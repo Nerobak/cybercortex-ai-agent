@@ -11,7 +11,7 @@ from planner import create_plan
 
 goal = """
 Perform a security assessment of
-https://nerminzlatanovic.com
+https://example.com
 """
 
 plan = create_plan(goal)

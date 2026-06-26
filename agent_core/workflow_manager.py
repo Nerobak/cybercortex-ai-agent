@@ -80,8 +80,8 @@ def run_workflow(goal: str, target: str, allowed_domain: str):
 
 
 if __name__ == "__main__":
-    target = "https://nerminzlatanovic.com"
-    allowed_domain = "nerminzlatanovic.com"
+    target = "https://example.com"
+    allowed_domain = "example.com"
 
     goal = f"Perform a safe security assessment of {target} and generate a report."
 

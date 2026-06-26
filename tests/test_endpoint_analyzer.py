@@ -11,8 +11,8 @@ from agent import ask_agent
 from tools.katana_crawl import katana_crawl
 from tools.endpoint_analyzer import endpoint_analyzer
 
-target = "https://nerminzlatanovic.com"
-allowed_domain = "nerminzlatanovic.com"
+target = "https://example.com"
+allowed_domain = "example.com"
 
 crawl_result = katana_crawl(target, depth=2)
 

@@ -12,8 +12,8 @@ from tools.dns_lookup import dns_lookup
 from tools.http_probe import http_probe
 from tools.tech_fingerprint import tech_fingerprint
 
-domain = "nerminzlatanovic.com"
-url = "https://nerminzlatanovic.com"
+domain = "example.com"
+url = "https://example.com"
 
 print("\n[1] DNS LOOKUP")
 dns_result = dns_lookup(domain)

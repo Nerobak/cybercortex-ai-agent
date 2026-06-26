@@ -10,7 +10,7 @@ sys.path.append(
 from agent import ask_agent
 from tools.security_headers_checker import security_headers_checker
 
-target = "https://nerminzlatanovic.com"
+target = "https://example.com"
 
 result = security_headers_checker(target)
 

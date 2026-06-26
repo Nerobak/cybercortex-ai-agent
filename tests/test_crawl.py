@@ -12,7 +12,7 @@ from agent import ask_agent
 from tools.katana_crawl import katana_crawl
 from tools.httpx_probe import httpx_probe
 
-target = "https://nerminzlatanovic.com"
+target = "https://example.com"
 
 print("[1] Katana crawl")
 crawl_result = katana_crawl(target, depth=2)

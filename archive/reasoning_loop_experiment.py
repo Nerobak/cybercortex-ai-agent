@@ -170,8 +170,8 @@ def run_reasoning_loop(goal, target, allowed_domain, max_steps=10):
 
 
 if __name__ == "__main__":
-    target = "https://nerminzlatanovic.com"
-    allowed_domain = "nerminzlatanovic.com"
+    target = "https://example.com"
+    allowed_domain = "example.com"
 
     goal = f"Perform a safe authorized security assessment of {target} and generate a report."
 

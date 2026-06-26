@@ -9,5 +9,5 @@ sys.path.append(
 
 from tools.scope_guard import enforce_scope
 
-print(enforce_scope("https://nerminzlatanovic.com"))
+print(enforce_scope("https://example.com"))
 print(enforce_scope("https://google.com"))

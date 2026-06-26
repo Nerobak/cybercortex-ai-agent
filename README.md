@@ -139,9 +139,28 @@ No cloud AI services are required.
 
 See:
 
-**docs/INSTALL.md**
+For complete installation instructions, see:
+
+- [Installation Guide](docs/INSTALL.md)
+
 
 ---
+
+### Configure Environment
+
+Copy the example configuration:
+
+```bash
+cp .env.example .env
+```
+
+Then edit:
+
+```bash
+nano .env
+```
+
+Update the allowlist with domains you are authorized to assess before running the agent.
 
 # Usage
 
@@ -188,10 +207,12 @@ archive/
 
 # Documentation
 
-* docs/INSTALL.md
-* docs/ARCHITECTURE.md
-* docs/TOOLS.md
-* docs/ROADMAP.md
+## Documentation
+
+- [Installation Guide](docs/INSTALL.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Security Tools](docs/TOOLS.md)
+- [Project Roadmap](docs/ROADMAP.md)
 
 ---
 

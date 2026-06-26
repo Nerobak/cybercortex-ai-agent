@@ -54,8 +54,8 @@ Give me:
 
 
 if __name__ == "__main__":
-    target = "https://nerminzlatanovic.com"
-    allowed_domain = "nerminzlatanovic.com"
+    target = "https://example.com"
+    allowed_domain = "example.com"
 
     result = analyze_target(target, allowed_domain)
 

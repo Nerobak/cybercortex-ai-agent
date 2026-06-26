@@ -10,7 +10,7 @@ sys.path.append(
 from agent_core.llm_client import ask_agent
 from tools.nuclei_scan import nuclei_scan
 
-target = "https://nerminzlatanovic.com"
+target = "https://example.com"
 
 result = nuclei_scan(target, severity="low")
 

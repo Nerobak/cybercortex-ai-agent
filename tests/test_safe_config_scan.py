@@ -10,8 +10,8 @@ sys.path.append(
 from agent import ask_agent
 from tools.safe_config_scan import safe_config_scan
 
-target = "https://nerminzlatanovic.com"
-allowed_domain = "nerminzlatanovic.com"
+target = "https://example.com"
+allowed_domain = "example.com"
 
 result = safe_config_scan(target, allowed_domain)
 
