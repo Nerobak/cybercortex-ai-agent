@@ -93,6 +93,53 @@ No cloud AI services are required.
 
 ---
 
+## Hardware Requirements
+
+CyberCortex AI Agent is designed to run entirely on local hardware using Ollama and DeepSeek R1 Distill 32B.
+
+The hardware required depends on the language model you choose.
+
+| Model                   | Recommended Memory | Notes                                      |
+| ----------------------- | -----------------: | ------------------------------------------ |
+| Llama 3 8B              |             16 GB+ | Entry-level local AI                       |
+| DeepSeek R1 Distill 8B  |           16–24 GB | Good performance                           |
+| DeepSeek R1 Distill 14B |           24–32 GB | Balanced speed and quality                 |
+| DeepSeek R1 Distill 32B |         **48 GB+** | Recommended configuration for this project |
+| 70B-class models        |             96 GB+ | Advanced workstation or server             |
+
+### Development System
+
+CyberCortex AI Agent was primarily developed and tested on:
+
+* **Apple MacBook Pro**
+* **Apple M4 Pro**
+* **48 GB Unified Memory**
+* **20-Core GPU**
+* **1 TB SSD**
+* **Ollama**
+* **DeepSeek R1 Distill 32B**
+
+This configuration provides a good balance between reasoning quality and local performance for the current version of the project.
+
+### Minimum Requirements
+
+For smaller local models (7B–14B):
+
+* Python 3.9+
+* 16 GB RAM
+* Ollama
+* Git
+
+### Recommended Requirements
+
+For the best experience with DeepSeek R1 Distill 32B:
+
+* Apple Silicon (M-series) or a modern workstation
+* **48 GB or more memory**
+* SSD storage
+* Ollama
+* Python 3.9+
+
 ## Reporting
 
 * AI-generated Markdown reports
