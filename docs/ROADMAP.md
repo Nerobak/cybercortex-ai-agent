@@ -40,8 +40,8 @@ This project is under active development. The goal is to build a fully local AI 
 
 ### AI Interaction
 
-- ✅ ask <question>
-- ✅ scan <authorized target>
+- ✅ ask question
+- ✅ scan authorized target
 
 ---
 
