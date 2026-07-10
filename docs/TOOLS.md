@@ -22,3 +22,13 @@
 
 - `ai_report_writer.py` – creates AI-generated Markdown reports
 - `report_writer.py` – creates basic Markdown reports
+
+## AI Commands
+
+CyberCortex AI Agent supports interactive AI commands.
+
+Examples:
+
+ask What is CSP?
+
+scan https://example.com
