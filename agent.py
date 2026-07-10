@@ -1,102 +1,518 @@
-import warnings
-warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
-import argparse
+import sys
+from typing import Any, Optional
 from urllib.parse import urlparse
 
+from openai import OpenAI
+
 from agent_core.workflow_manager import run_workflow
+from config import (
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
+    OPENAI_MODEL,
+)
 from tools.scope_guard import enforce_scope
 
 
+SYSTEM_PROMPT = """
+You are CyberCortex AI, a cybersecurity learning and analysis assistant.
+
+You can:
+- Answer cybersecurity questions.
+- Explain vulnerabilities and defensive controls.
+- Analyze HTTP requests and responses supplied by the user.
+- Review source code supplied by the user.
+- Suggest authorized manual testing approaches.
+- Help write vulnerability reports.
+- Explain security tool output and logs.
+- Help with secure software development and defensive analysis.
+
+Rules:
+- Do not claim that a vulnerability exists without evidence.
+- Clearly distinguish confirmed findings from hypotheses.
+- Do not invent scan results, endpoints, credentials, or evidence.
+- Recommend testing only on systems the user owns or is explicitly
+  authorized to test.
+- Never start scanning from a normal question.
+- Only start the testing workflow when the user explicitly uses the
+  "scan" command.
+- Keep explanations practical and technically accurate.
+"""
+
+
+def create_llm_client() -> OpenAI:
+    """
+    Create an OpenAI-compatible client for the configured local model.
+    """
+
+    if not OPENAI_BASE_URL:
+        raise RuntimeError(
+            "OPENAI_BASE_URL is not configured in the .env file."
+        )
+
+    if not OPENAI_MODEL:
+        raise RuntimeError(
+            "OPENAI_MODEL is not configured in the .env file."
+        )
+
+    return OpenAI(
+        base_url=OPENAI_BASE_URL,
+        api_key=OPENAI_API_KEY or "ollama",
+    )
+
+
+def ask_question(question: str) -> str:
+    """
+    Send a general cybersecurity question to the local LLM.
+
+    This function does not execute scanners, crawlers, or other
+    security-testing tools.
+    """
+
+    question = question.strip()
+
+    if not question:
+        return "Please enter a question."
+
+    try:
+        client = create_llm_client()
+
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": question,
+                },
+            ],
+            temperature=0.2,
+        )
+
+        content: Optional[str] = response.choices[0].message.content
+
+        if not content:
+            return "The model returned an empty response."
+
+        return content.strip()
+
+    except Exception as exc:
+        return f"Question-answering error: {exc}"
+
+
 def normalize_target(target: str) -> str:
-    if not target.startswith("http"):
-        target = "https://" + target
+    """
+    Add an HTTPS scheme when the user provides only a hostname or path.
+    """
+
+    target = target.strip()
+
+    if not target:
+        return ""
+
+    if "://" not in target:
+        return f"https://{target}"
+
     return target
 
 
-def extract_allowed_domain(target: str) -> str:
+def run_scan_command(command: str) -> dict[str, Any]:
+    """
+    Run the existing CyberCortex workflow against an authorized target.
+
+    The complete target URL is checked by the scope guard before any
+    workflow tools are allowed to run.
+    """
+
+    target = normalize_target(command)
+
+    if not target:
+        return {
+            "success": False,
+            "error": "Please provide an authorized target.",
+        }
+
+    scope_result = enforce_scope(target)
+
+    if not scope_result.get("allowed"):
+        return scope_result
+
     parsed = urlparse(target)
-    return parsed.netloc.replace("www.", "")
+    allowed_domain = parsed.hostname or ""
+
+    if not allowed_domain:
+        return {
+            "success": False,
+            "target": target,
+            "error": "The target does not contain a valid hostname.",
+        }
+
+    goal = (
+        "Perform a safe security assessment of the authorized target "
+        f"{target}. Stay within the configured scope, avoid leaving the "
+        "authorized URL path, collect evidence, avoid unsupported claims, "
+        "and generate a security report."
+    )
+
+    try:
+        return run_workflow(
+            goal,
+            target,
+            allowed_domain,
+        )
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "target": target,
+            "error": f"Workflow error: {exc}",
+        }
 
 
-def run_assessment(target: str, mode: str = "safe"):
-    target = normalize_target(target)
+def print_nuclei_result(tool_result: dict[str, Any]) -> None:
+    """
+    Print a concise Nuclei summary instead of dumping full findings.
+    """
 
-    scope = enforce_scope(target)
+    print(f"Success: {tool_result.get('success')}")
+    print(f"Target: {tool_result.get('url', 'N/A')}")
+    print(f"Findings: {tool_result.get('findings_count', 0)}")
 
-    if not scope["allowed"]:
-        print("\n[BLOCKED]")
-        print(scope["error"])
-        print("Add this domain to PENTEST_ALLOWLIST only if you are authorized to test it.\n")
+    severity_summary = tool_result.get("severity_summary", {})
+
+    if severity_summary:
+        print("Severity summary:")
+
+        for severity in (
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "info",
+            "unknown",
+        ):
+            count = severity_summary.get(severity, 0)
+
+            if count:
+                print(f"- {severity.capitalize()}: {count}")
+
+    findings = tool_result.get("findings", [])
+
+    if findings:
+        print("Detected items:")
+
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+
+            matcher = finding.get(
+                "matcher_name",
+                finding.get("name", "unknown"),
+            )
+
+            severity = finding.get(
+                "severity",
+                "unknown",
+            )
+
+            affected_url = finding.get(
+                "matched_at",
+                finding.get("url", ""),
+            )
+
+            item = f"- [{severity.upper()}] {matcher}"
+
+            if affected_url:
+                item += f" — {affected_url}"
+
+            print(item)
+
+    raw_file = tool_result.get("raw_output_file")
+
+    if raw_file:
+        print(f"Raw evidence: {raw_file}")
+
+    error = tool_result.get("error")
+
+    if error:
+        print(f"Error: {error}")
+
+
+def print_report_result(tool_result: dict[str, Any]) -> None:
+    """
+    Print generated report locations cleanly.
+    """
+
+    print(f"Success: {tool_result.get('success')}")
+
+    report_file = tool_result.get("report_file")
+    evidence_file = tool_result.get("evidence_file")
+    generated_at = tool_result.get("generated_at")
+
+    if report_file:
+        print(f"Report: {report_file}")
+
+    if evidence_file:
+        print(f"Evidence: {evidence_file}")
+
+    if generated_at:
+        print(f"Generated: {generated_at}")
+
+    error = tool_result.get("error")
+
+    if error:
+        print(f"Error: {error}")
+
+
+def print_standard_tool_result(tool_result: dict[str, Any]) -> None:
+    """
+    Print a compact summary for normal tools.
+    """
+
+    success = tool_result.get("success")
+
+    if success is not None:
+        print(f"Success: {success}")
+
+    error = tool_result.get("error")
+
+    if error:
+        print(f"Error: {error}")
+
+    for key, value in tool_result.items():
+        if key in {
+            "success",
+            "error",
+            "findings",
+            "headers_checked",
+            "urls",
+        }:
+            continue
+
+        print(f"{key}: {value}")
+
+    headers_checked = tool_result.get("headers_checked")
+
+    if isinstance(headers_checked, dict):
+        print("Headers:")
+
+        for header_name, header_result in headers_checked.items():
+            if not isinstance(header_result, dict):
+                print(f"- {header_name}: {header_result}")
+                continue
+
+            present = header_result.get("present", False)
+            status = "present" if present else "missing"
+
+            print(f"- {header_name}: {status}")
+
+    urls = tool_result.get("urls")
+
+    if isinstance(urls, list):
+        print(f"URLs discovered: {len(urls)}")
+
+        for url in urls[:10]:
+            print(f"- {url}")
+
+        if len(urls) > 10:
+            print(f"- ... and {len(urls) - 10} more")
+
+    findings = tool_result.get("findings")
+
+    if isinstance(findings, list):
+        print(f"Findings: {len(findings)}")
+
+        for finding in findings[:10]:
+            if isinstance(finding, dict):
+                title = (
+                    finding.get("issue")
+                    or finding.get("name")
+                    or finding.get("type")
+                    or "Finding"
+                )
+
+                severity = finding.get("severity")
+
+                if severity:
+                    print(f"- [{severity.upper()}] {title}")
+                else:
+                    print(f"- {title}")
+            else:
+                print(f"- {finding}")
+
+        if len(findings) > 10:
+            print(f"- ... and {len(findings) - 10} more")
+
+
+def print_result(result: Any) -> None:
+    """
+    Print strings and workflow dictionaries cleanly.
+    """
+
+    if isinstance(result, str):
+        print(result)
         return
 
-    allowed_domain = extract_allowed_domain(target)
+    if not isinstance(result, dict):
+        print(result)
+        return
 
-    goal = f"Perform a {mode} authorized security assessment of {target} and generate a report."
+    print("\n===== CYBERCORTEX RESULT =====")
 
-    result = run_workflow(
-        goal=goal,
-        target=target,
-        allowed_domain=allowed_domain,
+    if result.get("success") is False:
+        print(f"Success: {result.get('success')}")
+        print(f"Target: {result.get('target', 'N/A')}")
+        print(f"Error: {result.get('error', 'Unknown error')}")
+        return
+
+    print(f"Success: {result.get('success', True)}")
+
+    if result.get("goal"):
+        print(f"Goal: {result['goal']}")
+
+    if result.get("target"):
+        print(f"Target: {result['target']}")
+
+    completed_steps = result.get("completed_steps", [])
+
+    if completed_steps:
+        print("\nCompleted steps:")
+
+        for step in completed_steps:
+            print(f"- {step}")
+
+    results = result.get("results")
+
+    if not isinstance(results, dict):
+        return
+
+    print("\nTool results:")
+
+    for tool_name, tool_result in results.items():
+        print(f"\n--- {tool_name} ---")
+
+        if not isinstance(tool_result, dict):
+            print(tool_result)
+            continue
+
+        if tool_name == "nuclei_scan":
+            print_nuclei_result(tool_result)
+            continue
+
+        if tool_name == "ai_report_writer":
+            print_report_result(tool_result)
+            continue
+
+        print_standard_tool_result(tool_result)
+
+
+def print_help() -> None:
+    print(
+        """
+CyberCortex AI commands
+
+  ask <question>
+      Ask a cybersecurity or technical question.
+
+  scan <target>
+      Run the security workflow against an authorized in-scope target.
+
+  help
+      Display this help message.
+
+  exit
+      Exit CyberCortex AI.
+
+Examples
+
+  ask What is an IDOR vulnerability?
+
+  ask Explain the difference between authentication and authorization.
+
+  ask Give me a manual testing checklist for password reset.
+
+  ask Analyze this HTTP request:
+      GET /api/users/42 HTTP/1.1
+      Host: example.com
+
+  scan https://localhost:8000
+
+  scan https://crypto.com/exchange
+"""
     )
 
-    print("\nAssessment complete.")
-    print("Completed steps:")
-    print(result["completed_steps"])
 
-    report_result = result["results"].get("ai_report_writer")
+def process_user_input(user_input: str) -> Any:
+    """
+    Route input into question mode or scan mode.
 
-    if report_result:
-        print("\nReport generated:")
-        print(report_result.get("report_file"))
+    Unknown commands default to question mode. This prevents unclear input
+    from accidentally starting a security-testing workflow.
+    """
 
-    print("\n")
+    cleaned = user_input.strip()
+
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+
+    if lowered in {"exit", "quit", "/exit", "/quit"}:
+        print("Exiting CyberCortex AI.")
+        sys.exit(0)
+
+    if lowered in {"help", "/help", "?"}:
+        print_help()
+        return None
+
+    if lowered.startswith("ask "):
+        return ask_question(cleaned[4:].strip())
+
+    if lowered.startswith("/ask "):
+        return ask_question(cleaned[5:].strip())
+
+    if lowered.startswith("scan "):
+        return run_scan_command(cleaned[5:].strip())
+
+    if lowered.startswith("/scan "):
+        return run_scan_command(cleaned[6:].strip())
+
+    return ask_question(cleaned)
 
 
-def interactive_mode():
-
-    print("\n==================================================")
-    print("              CyberCortex AI Agent")
-    print("          Local AI Security Platform")
-    print("==================================================")
-    print("Version: 1.0 Beta")
-    print("Mode: Safe Authorized Assessment")
-    print("Powered by Ollama + DeepSeek R1 Distill 32B")
-    print("--------------------------------------------------\n")
-    print("Type a target URL to analyze, or type 'exit' to quit.\n")
+def main() -> None:
+    print("=" * 60)
+    print("CyberCortex AI")
+    print("=" * 60)
+    print("Use 'ask <question>' for questions.")
+    print("Use 'scan <target>' for authorized security testing.")
+    print("Type 'help' for examples or 'exit' to quit.")
+    print()
 
     while True:
-        target = input("Target URL > ").strip()
+        try:
+            user_input = input("CyberCortex> ")
+            result = process_user_input(user_input)
 
-        if target.lower() in ["exit", "quit"]:
-            print("Goodbye.")
+            if result is None:
+                continue
+
+            print()
+            print_result(result)
+            print()
+
+        except KeyboardInterrupt:
+            print("\nExiting CyberCortex AI.")
             break
 
-        run_assessment(target, mode="safe")
+        except EOFError:
+            print("\nExiting CyberCortex AI.")
+            break
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="CyberCortex AI Agent for authorized security testing."
-    )
-
-    parser.add_argument(
-        "--target",
-        help="Target URL or domain to assess.",
-    )
-
-    parser.add_argument(
-        "--mode",
-        default="safe",
-        choices=["safe"],
-        help="Assessment mode. Currently only 'safe' is supported.",
-    )
-
-    args = parser.parse_args()
-
-    if args.target:
-        run_assessment(args.target, args.mode)
-    else:
-        interactive_mode()
+        except Exception as exc:
+            print(f"\nUnexpected error: {exc}\n")
 
 
 if __name__ == "__main__":
