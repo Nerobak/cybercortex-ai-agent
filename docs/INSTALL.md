@@ -253,3 +253,16 @@ Use it only against:
 
 The built-in **Scope Guard** prevents assessments of targets outside the configured allowlist.
 
+After installation, start the interactive agent:
+
+```bash
+python agent.py
+```
+
+Example:
+
+```text
+ask Explain Content Security Policy
+
+scan https://example.com
+```
