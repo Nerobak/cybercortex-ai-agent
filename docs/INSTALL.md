@@ -253,6 +253,8 @@ Use it only against:
 
 The built-in **Scope Guard** prevents assessments of targets outside the configured allowlist.
 
+# Markdown
+
 After installation, start the interactive agent:
 
 ```bash
