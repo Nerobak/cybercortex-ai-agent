@@ -38,6 +38,11 @@ This project is under active development. The goal is to build a fully local AI 
 * ✅ AI-generated Markdown reports
 * ✅ Professional report structure
 
+### AI Interaction
+
+- ✅ ask <question>
+- ✅ scan <authorized target>
+
 ---
 
 # Version 1.1
