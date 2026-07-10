@@ -211,8 +211,6 @@ Update the allowlist with domains you are authorized to assess before running th
 
 # Usage
 
-# Usage
-
 Interactive Mode
 
 ```bash
