@@ -211,10 +211,20 @@ Update the allowlist with domains you are authorized to assess before running th
 
 # Usage
 
+# Usage
+
 Interactive Mode
 
 ```bash
 python agent.py
+```
+
+Example commands:
+
+```text
+ask What security headers are important?
+
+scan https://example.com
 ```
 
 CLI Mode
@@ -222,14 +232,6 @@ CLI Mode
 ```bash
 python agent.py --target https://example.com --mode safe
 ```
-
-Help
-
-```bash
-python agent.py --help
-```
-
----
 
 # Project Structure
 
