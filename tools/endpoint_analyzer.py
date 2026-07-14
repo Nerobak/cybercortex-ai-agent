@@ -24,6 +24,7 @@ INTERESTING_KEYWORDS = {
     "query": "Input validation testing",
 }
 
+
 def endpoint_analyzer(urls: list[str], allowed_domain: str):
     findings = []
     seen = set()
@@ -51,23 +52,25 @@ def endpoint_analyzer(urls: list[str], allowed_domain: str):
             reasons.append(f"Has parameters: {list(query.keys())}")
 
         if reasons:
-            findings.append({
-                "url": url,
-                "path": parsed.path,
-                "parameters": list(query.keys()),
-                "reasons": sorted(set(reasons)),
-                "suggested_tests": [
-                    "Check authorization boundaries",
-                    "Check input validation",
-                    "Check for sensitive data exposure",
-                    "Verify behavior manually before reporting"
-                ]
-            })
+            findings.append(
+                {
+                    "url": url,
+                    "path": parsed.path,
+                    "parameters": list(query.keys()),
+                    "reasons": sorted(set(reasons)),
+                    "suggested_tests": [
+                        "Check authorization boundaries",
+                        "Check input validation",
+                        "Check for sensitive data exposure",
+                        "Verify behavior manually before reporting",
+                    ],
+                }
+            )
 
     return {
         "success": True,
         "allowed_domain": allowed_domain,
         "total_urls_checked": len(urls),
         "interesting_count": len(findings),
-        "interesting_endpoints": findings
+        "interesting_endpoints": findings,
     }

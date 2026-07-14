@@ -12,7 +12,6 @@ from config import (
 )
 from tools.scope_guard import enforce_scope
 
-
 SYSTEM_PROMPT = """
 You are CyberCortex AI, a cybersecurity learning and analysis assistant.
 
@@ -45,14 +44,10 @@ def create_llm_client() -> OpenAI:
     """
 
     if not OPENAI_BASE_URL:
-        raise RuntimeError(
-            "OPENAI_BASE_URL is not configured in the .env file."
-        )
+        raise RuntimeError("OPENAI_BASE_URL is not configured in the .env file.")
 
     if not OPENAI_MODEL:
-        raise RuntimeError(
-            "OPENAI_MODEL is not configured in the .env file."
-        )
+        raise RuntimeError("OPENAI_MODEL is not configured in the .env file.")
 
     return OpenAI(
         base_url=OPENAI_BASE_URL,
@@ -409,8 +404,7 @@ def print_result(result: Any) -> None:
 
 
 def print_help() -> None:
-    print(
-        """
+    print("""
 CyberCortex AI commands
 
   ask <question>
@@ -440,8 +434,7 @@ Examples
   scan https://localhost:8000
 
   scan https://crypto.com/exchange
-"""
-    )
+""")
 
 
 def process_user_input(user_input: str) -> Any:

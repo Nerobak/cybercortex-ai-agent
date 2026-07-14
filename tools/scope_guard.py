@@ -107,9 +107,8 @@ def is_url_prefix_allowed(target: str) -> bool:
             and target_port == allowed_port
         )
 
-        path_allowed = (
-            target_path == allowed_path
-            or target_path.startswith(f"{allowed_path}/")
+        path_allowed = target_path == allowed_path or target_path.startswith(
+            f"{allowed_path}/"
         )
 
         if same_origin and path_allowed:

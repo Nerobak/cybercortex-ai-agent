@@ -13,6 +13,7 @@ client = OpenAI(
 
 model = OPENAI_MODEL
 
+
 def ask_agent(message: str) -> str:
     response = client.chat.completions.create(
         model=model,

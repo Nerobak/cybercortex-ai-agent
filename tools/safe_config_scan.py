@@ -5,6 +5,7 @@ from tools.misconfiguration_detector import misconfiguration_detector
 from tools.js_secret_scanner import js_secret_scanner
 from tools.scope_guard import enforce_scope
 
+
 def safe_config_scan(url: str, allowed_domain: str):
     scope = enforce_scope(url)
 

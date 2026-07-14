@@ -1,6 +1,7 @@
 import subprocess
 import tempfile
 
+
 def httpx_probe(hosts: list[str]):
     try:
         with tempfile.NamedTemporaryFile(mode="w+", delete=True) as f:
@@ -11,32 +12,26 @@ def httpx_probe(hosts: list[str]):
             result = subprocess.run(
                 [
                     "httpx",
-                    "-l", f.name,
+                    "-l",
+                    f.name,
                     "-status-code",
                     "-title",
                     "-tech-detect",
-                    "-silent"
+                    "-silent",
                 ],
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=60,
             )
 
-        lines = [
-            line.strip()
-            for line in result.stdout.splitlines()
-            if line.strip()
-        ]
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
         return {
             "success": result.returncode == 0,
             "count": len(lines),
             "results": lines,
-            "error": result.stderr.strip()
+            "error": result.stderr.strip(),
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}

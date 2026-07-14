@@ -25,8 +25,7 @@ def safe_filename_from_url(url: str) -> str:
         name = f"{host}_{path}"
 
     return "".join(
-        character if character.isalnum() or character in {"-", "_", "."}
-        else "_"
+        character if character.isalnum() or character in {"-", "_", "."} else "_"
         for character in name
     )
 
@@ -95,10 +94,7 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_target = safe_filename_from_url(url)
 
-    raw_output_file = (
-        report_directory
-        / f"nuclei_{safe_target}_{timestamp}.jsonl"
-    )
+    raw_output_file = report_directory / f"nuclei_{safe_target}_{timestamp}.jsonl"
 
     command = [
         "nuclei",
@@ -161,11 +157,7 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
             "error": str(exc),
         }
 
-    raw_lines = [
-        line.strip()
-        for line in result.stdout.splitlines()
-        if line.strip()
-    ]
+    raw_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     if raw_lines:
         raw_output_file.write_text(
@@ -182,8 +174,7 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
             findings.append(finding)
 
     severity_counts = Counter(
-        finding.get("severity", "unknown")
-        for finding in findings
+        finding.get("severity", "unknown") for finding in findings
     )
 
     severity_summary = {
@@ -201,17 +192,10 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
         "success": result.returncode == 0,
         "url": url,
         "requested_severity": severity,
-        "template": (
-            "http/misconfiguration/"
-            "http-missing-security-headers.yaml"
-        ),
+        "template": ("http/misconfiguration/" "http-missing-security-headers.yaml"),
         "findings_count": len(findings),
         "severity_summary": severity_summary,
         "findings": findings[:50],
-        "raw_output_file": (
-            str(raw_output_file)
-            if raw_lines
-            else None
-        ),
+        "raw_output_file": (str(raw_output_file) if raw_lines else None),
         "error": stderr or None,
     }

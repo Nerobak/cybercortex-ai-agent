@@ -110,7 +110,10 @@ Rules:
     if "katana_crawl" in completed and "misconfiguration_detector" not in completed:
         return "misconfiguration_detector"
 
-    if "misconfiguration_detector" in completed and "js_secret_scanner" not in completed:
+    if (
+        "misconfiguration_detector" in completed
+        and "js_secret_scanner" not in completed
+    ):
         return "js_secret_scanner"
 
     if "js_secret_scanner" in completed and "nuclei_scan" not in completed:

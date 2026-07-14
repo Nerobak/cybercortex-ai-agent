@@ -16,8 +16,9 @@ PARAMETER_PATTERNS = {
     "path": "Path Traversal",
     "download": "File Download",
     "search": "Input Validation",
-    "query": "Input Validation"
+    "query": "Input Validation",
 }
+
 
 def parameter_analyzer(urls):
     findings = []
@@ -38,14 +39,6 @@ def parameter_analyzer(urls):
 
                 if pattern in key:
 
-                    findings.append({
-                        "url": url,
-                        "parameter": param,
-                        "reason": reason
-                    })
+                    findings.append({"url": url, "parameter": param, "reason": reason})
 
-    return {
-        "success": True,
-        "findings_count": len(findings),
-        "findings": findings
-    }
+    return {"success": True, "findings_count": len(findings), "findings": findings}

@@ -6,7 +6,7 @@ Path("logs").mkdir(exist_ok=True)
 logging.basicConfig(
     filename="logs/agent.log",
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 logger = logging.getLogger("local_ai_security_agent")

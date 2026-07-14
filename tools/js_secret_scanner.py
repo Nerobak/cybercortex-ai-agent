@@ -11,6 +11,7 @@ SECRET_PATTERNS = {
     "localhost_reference": r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)[^\s\"'>)]*",
 }
 
+
 def js_secret_scanner(urls: list[str], allowed_domain: str):
     findings = []
     checked = 0
@@ -41,26 +42,24 @@ def js_secret_scanner(urls: list[str], allowed_domain: str):
                 if matches:
                     sample_matches = matches[:5]
 
-                    findings.append({
-                        "url": url,
-                        "type": name,
-                        "matches_count": len(matches),
-                        "sample_matches": sample_matches,
-                        "risk": "review_required",
-                        "recommendation": "Manually review the matched value and remove it if it is sensitive or a test reference."
-                    })
+                    findings.append(
+                        {
+                            "url": url,
+                            "type": name,
+                            "matches_count": len(matches),
+                            "sample_matches": sample_matches,
+                            "risk": "review_required",
+                            "recommendation": "Manually review the matched value and remove it if it is sensitive or a test reference.",
+                        }
+                    )
 
         except Exception as e:
-            findings.append({
-                "url": url,
-                "type": "fetch_error",
-                "error": str(e)
-            })
+            findings.append({"url": url, "type": "fetch_error", "error": str(e)})
 
     return {
         "success": True,
         "allowed_domain": allowed_domain,
         "urls_checked": checked,
         "findings_count": len(findings),
-        "findings": findings
+        "findings": findings,
     }

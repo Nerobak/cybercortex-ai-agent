@@ -1,11 +1,7 @@
 import sys
 import os
 
-sys.path.append(
-    os.path.dirname(
-        os.path.dirname(__file__)
-    )
-)
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from agent import ask_agent
 from tools.safe_config_scan import safe_config_scan

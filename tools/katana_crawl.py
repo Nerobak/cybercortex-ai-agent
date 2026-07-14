@@ -1,24 +1,16 @@
 import subprocess
 
+
 def katana_crawl(url: str, depth: int = 2):
     try:
         result = subprocess.run(
-            [
-                "katana",
-                "-u", url,
-                "-d", str(depth),
-                "-silent"
-            ],
+            ["katana", "-u", url, "-d", str(depth), "-silent"],
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=60,
         )
 
-        urls = [
-            line.strip()
-            for line in result.stdout.splitlines()
-            if line.strip()
-        ]
+        urls = [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
         return {
             "success": result.returncode == 0,
@@ -26,11 +18,8 @@ def katana_crawl(url: str, depth: int = 2):
             "depth": depth,
             "count": len(urls),
             "urls": urls[:100],
-            "error": result.stderr.strip()
+            "error": result.stderr.strip(),
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}

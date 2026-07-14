@@ -1,4 +1,3 @@
-from agent_core.logger import logger
 from agent_core.planner import create_plan
 from agent_core.decision_engine import parse_plan, get_next_tool
 
@@ -40,10 +39,7 @@ def run_tool(tool_name: str, target: str, allowed_domain: str, results: dict):
     if tool_name == "ai_report_writer":
         return ai_report_writer(target, results)
 
-    return {
-        "success": False,
-        "error": f"Unknown tool: {tool_name}"
-    }
+    return {"success": False, "error": f"Unknown tool: {tool_name}"}
 
 
 def run_workflow(goal: str, target: str, allowed_domain: str):
@@ -75,7 +71,7 @@ def run_workflow(goal: str, target: str, allowed_domain: str):
         "target": target,
         "plan": plan_text,
         "completed_steps": completed_steps,
-        "results": results
+        "results": results,
     }
 
 

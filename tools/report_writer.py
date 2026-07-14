@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
+
 def report_writer(target: str, results: dict, output_dir: str = "reports"):
     Path(output_dir).mkdir(exist_ok=True)
 
@@ -49,7 +50,4 @@ This report is intended for authorized security testing only.
     with open(filename, "w") as f:
         f.write(report)
 
-    return {
-        "success": True,
-        "report_file": filename
-    }
+    return {"success": True, "report_file": filename}

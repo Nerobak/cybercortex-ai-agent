@@ -6,7 +6,6 @@ from typing import Any
 from agent_core.llm_client import ask_agent
 from config import REPORT_DIR
 
-
 MAX_FINDINGS_PER_TOOL = 25
 MAX_TEXT_LENGTH = 1500
 
@@ -56,8 +55,7 @@ def sanitize_value(value: Any) -> Any:
 
             if key == "findings" and isinstance(item, list):
                 cleaned[key] = [
-                    sanitize_value(finding)
-                    for finding in item[:MAX_FINDINGS_PER_TOOL]
+                    sanitize_value(finding) for finding in item[:MAX_FINDINGS_PER_TOOL]
                 ]
                 continue
 
@@ -66,10 +64,7 @@ def sanitize_value(value: Any) -> Any:
         return cleaned
 
     if isinstance(value, list):
-        return [
-            sanitize_value(item)
-            for item in value[:MAX_FINDINGS_PER_TOOL]
-        ]
+        return [sanitize_value(item) for item in value[:MAX_FINDINGS_PER_TOOL]]
 
     if isinstance(value, str):
         return truncate_text(value)
@@ -110,15 +105,9 @@ def ai_report_writer(
     generated_at = datetime.now()
     timestamp = generated_at.strftime("%Y%m%d_%H%M%S")
 
-    filename = (
-        report_directory
-        / f"ai_security_report_{timestamp}.md"
-    )
+    filename = report_directory / f"ai_security_report_{timestamp}.md"
 
-    evidence_filename = (
-        report_directory
-        / f"assessment_evidence_{timestamp}.json"
-    )
+    evidence_filename = report_directory / f"assessment_evidence_{timestamp}.json"
 
     compact_results = build_compact_results(results)
 
@@ -300,10 +289,7 @@ Important requirements:
 """
 
     print("\n🤖 CyberCortex AI Agent")
-    print(
-        "Generating AI-powered security report "
-        "with DeepSeek R1 Distill 32B..."
-    )
+    print("Generating AI-powered security report " "with DeepSeek R1 Distill 32B...")
 
     try:
         report = ask_agent(prompt)

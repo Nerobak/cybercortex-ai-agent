@@ -1,5 +1,6 @@
 import requests
 
+
 def security_headers_checker(url: str):
     try:
         response = requests.get(url, timeout=10, allow_redirects=True)
@@ -11,7 +12,7 @@ def security_headers_checker(url: str):
             "X-Frame-Options": "Helps prevent clickjacking",
             "X-Content-Type-Options": "Helps prevent MIME sniffing",
             "Referrer-Policy": "Controls referrer leakage",
-            "Permissions-Policy": "Limits browser features"
+            "Permissions-Policy": "Limits browser features",
         }
 
         results = {}
@@ -20,18 +21,15 @@ def security_headers_checker(url: str):
             results[header] = {
                 "present": header in headers,
                 "value": headers.get(header),
-                "description": description
+                "description": description,
             }
 
         return {
             "success": True,
             "url": response.url,
             "status_code": response.status_code,
-            "headers_checked": results
+            "headers_checked": results,
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}

@@ -1,5 +1,6 @@
 import requests
 
+
 def tech_fingerprint(url: str):
     try:
         response = requests.get(url, timeout=10, allow_redirects=True)
@@ -33,11 +34,8 @@ def tech_fingerprint(url: str):
             "final_url": response.url,
             "status_code": response.status_code,
             "headers": headers,
-            "technologies": technologies
+            "technologies": technologies,
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}

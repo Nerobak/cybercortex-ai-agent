@@ -17,14 +17,10 @@ def parse_plan(plan_text: str):
 def get_next_tool(plan_steps: list[str], completed_steps: list[str]):
     for step in plan_steps:
         if step not in completed_steps:
-            return {
-                "success": True,
-                "next_tool": step,
-                "tool_info": TOOLS.get(step)
-            }
+            return {"success": True, "next_tool": step, "tool_info": TOOLS.get(step)}
 
     return {
         "success": True,
         "next_tool": None,
-        "message": "All planned steps completed"
+        "message": "All planned steps completed",
     }

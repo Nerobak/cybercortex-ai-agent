@@ -1,11 +1,7 @@
 import sys
 import os
 
-sys.path.append(
-    os.path.dirname(
-        os.path.dirname(__file__)
-    )
-)
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from agent import ask_agent
 from tools.katana_crawl import katana_crawl
@@ -16,10 +12,7 @@ allowed_domain = "example.com"
 
 crawl_result = katana_crawl(target, depth=2)
 
-scan_result = js_secret_scanner(
-    crawl_result.get("urls", []),
-    allowed_domain
-)
+scan_result = js_secret_scanner(crawl_result.get("urls", []), allowed_domain)
 
 print("[1] JS Secret Scanner Result")
 print(scan_result)
@@ -42,4 +35,3 @@ Tell me:
 
 print("\n[2] DeepSeek Analysis")
 print(ask_agent(prompt))
-

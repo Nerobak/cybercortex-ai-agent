@@ -1,11 +1,7 @@
 import sys
 import os
 
-sys.path.append(
-    os.path.dirname(
-        os.path.dirname(__file__)
-    )
-)
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from agent import ask_agent
 from tools.katana_crawl import katana_crawl
@@ -17,8 +13,7 @@ allowed_domain = "example.com"
 crawl_result = katana_crawl(target, depth=2)
 
 misconfig_result = misconfiguration_detector(
-    crawl_result.get("urls", []),
-    allowed_domain
+    crawl_result.get("urls", []), allowed_domain
 )
 
 print("[1] Misconfiguration Result")
