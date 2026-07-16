@@ -231,6 +231,18 @@ CLI Mode
 python agent.py --target https://example.com --mode safe
 ```
 
+Local Web Dashboard
+
+```bash
+python web_app.py
+```
+
+Then open `http://127.0.0.1:8000`. The dashboard requires an explicit
+authorization confirmation and rejects targets outside
+`PENTEST_ALLOWLIST` / `PENTEST_ALLOWED_URL_PREFIXES`. It runs low-impact
+DNS and HTTP configuration checks, shows live progress, preserves raw
+evidence, and exports a Markdown report.
+
 # Project Structure
 
 ```text
@@ -327,4 +339,3 @@ https://github.com/nerobak
 CyberCortex is a growing ecosystem of AI-powered cybersecurity projects focused on empowering defenders, researchers, and bug bounty hunters through local AI, automation, and practical security engineering.
 
 CyberCortex AI Agent is the first major component of that ecosystem.
-
