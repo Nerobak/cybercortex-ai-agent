@@ -6,3 +6,13 @@ logs/
 reports/
 .DS_Store
 tools/WhatWeb/
+
+# Local verification inputs
+verification_inputs/
+*.burp
+*.request.txt
+
+# Local verification inputs
+verification_inputs/
+*.burp
+*.request.txt
