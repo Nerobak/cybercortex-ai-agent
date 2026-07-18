@@ -40,6 +40,7 @@ class SecurityFinding:
     severity: Severity
     confidence: Confidence
     status: FindingStatus
+    source_tool: str = "unknown"
 
     endpoint: str | None = None
     method: str | None = None

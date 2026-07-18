@@ -37,28 +37,34 @@ def test_scan_rejects_out_of_scope_target(monkeypatch):
 def test_completed_scan_and_report(monkeypatch):
     monkeypatch.setattr(web_app, "enforce_scope", lambda target: {"allowed": True})
     monkeypatch.setattr(
-        web_app, "dns_lookup", lambda host: {"success": True, "host": host}
-    )
-    monkeypatch.setattr(
-        web_app, "http_probe", lambda target: {"success": True, "status_code": 200}
-    )
-    monkeypatch.setattr(
         web_app,
-        "security_headers_checker",
-        lambda target: {
+        "run_workflow",
+        lambda *args, **kwargs: {
             "success": True,
-            "headers_checked": {
-                "Content-Security-Policy": {
-                    "present": False,
-                    "description": "Reduces XSS risk",
-                }
+            "results": {
+                "security_headers_checker": {
+                    "status": "completed",
+                    "output": {"success": True},
+                },
+                "ai_report_writer": {
+                    "status": "completed",
+                    "output": {"success": True},
+                },
+            },
+            "evidence_package": {
+                "observed_surface": {},
+                "observations": [
+                    {
+                        "severity": "low",
+                        "title": "Missing Content-Security-Policy",
+                        "evidence": ["Header was not present."],
+                        "status": "observation",
+                    }
+                ],
+                "candidate_findings": [],
+                "verified_findings": [],
             },
         },
-    )
-    monkeypatch.setattr(
-        web_app,
-        "tech_fingerprint",
-        lambda target: {"success": True, "technologies": []},
     )
 
     created = client.post(

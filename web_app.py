@@ -15,15 +15,13 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from tools.dns_lookup import dns_lookup
-from tools.http_probe import http_probe
+from agent_core.workflow_manager import run_workflow
+from agent_core.version import __version__
 from tools.scope_guard import (
     enforce_scope,
     get_allowed_domains,
     get_allowed_url_prefixes,
 )
-from tools.security_headers_checker import security_headers_checker
-from tools.tech_fingerprint import tech_fingerprint
 
 BASE_DIR = Path(__file__).resolve().parent
 DASHBOARD_FILE = BASE_DIR / "web" / "dashboard.html"
@@ -32,7 +30,7 @@ MAX_RETAINED_JOBS = 50
 app = FastAPI(
     title="CyberCortex Bug Bounty Cockpit",
     description="A local dashboard for explicitly authorized, non-destructive web checks.",
-    version="1.0.0",
+    version=__version__,
 )
 
 _jobs: dict[str, dict[str, Any]] = {}
@@ -41,6 +39,7 @@ _jobs_lock = threading.Lock()
 
 class ScanRequest(BaseModel):
     target: str = Field(min_length=3, max_length=2048)
+    profile: str = Field(default="baseline", pattern="^(baseline|deep)$")
     authorization_confirmed: bool = False
 
 
@@ -90,36 +89,57 @@ def _finding_summary(results: dict[str, Any]) -> list[dict[str, str]]:
     return findings
 
 
-def _run_assessment(job_id: str, target: str) -> None:
-    steps = ["dns", "http_probe", "security_headers", "technology"]
-    results: dict[str, Any] = {}
+def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None:
     parsed = urlparse(target)
 
     try:
         _set_job(job_id, status="running", started_at=_now())
-        runners = (
-            ("dns", lambda: dns_lookup(parsed.hostname or "")),
-            ("http_probe", lambda: http_probe(target)),
-            ("security_headers", lambda: security_headers_checker(target)),
-            ("technology", lambda: tech_fingerprint(target)),
-        )
-        for index, (name, runner) in enumerate(runners, start=1):
-            _set_job(
-                job_id, current_step=name, progress=int((index - 1) / len(steps) * 100)
+
+        def status_callback(name: str, envelope: dict[str, Any]) -> None:
+            job = _get_job(job_id)
+            statuses = job.get("tool_statuses", {})
+            statuses[name] = deepcopy(envelope)
+            done = sum(
+                1
+                for value in statuses.values()
+                if value.get("status") not in {"running", "queued"}
             )
-            results[name] = runner()
             _set_job(
                 job_id,
-                results=deepcopy(results),
-                progress=int(index / len(steps) * 100),
+                current_step=name if envelope.get("status") == "running" else None,
+                tool_statuses=statuses,
+                progress=min(95, done * 7),
             )
+
+        workflow = run_workflow(
+            f"Authorized {profile} dashboard assessment",
+            target,
+            parsed.hostname or "",
+            profile=profile,
+            status_callback=status_callback,
+        )
+        evidence = workflow["evidence_package"]
 
         _set_job(
             job_id,
             status="completed",
             current_step=None,
+            progress=100,
             completed_at=_now(),
-            findings=_finding_summary(results),
+            results=workflow["results"],
+            observed_surface=evidence["observed_surface"],
+            observations=evidence["observations"],
+            candidates=evidence["candidate_findings"],
+            verified_findings=evidence["verified_findings"],
+            findings=evidence["observations"]
+            + evidence["candidate_findings"]
+            + evidence["verified_findings"],
+            deepseek_status=(workflow["results"].get("ai_report_writer") or {}).get(
+                "status", "not_applicable"
+            ),
+            report_file=(
+                (workflow["results"].get("ai_report_writer") or {}).get("output") or {}
+            ).get("report_file"),
         )
     except Exception as exc:
         _set_job(
@@ -177,12 +197,15 @@ def _render_report(job: dict[str, Any]) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
-    return HTMLResponse(DASHBOARD_FILE.read_text(encoding="utf-8"))
+    html = DASHBOARD_FILE.read_text(encoding="utf-8").replace(
+        "{{VERSION}}", __version__
+    )
+    return HTMLResponse(html)
 
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "cybercortex-web"}
+    return {"status": "ok", "service": "cybercortex-web", "version": __version__}
 
 
 @app.get("/api/scope")
@@ -227,6 +250,7 @@ def start_scan(
     job = {
         "id": job_id,
         "target": target,
+        "profile": request.profile,
         "status": "queued",
         "progress": 0,
         "current_step": None,
@@ -234,6 +258,12 @@ def start_scan(
         "started_at": None,
         "completed_at": None,
         "results": {},
+        "tool_statuses": {},
+        "observed_surface": {},
+        "observations": [],
+        "candidates": [],
+        "verified_findings": [],
+        "deepseek_status": "queued",
         "findings": [],
         "error": None,
     }
@@ -242,7 +272,7 @@ def start_scan(
             oldest = min(_jobs, key=lambda key: _jobs[key]["created_at"])
             del _jobs[oldest]
         _jobs[job_id] = job
-    background_tasks.add_task(_run_assessment, job_id, target)
+    background_tasks.add_task(_run_assessment, job_id, target, request.profile)
     return deepcopy(job)
 
 

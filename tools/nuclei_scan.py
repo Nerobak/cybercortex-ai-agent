@@ -9,6 +9,38 @@ from config import ENABLE_ACTIVE_SCANNING, REPORT_DIR
 from tools.scope_guard import enforce_scope
 
 
+def _result(
+    target: str,
+    status: str,
+    findings: list[dict] | None = None,
+    *,
+    evidence_file: str | None = None,
+    error: str | None = None,
+) -> dict:
+    findings = findings or []
+    counts = Counter(item.get("severity", "unknown") for item in findings)
+    summary = {
+        name: counts.get(name, 0)
+        for name in ("critical", "high", "medium", "low", "info", "unknown")
+    }
+    return {
+        "success": status == "completed",
+        "target": target,
+        "status": status,
+        "finding_count": len(findings),
+        "severity_summary": summary,
+        "findings": findings[:50],
+        "evidence_file": evidence_file,
+        "timeout": status == "timed_out",
+        "failure": status == "failed",
+        "error": error,
+        # Compatibility aliases for existing consumers.
+        "url": target,
+        "findings_count": len(findings),
+        "raw_output_file": evidence_file,
+    }
+
+
 def safe_filename_from_url(url: str) -> str:
     """
     Convert a URL into a safe filename component.
@@ -79,14 +111,14 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
         return scope
 
     if not ENABLE_ACTIVE_SCANNING:
-        return {
-            "success": False,
-            "url": url,
-            "error": (
+        return _result(
+            url,
+            "failed",
+            error=(
                 "Active scanning is disabled. "
                 "Set ENABLE_ACTIVE_SCANNING=true in .env"
             ),
-        }
+        )
 
     report_directory = Path(REPORT_DIR)
     report_directory.mkdir(parents=True, exist_ok=True)
@@ -122,40 +154,22 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
         )
 
     except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "url": url,
-            "severity": severity,
-            "findings_count": 0,
-            "findings": [],
-            "severity_summary": {},
-            "error": "Nuclei scan timed out after 60 seconds.",
-        }
+        return _result(
+            url, "timed_out", error="Nuclei scan timed out after 60 seconds."
+        )
 
     except FileNotFoundError:
-        return {
-            "success": False,
-            "url": url,
-            "severity": severity,
-            "findings_count": 0,
-            "findings": [],
-            "severity_summary": {},
-            "error": (
+        return _result(
+            url,
+            "failed",
+            error=(
                 "Nuclei executable was not found. "
                 "Confirm that Nuclei is installed and available in PATH."
             ),
-        }
+        )
 
     except Exception as exc:
-        return {
-            "success": False,
-            "url": url,
-            "severity": severity,
-            "findings_count": 0,
-            "findings": [],
-            "severity_summary": {},
-            "error": str(exc),
-        }
+        return _result(url, "failed", error=str(exc))
 
     raw_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
@@ -173,29 +187,12 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
         if finding is not None:
             findings.append(finding)
 
-    severity_counts = Counter(
-        finding.get("severity", "unknown") for finding in findings
-    )
-
-    severity_summary = {
-        "critical": severity_counts.get("critical", 0),
-        "high": severity_counts.get("high", 0),
-        "medium": severity_counts.get("medium", 0),
-        "low": severity_counts.get("low", 0),
-        "info": severity_counts.get("info", 0),
-        "unknown": severity_counts.get("unknown", 0),
-    }
-
     stderr = result.stderr.strip()
-
-    return {
-        "success": result.returncode == 0,
-        "url": url,
-        "requested_severity": severity,
-        "template": ("http/misconfiguration/" "http-missing-security-headers.yaml"),
-        "findings_count": len(findings),
-        "severity_summary": severity_summary,
-        "findings": findings[:50],
-        "raw_output_file": (str(raw_output_file) if raw_lines else None),
-        "error": stderr or None,
-    }
+    status = "completed" if result.returncode == 0 else "failed"
+    return _result(
+        url,
+        status,
+        findings,
+        evidence_file=str(raw_output_file) if raw_lines else None,
+        error=stderr or None,
+    )

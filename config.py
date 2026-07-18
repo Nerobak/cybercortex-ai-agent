@@ -55,6 +55,7 @@ BUG_BOUNTY_USER_AGENT = os.getenv("BUG_BOUNTY_USER_AGENT", "CyberCortexAI")
 MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "2"))
 
 NUCLEI_SEVERITY = os.getenv("NUCLEI_SEVERITY", "low")
+AI_REPORT_TIMEOUT_SECONDS = int(os.getenv("AI_REPORT_TIMEOUT_SECONDS", "300"))
 
 # ============================================================
 # Output Directories

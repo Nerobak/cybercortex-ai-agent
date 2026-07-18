@@ -1,5 +1,13 @@
 # CyberCortex AI Agent
 
+## CyberCortex AI Agent v2.0.0 Beta
+
+Version metadata is sourced from `agent_core/version.py`. V2 uses an evidence-driven, dependency-aware workflow with baseline, deep, and authenticated profiles. Tool output is normalized before it reaches the local DeepSeek analyst; deterministic fallback reports remain available when the model is unavailable. The dashboard binds to localhost.
+
+Use `explain <tool>`, `explain latest`, `explain scan`, and `explain profiles` for deterministic operational guidance. Use `doctor --quick` or `doctor` for local release-readiness checks; neither starts a target scan or prints secrets.
+
+Authenticated tools require explicit controlled credentials or request input. Baseline scans do not automatically verify IDOR, JWT acceptance, GraphQL authorization, business logic, or upload behavior. Explicit authorization, configured scope, and program rules always apply.
+
 > **A fully local AI-powered cybersecurity assistant for authorized security assessments, bug bounty research, reconnaissance, analysis, and professional reporting.**
 
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
@@ -19,6 +27,24 @@ Unlike traditional security automation scripts, CyberCortex AI Agent combines a 
 The project is designed around a modular AI architecture that separates planning, workflow management, decision-making, security tooling, and AI-assisted reporting.
 
 No cloud AI services are required.
+
+## Assessment commands
+
+```text
+scan <target>
+scan <target> --profile baseline
+scan <target> --profile deep
+scan <target> --jwt-file verification_inputs/token.txt
+list tools
+jwt analyze
+```
+
+`baseline` is the default and runs target-only checks. `deep` adds bounded,
+policy-approved discovery as those tools become available. Authenticated and
+authorization-differential verification is never inferred from a normal scan;
+it requires explicit researcher credentials or evidence. JWT input should be
+entered through the hidden `jwt analyze` prompt or an ignored file under
+`verification_inputs/`.
 
 ---
 ## Screenshots

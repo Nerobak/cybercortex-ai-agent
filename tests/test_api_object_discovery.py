@@ -5,9 +5,12 @@ import threading
 from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
 
+import pytest
+
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from tools.api_object_discovery import (
+    classify_path_segment,
     crawl_and_discover_ids,
 )
 
@@ -177,6 +180,54 @@ def test_invalid_limits():
     print(result)
 
     assert result["success"] is False
+
+
+@pytest.mark.parametrize(
+    ("segment", "parent", "kind"),
+    [
+        ("exchange", "", "route"),
+        ("announcements", "exchange", "route"),
+        ("privacy", "document", "resource_slug"),
+        ("trading-rules", "document", "resource_slug"),
+        ("cro-rewards", "user", "resource_slug"),
+        ("1001", "users", "numeric_identifier"),
+        ("550e8400-e29b-41d4-a716-446655440000", "users", "uuid_identifier"),
+        ("project-123", "projects", "opaque_identifier"),
+        ("index-Dxj6cuuy.js", "assets", "asset_filename"),
+        ("en-US", "exchange-pro", "locale"),
+    ],
+)
+def test_explicit_path_segment_classification(segment, parent, kind):
+    assert classify_path_segment(segment, parent=parent) == kind
+
+
+def test_offline_slug_routes_never_become_authorization_candidates(monkeypatch):
+    monkeypatch.setattr(
+        "tools.api_object_discovery.enforce_scope", lambda url: {"allowed": True}
+    )
+    urls = [
+        "https://example.test/exchange",
+        "https://example.test/exchange/announcements",
+        "https://example.test/exchange/document/privacy",
+        "https://example.test/exchange/document/trading-rules",
+        "https://example.test/exchange/document/fees-limits",
+        "https://example.test/exchange/document/tnc",
+        "https://example.test/exchange/document/crypto-asset-statements",
+        "https://example.test/exchange/user/cro-rewards",
+        "https://example.test/exchange/staking",
+        "https://example.test/exchange/referral",
+        "https://example.test/exchange/trading-bots",
+        "https://example.test/exchange/institution",
+        "https://example.test/exchange/supercharger",
+    ]
+    result = crawl_and_discover_ids(
+        urls[0], normalized_url_evidence={"all_urls": urls}, allow_network_crawl=False
+    )
+    assert result["urls_received_from_katana"] == len(urls)
+    assert result["urls_analyzed_offline"] == len(urls)
+    assert result["extra_pages_requested"] == 0
+    assert result["candidate_authorization_tests"] == []
+    assert result["resource_slugs_discovered"] >= 6
 
 
 def main():

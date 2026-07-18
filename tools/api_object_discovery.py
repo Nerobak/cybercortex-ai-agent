@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
+from collections import Counter
 from collections import deque
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
@@ -61,7 +63,7 @@ JSON_KEY_VALUE_PATTERN = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-PATH_SKIP_SEGMENTS = {
+STATIC_ROUTE_SEGMENTS = {
     "api",
     "rest",
     "graphql",
@@ -73,6 +75,112 @@ PATH_SKIP_SEGMENTS = {
     "images",
     "css",
     "js",
+    "fonts",
+    "media",
+    "exchange",
+    "announcements",
+    "announcement",
+    "institution",
+    "institutions",
+    "referral",
+    "referrals",
+    "supercharger",
+    "staking",
+    "trading-bots",
+    "login",
+    "logout",
+    "register",
+    "settings",
+    "search",
+    "help",
+    "about",
+    "contact",
+    "home",
+    "dashboard",
+}
+
+# Route vocabulary is an explicit denylist: names alone are navigation, not
+# authorization objects. Keep this intentionally broader than API vocabulary.
+ROUTE_WORDS = STATIC_ROUTE_SEGMENTS | {
+    "exchange",
+    "announcements",
+    "announcement",
+    "institution",
+    "institutions",
+    "referral",
+    "referrals",
+    "supercharger",
+    "staking",
+    "privacy",
+    "trading-bots",
+    "user",
+    "users",
+    "account",
+    "accounts",
+    "admin",
+    "profile",
+    "profiles",
+    "order",
+    "orders",
+    "project",
+    "projects",
+    "login",
+    "logout",
+    "register",
+    "settings",
+    "search",
+    "help",
+    "about",
+    "contact",
+    "home",
+    "dashboard",
+}
+
+RESOURCE_COLLECTIONS = {
+    "users",
+    "user",
+    "accounts",
+    "account",
+    "profiles",
+    "profile",
+    "orders",
+    "order",
+    "projects",
+    "project",
+    "institutions",
+    "institution",
+    "referrals",
+    "referral",
+    "transactions",
+    "transaction",
+    "invoices",
+    "invoice",
+    "items",
+    "item",
+    "documents",
+    "document",
+    "organizations",
+    "organization",
+    "teams",
+    "team",
+    "customers",
+    "customer",
+    "subscriptions",
+    "subscription",
+}
+
+ASSET_EXTENSION_PATTERN = re.compile(
+    r"\.(?:js|mjs|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot)(?:$|[?#])", re.I
+)
+LOCALE_PATTERN = re.compile(r"^[a-z]{2}(?:-[A-Z]{2})?$")
+RESOURCE_SLUG_PATTERNS = (
+    re.compile(r"^[a-z]+(?:-[a-z]+)+$"),
+    re.compile(r"^(?:privacy|tnc|terms|fees-limits|trading-rules)$"),
+)
+ACTUAL_IDENTIFIER_KINDS = {
+    "numeric_identifier",
+    "uuid_identifier",
+    "opaque_identifier",
 }
 
 REDACTED_HEADERS = {
@@ -128,24 +236,42 @@ def _sanitize_headers(
     return sanitized
 
 
-def _looks_like_identifier(value: str) -> bool:
+def _entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    return -sum(
+        (value.count(c) / len(value)) * math.log2(value.count(c) / len(value))
+        for c in set(value)
+    )
+
+
+def _looks_like_identifier(value: str, *, after_resource: bool = False) -> bool:
     text = value.strip()
 
     if not text:
         return False
 
-    if text.isdigit():
-        return True
-
     if UUID_PATTERN.fullmatch(text):
         return True
-
-    if len(text) >= 8 and re.fullmatch(
-        r"[A-Za-z0-9_-]+",
-        text,
+    lowered = text.lower()
+    if lowered in ROUTE_WORDS or ASSET_EXTENSION_PATTERN.search(lowered):
+        return False
+    if text.isdigit():
+        return True
+    # Mixed alphabetic/numeric values are strong object-reference evidence.
+    if (
+        re.fullmatch(r"[A-Za-z0-9_-]+", text)
+        and re.search(r"[A-Za-z]", text)
+        and re.search(r"\d", text)
     ):
         return True
-
+    # Long, diverse URL-safe values are token-like even without digits.
+    if (
+        len(text) >= 20
+        and re.fullmatch(r"[A-Za-z0-9_-]+", text)
+        and _entropy(text) >= 3.5
+    ):
+        return True
     return False
 
 
@@ -159,6 +285,44 @@ def _identifier_type(value: str) -> str:
         return "uuid"
 
     return "opaque"
+
+
+def classify_path_segment(
+    value: str, *, parent: str = "", next_segment: str = ""
+) -> str:
+    """Classify a path segment before deciding whether it is an object reference."""
+    text = value.strip()
+    lowered = text.lower()
+    if ASSET_EXTENSION_PATTERN.search(text):
+        return "asset_filename"
+    if LOCALE_PATTERN.fullmatch(text):
+        return "locale"
+    if UUID_PATTERN.fullmatch(text):
+        return "uuid_identifier"
+    if text.isdigit():
+        return "numeric_identifier"
+    if any(pattern.fullmatch(lowered) for pattern in RESOURCE_SLUG_PATTERNS):
+        # A slug following a resource collection is still only an identifier when
+        # it has strong mixed alpha/numeric evidence (for example project-123).
+        if (
+            parent.lower() in RESOURCE_COLLECTIONS
+            and re.search(r"[a-z]", lowered)
+            and re.search(r"\d", lowered)
+            and lowered not in ROUTE_WORDS
+        ):
+            return "opaque_identifier"
+        return "resource_slug"
+    if lowered in STATIC_ROUTE_SEGMENTS:
+        return "route"
+    if lowered in RESOURCE_COLLECTIONS and next_segment:
+        return "collection"
+    if _looks_like_identifier(
+        text, after_resource=parent.lower() in RESOURCE_COLLECTIONS
+    ):
+        return "opaque_identifier"
+    if lowered in RESOURCE_COLLECTIONS:
+        return "collection"
+    return "unknown"
 
 
 def _singularize(value: str) -> str:
@@ -188,7 +352,12 @@ def _extract_path_identifiers(
     for index, segment in enumerate(segments):
         decoded_segment = segment.strip()
 
-        if not _looks_like_identifier(decoded_segment):
+        parent = segments[index - 1] if index > 0 else ""
+        next_segment = segments[index + 1] if index + 1 < len(segments) else ""
+        identifier_kind = classify_path_segment(
+            decoded_segment, parent=parent, next_segment=next_segment
+        )
+        if identifier_kind not in ACTUAL_IDENTIFIER_KINDS:
             continue
 
         parent = segments[index - 1] if index > 0 else "object"
@@ -202,6 +371,7 @@ def _extract_path_identifiers(
                 "field": object_name,
                 "value": decoded_segment,
                 "identifier_type": _identifier_type(decoded_segment),
+                "identifier_kind": identifier_kind,
             }
         )
 
@@ -231,6 +401,15 @@ def _extract_query_identifiers(
 
         for value in values:
             if field_looks_like_id or _looks_like_identifier(value):
+                identifier_kind = (
+                    "numeric_identifier"
+                    if value.isdigit()
+                    else (
+                        "uuid_identifier"
+                        if UUID_PATTERN.fullmatch(value)
+                        else "opaque_identifier"
+                    )
+                )
                 identifiers.append(
                     {
                         "source": "query",
@@ -238,6 +417,7 @@ def _extract_query_identifiers(
                         "field": field,
                         "value": value,
                         "identifier_type": (_identifier_type(value)),
+                        "identifier_kind": identifier_kind,
                     }
                 )
 
@@ -272,6 +452,15 @@ def _extract_json_identifiers(
                         "field": field_path,
                         "value": str(child),
                         "identifier_type": (_identifier_type(str(child))),
+                        "identifier_kind": (
+                            "numeric_identifier"
+                            if str(child).isdigit()
+                            else (
+                                "uuid_identifier"
+                                if UUID_PATTERN.fullmatch(str(child))
+                                else "opaque_identifier"
+                            )
+                        ),
                     }
                 )
 
@@ -312,6 +501,15 @@ def _extract_text_identifiers(
                 "field": field,
                 "value": value,
                 "identifier_type": _identifier_type(value),
+                "identifier_kind": (
+                    "numeric_identifier"
+                    if value.isdigit()
+                    else (
+                        "uuid_identifier"
+                        if UUID_PATTERN.fullmatch(value)
+                        else "opaque_identifier"
+                    )
+                ),
             }
         )
 
@@ -323,6 +521,7 @@ def _extract_text_identifiers(
                 "field": "uuid",
                 "value": value,
                 "identifier_type": "uuid",
+                "identifier_kind": "uuid_identifier",
             }
         )
 
@@ -460,6 +659,8 @@ def crawl_and_discover_ids(
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     same_origin_only: bool = True,
     verify_tls: bool = True,
+    normalized_url_evidence: dict[str, Any] | None = None,
+    allow_network_crawl: bool = True,
 ) -> dict[str, Any]:
     """
     Crawl an explicitly authorized target and extract identifiers observed
@@ -514,6 +715,39 @@ def crawl_and_discover_ids(
         ("application/json, text/html, " "application/javascript, text/plain, */*"),
     )
 
+    normalized_url_evidence = (
+        normalized_url_evidence if isinstance(normalized_url_evidence, dict) else {}
+    )
+    raw_katana_urls = normalized_url_evidence.get("all_urls")
+    katana_urls = (
+        list(raw_katana_urls) if isinstance(raw_katana_urls, (list, tuple, set)) else []
+    )
+    allowed_katana_urls = [
+        _normalize_url(url)
+        for url in katana_urls
+        if isinstance(url, str) and enforce_scope(url).get("allowed")
+    ]
+    offline_identifiers: list[dict[str, Any]] = []
+    offline_segment_classifications: list[dict[str, str]] = []
+    for url in allowed_katana_urls:
+        offline_identifiers.extend(_extract_path_identifiers(url))
+        offline_identifiers.extend(_extract_query_identifiers(url))
+        segments = [segment for segment in urlparse(url).path.split("/") if segment]
+        for index, segment in enumerate(segments):
+            offline_segment_classifications.append(
+                {
+                    "url": url,
+                    "segment": segment,
+                    "classification": classify_path_segment(
+                        segment,
+                        parent=segments[index - 1] if index else "",
+                        next_segment=(
+                            segments[index + 1] if index + 1 < len(segments) else ""
+                        ),
+                    ),
+                }
+            )
+
     queue: deque[tuple[str, int]] = deque(
         [
             (
@@ -527,13 +761,13 @@ def crawl_and_discover_ids(
 
     visited: set[str] = set()
     pages: list[dict[str, Any]] = []
-    identifiers: list[dict[str, Any]] = []
+    identifiers: list[dict[str, Any]] = list(offline_identifiers)
     discovered_urls: set[str] = set()
     errors: list[dict[str, str]] = []
 
     session = requests.Session()
 
-    while queue and len(visited) < max_pages:
+    while allow_network_crawl and queue and len(visited) < max_pages:
         current_url, depth = queue.popleft()
 
         if current_url in visited:
@@ -688,6 +922,7 @@ def crawl_and_discover_ids(
             "field": item["field"],
             "observed_identifier": item["value"],
             "identifier_type": item["identifier_type"],
+            "identifier_kind": item["identifier_kind"],
             "source": item["source"],
             "recommendation": (
                 "Use a second explicitly controlled account "
@@ -696,8 +931,36 @@ def crawl_and_discover_ids(
             ),
         }
         for item in identifiers
+        if item.get("identifier_kind") in ACTUAL_IDENTIFIER_KINDS
     ]
 
+    resource_slugs = [
+        item
+        for item in offline_segment_classifications
+        if item["classification"] == "resource_slug"
+    ]
+    static_routes = [
+        item
+        for item in offline_segment_classifications
+        if item["classification"] in {"route", "collection"}
+    ]
+
+    classification_counts = Counter(
+        item.get("classification", "unknown")
+        for item in offline_segment_classifications
+    )
+    classification_summary = {
+        kind: classification_counts.get(kind, 0)
+        for kind in (
+            "route",
+            "resource_slug",
+            "asset_filename",
+            "locale",
+            "numeric_identifier",
+            "uuid_identifier",
+            "opaque_identifier",
+        )
+    }
     return {
         "success": True,
         "start_url": start_url,
@@ -716,9 +979,19 @@ def crawl_and_discover_ids(
             "object_count": len(object_map),
             "error_count": len(errors),
         },
+        "urls_received_from_katana": len(katana_urls),
+        "urls_analyzed_offline": len(allowed_katana_urls),
+        "extra_pages_requested": len(visited),
+        "identifiers_discovered": len(identifiers),
+        "resource_slugs_discovered": len(resource_slugs),
+        "static_routes_discovered": len(static_routes),
+        "classification_summary": classification_summary,
+        "sample_classifications": offline_segment_classifications[:20],
+        "identifier_count": len(identifiers),
+        "candidate_authorization_test_count": len(candidate_tests),
         "pages": pages,
         "identifiers": identifiers,
         "objects": object_map,
-        "candidate_authorization_tests": (candidate_tests),
+        "candidate_authorization_tests": candidate_tests[:20],
         "errors": errors,
     }

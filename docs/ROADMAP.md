@@ -1,5 +1,17 @@
 # Roadmap
 
+## v2.0.0 Beta stabilization
+
+The beta milestone delivers dependency-aware profiles, normalized evidence, conservative observation/candidate boundaries, bounded discovery output, deterministic/DeepSeek reporting, the local dashboard, `explain`, and `doctor`.
+
+## v2.1
+
+- GraphQL testing suite, activated only after endpoint evidence
+- Controlled JWT verification workflows
+- Business-logic analysis engine
+- Evidence-driven file-upload analysis
+- Authenticated object-authorization workflows with controlled accounts
+
 This project is under active development. The goal is to build a fully local AI Security Agent capable of assisting security researchers and bug bounty hunters with authorized reconnaissance, analysis, and reporting.
 
 ---
@@ -146,4 +158,3 @@ Current Status:
 **Version 1.0 Beta**
 
 Actively developed and continuously improving.
-

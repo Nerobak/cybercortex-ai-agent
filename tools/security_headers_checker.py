@@ -1,9 +1,9 @@
-import requests
+from tools.safe_http import UnsafeRedirectError, scoped_get
 
 
 def security_headers_checker(url: str):
     try:
-        response = requests.get(url, timeout=10, allow_redirects=True)
+        response, redirect_chain = scoped_get(url, timeout=10)
         headers = response.headers
 
         required_headers = {
@@ -28,8 +28,13 @@ def security_headers_checker(url: str):
             "success": True,
             "url": response.url,
             "status_code": response.status_code,
+            "requested_url": url,
+            "effective_url": response.url,
+            "redirect_chain": redirect_chain,
             "headers_checked": results,
         }
 
+    except UnsafeRedirectError as e:
+        return {"success": False, "error": str(e), "redirect_chain": e.redirect_chain}
     except Exception as e:
         return {"success": False, "error": str(e)}

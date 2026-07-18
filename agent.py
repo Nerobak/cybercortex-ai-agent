@@ -1,16 +1,24 @@
+import getpass
+import shlex
 import sys
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 from openai import OpenAI
 
 from agent_core.workflow_manager import run_workflow
+from agent_core.doctor import doctor
+from agent_core.tool_explainer import explain
+from agent_core.version import __version__
 from config import (
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     OPENAI_MODEL,
 )
 from tools.scope_guard import enforce_scope
+from tool_registry import validate_registry
+from tools.jwt_security_analyzer import analyze_jwt
 
 SYSTEM_PROMPT = """
 You are CyberCortex AI, a cybersecurity learning and analysis assistant.
@@ -36,6 +44,8 @@ Rules:
   "scan" command.
 - Keep explanations practical and technically accurate.
 """
+
+LATEST_SCAN_RESULT: dict[str, Any] | None = None
 
 
 def create_llm_client() -> OpenAI:
@@ -121,7 +131,35 @@ def run_scan_command(command: str) -> dict[str, Any]:
     workflow tools are allowed to run.
     """
 
-    target = normalize_target(command)
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        return {"success": False, "error": f"Invalid scan command: {exc}"}
+    if not parts:
+        return {"success": False, "error": "Please provide an authorized target."}
+    target = normalize_target(parts[0])
+    profile = "baseline"
+    jwt_token = None
+    index = 1
+    while index < len(parts):
+        option = parts[index]
+        if option == "--profile" and index + 1 < len(parts):
+            profile = parts[index + 1].lower()
+            index += 2
+            continue
+        if option == "--jwt-file" and index + 1 < len(parts):
+            path = Path(parts[index + 1])
+            try:
+                jwt_token = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                return {"success": False, "error": f"Unable to read JWT file: {exc}"}
+            index += 2
+            continue
+        return {"success": False, "error": f"Unsupported scan option: {option}"}
+    if profile not in {"baseline", "deep", "authenticated"}:
+        return {"success": False, "error": f"Unknown scan profile: {profile}"}
+    if jwt_token and profile != "authenticated":
+        profile = "authenticated"
 
     if not target:
         return {
@@ -152,11 +190,16 @@ def run_scan_command(command: str) -> dict[str, Any]:
     )
 
     try:
-        return run_workflow(
+        result = run_workflow(
             goal,
             target,
             allowed_domain,
+            profile=profile,
+            jwt_token=jwt_token,
         )
+        global LATEST_SCAN_RESULT
+        LATEST_SCAN_RESULT = result
+        return result
 
     except Exception as exc:
         return {
@@ -171,9 +214,12 @@ def print_nuclei_result(tool_result: dict[str, Any]) -> None:
     Print a concise Nuclei summary instead of dumping full findings.
     """
 
+    tool_result = tool_result.get("output") or tool_result
     print(f"Success: {tool_result.get('success')}")
-    print(f"Target: {tool_result.get('url', 'N/A')}")
-    print(f"Findings: {tool_result.get('findings_count', 0)}")
+    print(f"Target: {tool_result.get('target', tool_result.get('url', 'N/A'))}")
+    print(
+        f"Findings: {tool_result.get('finding_count', tool_result.get('findings_count', 0))}"
+    )
 
     severity_summary = tool_result.get("severity_summary", {})
 
@@ -224,7 +270,7 @@ def print_nuclei_result(tool_result: dict[str, Any]) -> None:
 
             print(item)
 
-    raw_file = tool_result.get("raw_output_file")
+    raw_file = tool_result.get("evidence_file") or tool_result.get("raw_output_file")
 
     if raw_file:
         print(f"Raw evidence: {raw_file}")
@@ -364,6 +410,25 @@ def print_result(result: Any) -> None:
 
     print(f"Success: {result.get('success', True)}")
 
+    assessment_status = result.get("assessment_status")
+    if assessment_status:
+        labels = {
+            "completed": "Completed",
+            "completed_with_limitations": "Completed with limitations",
+            "failed": "Failed",
+        }
+        print(f"Assessment status: {labels.get(assessment_status, assessment_status)}")
+    coverage = result.get("coverage") or {}
+    if coverage:
+        print(f"Coverage: {coverage.get('coverage_percentage', 0)}%")
+        if coverage.get("failed_tools") or coverage.get("timed_out_tools"):
+            print(
+                f"Failed tools: {', '.join(coverage.get('failed_tools', [])) or 'None'}"
+            )
+            print(
+                f"Timed-out tools: {', '.join(coverage.get('timed_out_tools', [])) or 'None'}"
+            )
+
     if result.get("goal"):
         print(f"Goal: {result['goal']}")
 
@@ -411,13 +476,31 @@ CyberCortex AI commands
       Ask a cybersecurity or technical question.
 
   scan <target>
+  scan <target> --profile baseline
+  scan <target> --profile deep
       Run the security workflow against an authorized in-scope target.
+
+  list tools
+      Display registered tools, prerequisites, traffic, and profiles.
+
+  explain <tool> | explain latest | explain scan | explain profiles
+      Explain deterministic capabilities, evidence, limitations, or the latest scan.
+
+  jwt analyze [token]
+      Analyze an explicitly supplied JWT offline. With no token, prompt securely.
+
+  doctor [--quick]
+      Check local release readiness without running a live target scan.
 
   help
       Display this help message.
 
   exit
       Exit CyberCortex AI.
+
+Authenticated tools require explicit controlled input. Baseline scans do not
+automatically test IDOR, JWT acceptance, GraphQL authorization, business logic,
+or file uploads. Scope and program rules always apply.
 
 Examples
 
@@ -472,12 +555,41 @@ def process_user_input(user_input: str) -> Any:
     if lowered.startswith("/scan "):
         return run_scan_command(cleaned[6:].strip())
 
+    if lowered == "list tools":
+        rows = ["Tool | Status | Category | Prerequisites | Traffic | Profiles"]
+        for item in validate_registry():
+            rows.append(
+                " | ".join(
+                    (
+                        item["name"],
+                        item["status"],
+                        item["category"],
+                        ",".join(item["prerequisites"]) or "none",
+                        "network" if item["network"] else "offline",
+                        ",".join(item["profiles"]),
+                    )
+                )
+            )
+        return "\n".join(rows)
+
+    if lowered.startswith("explain "):
+        return explain(cleaned[len("explain ") :], LATEST_SCAN_RESULT)
+
+    if lowered == "doctor" or lowered == "doctor --quick":
+        return doctor(quick=lowered.endswith("--quick"))
+
+    if lowered == "jwt analyze" or lowered.startswith("jwt analyze "):
+        token = cleaned[len("jwt analyze") :].strip()
+        if not token:
+            token = getpass.getpass("JWT (hidden): ").strip()
+        return analyze_jwt(token)
+
     return ask_question(cleaned)
 
 
 def main() -> None:
     print("=" * 60)
-    print("CyberCortex AI")
+    print(f"CyberCortex AI Agent v{__version__}")
     print("=" * 60)
     print("Use 'ask <question>' for questions.")
     print("Use 'scan <target>' for authorized security testing.")

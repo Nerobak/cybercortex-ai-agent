@@ -275,7 +275,10 @@ def analyze_jwt(
             severity="high",
             confidence="high",
             evidence=f"The JWT header declares alg={algorithm!r}.",
-            risk=("A vulnerable verifier may accept an unsigned token."),
+            risk=(
+                "This is a verification condition only. The header does not "
+                "prove that the server accepts unsigned tokens."
+            ),
             recommendation=(
                 "Reject unsigned JWTs and enforce a server-side " "algorithm allowlist."
             ),

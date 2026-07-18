@@ -118,6 +118,17 @@ def is_url_prefix_allowed(target: str) -> bool:
 
 
 def is_target_allowed(target: str) -> bool:
+    parsed = urlparse(normalize_url(target))
+    host = (parsed.hostname or "").lower().rstrip(".")
+    # A configured URL prefix for this host is the narrower authorization and
+    # must not be bypassed merely because the host also appears in the domain
+    # allowlist.
+    host_has_prefix = any(
+        (urlparse(normalize_url(prefix)).hostname or "").lower().rstrip(".") == host
+        for prefix in get_allowed_url_prefixes()
+    )
+    if host_has_prefix:
+        return is_url_prefix_allowed(target)
     return is_domain_allowed(target) or is_url_prefix_allowed(target)
 
 

@@ -1,5 +1,9 @@
 # Installation Guide
 
+## CyberCortex AI Agent v2.0.0 Beta readiness
+
+After installation, run `doctor --quick`. Resolve `FAIL` entries before use and review environment-specific `WARN` entries. A full `doctor` additionally runs registry and compile checks; it does not scan a target. Keep `.env`, reports, logs, verification inputs, captured requests, Burp files, and local JWT inputs untracked. The dashboard binds only to `127.0.0.1`.
+
 This guide explains how to install and configure **CyberCortex AI Agent** on a local system using **Ollama** and **DeepSeek R1 Distill 32B**.
 
 ---
@@ -56,6 +60,18 @@ venv\Scripts\activate
 ```bash
 pip install -r requirements.txt
 ```
+
+For development checks:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+Configure both the hostname allowlist and, where authorization is path-limited,
+`PENTEST_ALLOWED_URL_PREFIXES`. Keep JWTs and captured verification material in
+the Git-ignored `verification_inputs/` directory. Baseline and deep scans do not
+automatically run authenticated tools.
 
 ---
 

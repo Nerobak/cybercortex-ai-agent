@@ -1,6 +1,5 @@
 from tools import idor_verification_engine as engine
 
-
 RAW_REQUEST = """GET /api/users/1001 HTTP/1.1
 Host: lab.local
 Accept: application/json

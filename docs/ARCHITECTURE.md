@@ -1,5 +1,11 @@
 # Architecture
 
+## CyberCortex AI Agent v2.0.0 Beta
+
+The v2 pipeline is evidence-driven and dependency-aware: scope validation precedes network activity; independent checks run before crawl-dependent analyzers; normalized evidence separates observations, candidates needing manual verification, and verified findings. DeepSeek acts only as a local evidence analyst and may improve wording without changing deterministic classifications. When unavailable, the report writer emits a deterministic report. The local dashboard binds to `127.0.0.1`.
+
+Baseline is low-impact, deep permits broader bounded discovery, and authenticated enables only workflows supplied with explicit controlled input. The registry powers `list tools` and `explain`; `doctor` validates local release prerequisites without scanning a live target.
+
 CyberCortex AI Agent is built as a modular AI-assisted security workflow.
 
 ## Flow
@@ -14,13 +20,20 @@ Planner
 ↓  
 Decision Engine  
 ↓  
-Workflow Manager  
+Dependency-aware Tool Runner
 ↓  
 Tool Registry  
 ↓  
 Security Tools  
 ↓  
 AI Report Writer  
+
+The runner uses canonical registry metadata to enforce prerequisites, explicit
+inputs, per-tool and overall timeouts, network concurrency bounds, and status
+envelopes. Crawler and redirect URLs are rechecked by the scope guard. A shared
+URL collection feeds endpoint, parameter, misconfiguration, JavaScript, and API
+object analyzers. Deterministic finding classification and secret redaction run
+before one bounded evidence package is sent to the local analyst model.
 
 ## Core Components
 
@@ -31,10 +44,14 @@ AI Report Writer
 - `agent_core/planner.py` – creates tool execution plans
 - `agent_core/decision_engine.py` – parses and selects workflow steps
 - `agent_core/workflow_manager.py` – executes the planned workflow
+- `agent_core/tool_runner.py` – dependency execution and result envelopes
+- `agent_core/result_normalizer.py` – shared URL and evidence normalization
 - `tools/` – cybersecurity tools
 - `reports/` – generated Markdown reports
 
 ## Safety Model
 
-All target testing is controlled by `PENTEST_ALLOWLIST` in `.env`.
-Targets not listed in the allowlist are blocked by `scope_guard.py`.
+All target testing is controlled by `PENTEST_ALLOWLIST` and
+`PENTEST_ALLOWED_URL_PREFIXES`. A prefix configured for a host is the narrower
+authorization. Redirect destinations and discovered URLs are independently
+validated; cross-domain and out-of-prefix redirects are blocked.

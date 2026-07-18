@@ -14,7 +14,7 @@ client = OpenAI(
 model = OPENAI_MODEL
 
 
-def ask_agent(message: str) -> str:
+def ask_agent(message: str, timeout: int | None = None) -> str:
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -27,6 +27,7 @@ def ask_agent(message: str) -> str:
                 "content": message,
             },
         ],
+        timeout=timeout,
     )
 
     return response.choices[0].message.content

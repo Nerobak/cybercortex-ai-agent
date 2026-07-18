@@ -1,9 +1,9 @@
-import requests
+from tools.safe_http import UnsafeRedirectError, scoped_get
 
 
 def tech_fingerprint(url: str):
     try:
-        response = requests.get(url, timeout=10, allow_redirects=True)
+        response, redirect_chain = scoped_get(url, timeout=10)
 
         headers = dict(response.headers)
 
@@ -35,7 +35,11 @@ def tech_fingerprint(url: str):
             "status_code": response.status_code,
             "headers": headers,
             "technologies": technologies,
+            "requested_url": url,
+            "redirect_chain": redirect_chain,
         }
 
+    except UnsafeRedirectError as e:
+        return {"success": False, "error": str(e), "redirect_chain": e.redirect_chain}
     except Exception as e:
         return {"success": False, "error": str(e)}

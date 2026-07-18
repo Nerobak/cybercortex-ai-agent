@@ -1,0 +1,159 @@
+"""Secret-safe local release-readiness checks."""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from agent_core.version import __version__
+from tool_registry import validate_registry
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _git(*args: str) -> str:
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def doctor(*, quick: bool = False) -> str:
+    """Return readiness diagnostics without displaying configuration values."""
+    rows: list[tuple[str, str, str]] = []
+
+    def add(level: str, name: str, detail: str) -> None:
+        rows.append((level, name, detail))
+
+    branch = _git("branch", "--show-current")
+    add(
+        "PASS" if branch == "develop-v2" else "WARN",
+        "Git branch",
+        branch or "unavailable",
+    )
+    add(
+        "WARN" if _git("status", "--porcelain") else "PASS",
+        "Working tree",
+        "dirty" if _git("status", "--porcelain") else "clean",
+    )
+    add("PASS", "Python version", sys.version.split()[0])
+    add(
+        "PASS" if sys.prefix != sys.base_prefix else "WARN",
+        "Virtual environment",
+        "active" if sys.prefix != sys.base_prefix else "not active",
+    )
+    add(
+        "PASS" if (ROOT / ".env").is_file() else "WARN",
+        ".env",
+        "found" if (ROOT / ".env").is_file() else "not found",
+    )
+    allowlist = bool(
+        os.getenv("PENTEST_ALLOWLIST") or os.getenv("PENTEST_ALLOWED_URL_PREFIXES")
+    )
+    add(
+        "PASS" if allowlist else "FAIL",
+        "Allowlist",
+        "configured" if allowlist else "not configured",
+    )
+    reports = ROOT / "reports"
+    parent = reports if reports.exists() else reports.parent
+    add(
+        "PASS" if os.access(parent, os.W_OK) else "FAIL",
+        "Reports directory",
+        "writable" if os.access(parent, os.W_OK) else "not writable",
+    )
+    missing = [
+        name
+        for name in ("fastapi", "openai", "pydantic", "requests", "dotenv")
+        if importlib.util.find_spec(name) is None
+    ]
+    add(
+        "PASS" if not missing else "FAIL",
+        "Python packages",
+        "installed" if not missing else "missing: " + ", ".join(missing),
+    )
+    for binary, required in (("katana", True), ("nuclei", True), ("whatweb", False)):
+        found = shutil.which(binary) is not None
+        add(
+            "PASS" if found else ("FAIL" if required else "WARN"),
+            binary.capitalize(),
+            (
+                "available"
+                if found
+                else ("not available" if required else "optional; not available")
+            ),
+        )
+    registry_ok = all(
+        item["callable_exists"] and item["metadata_complete"]
+        for item in validate_registry()
+    )
+    add(
+        "PASS" if registry_ok else "FAIL",
+        "Registry",
+        "valid" if registry_ok else "invalid or unavailable entries",
+    )
+    ignored = all(
+        _git("check-ignore", path)
+        for path in (
+            ".env",
+            "reports/example",
+            "logs/example",
+            "verification_inputs/example",
+            "sample.request.txt",
+            "sample.burp",
+        )
+    )
+    add(
+        "PASS" if ignored else "FAIL",
+        "Ignored secret paths",
+        "verified" if ignored else "incomplete",
+    )
+    source = (ROOT / "web_app.py").read_text(encoding="utf-8")
+    add(
+        "PASS" if 'host="127.0.0.1"' in source else "FAIL",
+        "Dashboard binding",
+        "localhost only" if 'host="127.0.0.1"' in source else "review required",
+    )
+    if quick:
+        add("WARN", "Ollama/model", "not contacted in quick mode")
+        add("WARN", "Tests", "not run in quick mode")
+    else:
+        add(
+            "WARN",
+            "Ollama/model",
+            "configuration checked; use Ollama CLI to confirm local availability",
+        )
+        compile_result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "compileall",
+                "-q",
+                "agent_core",
+                "tools",
+                "agent.py",
+                "web_app.py",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        add(
+            "PASS" if compile_result.returncode == 0 else "FAIL",
+            "Compile check",
+            "passed" if compile_result.returncode == 0 else "failed",
+        )
+        add("WARN", "Tests", "run the release quality-gate command for full status")
+    lines = [f"CyberCortex V2 Release Readiness ({__version__})", ""]
+    lines.extend(f"[{level}] {name}: {detail}" for level, name, detail in rows)
+    lines += [
+        "",
+        "Recommended fixes: resolve FAIL items before release; review WARN items for the intended environment.",
+    ]
+    return "\n".join(lines)
