@@ -11,8 +11,14 @@ tools/WhatWeb/
 verification_inputs/
 *.burp
 *.request.txt
-
-# Local verification inputs
-verification_inputs/
-*.burp
-*.request.txt
+*.jwt
+*.token
+*.graphql
+*.graphqls
+*.schema.json
+*.workflow.json
+*.upload.json
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

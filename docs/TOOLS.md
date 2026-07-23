@@ -24,7 +24,7 @@ researcher-owned benign files and remains an observation.
 
 Use `workflow explain` for complete registry metadata and safety limitations.
 
-## CyberCortex AI Agent v2.0.0 Beta
+## CyberCortex AI Agent v2.1.0-beta
 
 Every registered tool declares its category, profiles, prerequisites, traffic behavior, input, evidence, limitations, false positives, verification guidance, relevance, example usage, and safety notes. Inspect those facts with `explain <tool>`, compare profiles with `explain profiles`, review workflow boundaries with `explain scan`, or summarize the current session with `explain latest`.
 

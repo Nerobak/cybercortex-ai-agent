@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -26,6 +25,31 @@ from tools.scope_guard import (
 BASE_DIR = Path(__file__).resolve().parent
 DASHBOARD_FILE = BASE_DIR / "web" / "dashboard.html"
 MAX_RETAINED_JOBS = 50
+PUBLIC_JOB_FIELDS = {
+    "id",
+    "target",
+    "profile",
+    "status",
+    "assessment_status",
+    "coverage",
+    "progress",
+    "current_step",
+    "created_at",
+    "started_at",
+    "completed_at",
+    "tool_statuses",
+    "graphql",
+    "jwt",
+    "business_logic",
+    "upload",
+    "observations",
+    "candidates",
+    "verified_findings",
+    "findings",
+    "report_mode",
+    "report_file",
+    "error",
+}
 
 app = FastAPI(
     title="CyberCortex Bug Bounty Cockpit",
@@ -59,6 +83,23 @@ def _get_job(job_id: str) -> dict[str, Any]:
         if job is None:
             raise HTTPException(status_code=404, detail="Assessment not found")
         return deepcopy(job)
+
+
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Return the dashboard contract without raw evidence or credentials."""
+    public = {
+        key: deepcopy(value) for key, value in job.items() if key in PUBLIC_JOB_FIELDS
+    }
+    public["version"] = __version__
+    public["tool_statuses"] = {
+        name: {
+            "tool": name,
+            "status": envelope.get("status", "unknown"),
+        }
+        for name, envelope in (job.get("tool_statuses") or {}).items()
+        if isinstance(envelope, dict)
+    }
+    return public
 
 
 def _finding_summary(results: dict[str, Any]) -> list[dict[str, str]]:
@@ -154,6 +195,8 @@ def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None
         _set_job(
             job_id,
             status="completed",
+            assessment_status=workflow.get("assessment_status", "completed"),
+            coverage=workflow.get("coverage", {}),
             current_step=None,
             progress=100,
             completed_at=_now(),
@@ -169,9 +212,9 @@ def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None
             findings=evidence["observations"]
             + evidence["candidate_findings"]
             + evidence["verified_findings"],
-            deepseek_status=(workflow["results"].get("ai_report_writer") or {}).get(
-                "status", "not_applicable"
-            ),
+            report_mode=(
+                (workflow["results"].get("ai_report_writer") or {}).get("output") or {}
+            ).get("report_mode", "not_available"),
             report_file=(
                 (workflow["results"].get("ai_report_writer") or {}).get("output") or {}
             ).get("report_file"),
@@ -187,47 +230,122 @@ def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None
 
 
 def _render_report(job: dict[str, Any]) -> str:
-    findings = job.get("findings", [])
+    observations = job.get("observations", [])
+    candidates = job.get("candidates", [])
+    verified = job.get("verified_findings", [])
+    coverage = job.get("coverage") or {}
     lines = [
-        "# CyberCortex Authorized Assessment Report",
+        f"# CyberCortex AI Agent v{__version__} Security Assessment Report",
         "",
         f"**Target:** {job['target']}",
         f"**Generated:** {_now()}",
         f"**Assessment ID:** `{job['id']}`",
         "",
-        "## Scope and methodology",
+        "## Executive Summary",
         "",
-        "The operator explicitly confirmed authorization. CyberCortex performed only low-impact DNS and HTTP configuration checks against the configured in-scope target.",
+        "No evidence collected during this assessment demonstrated an exploitable vulnerability.",
         "",
-        "## Findings requiring manual validation",
+        f"- Observations: {len(observations)}",
+        f"- Candidates: {len(candidates)}",
+        f"- Verified findings: {len(verified)}",
+        "",
+        "## Scope and Authorization",
+        "",
+        "The operator confirmed authorization. Testing remained restricted to the configured scope and program rules.",
+        "",
+        "## Assessment Coverage",
+        "",
+        f"- Profile: {job.get('profile', 'unknown')}",
+        f"- Assessment status: {job.get('assessment_status', job.get('status', 'unknown'))}",
+        f"- Coverage: {coverage.get('coverage_percentage', 0)}%",
+        "",
+        "## Confirmed Security Controls",
+        "",
+        "No controls are claimed unless supported by the retained normalized evidence.",
+        "",
+        "## Verified Findings",
         "",
     ]
-    if not findings:
-        lines.append(
-            "No candidate findings were produced by the safe checks. This does not prove the target is vulnerability-free."
+    lines.append("No verified findings were recorded." if not verified else "")
+    for finding in verified[:20]:
+        lines.extend(_report_finding(finding))
+    lines.extend(["", "## Candidate Findings Requiring Manual Verification", ""])
+    if not candidates:
+        lines.append("No candidate findings were recorded.")
+    for finding in candidates[:20]:
+        lines.extend(_report_finding(finding))
+    lines.extend(["", "## Informational and Defense-in-Depth Observations", ""])
+    if not observations:
+        lines.append("No informational observations were recorded.")
+    for finding in observations[:20]:
+        lines.extend(_report_finding(finding))
+    for title, key, phrase in (
+        (
+            "GraphQL Surface",
+            "graphql",
+            "GraphQL-related application behavior was observed.",
+        ),
+        ("JWT Surface", "jwt", "JWT-related authentication metadata was observed."),
+        (
+            "Business Workflow Surface",
+            "business_logic",
+            "Business-workflow-related application behavior was observed.",
+        ),
+        (
+            "File Upload Surface",
+            "upload",
+            "File-upload-related application behavior was observed.",
+        ),
+    ):
+        data = job.get(key) or {}
+        relevant = bool(
+            data.get("endpoints_observed")
+            or data.get("tokens_observed")
+            or data.get("workflow_candidates")
+            or data.get("surface_observed")
         )
-    for index, finding in enumerate(findings, start=1):
-        lines.extend(
-            [
-                f"### {index}. {finding['title']}",
-                "",
-                f"- Severity: {finding['severity'].upper()}",
-                f"- Status: {finding['status']}",
-                f"- Evidence: {finding['evidence']}",
-                "",
-            ]
-        )
+        if relevant:
+            lines.extend(["", f"## {title}", "", phrase])
     lines.extend(
         [
-            "## Raw evidence",
             "",
-            "```json",
-            json.dumps(job.get("results", {}), indent=2),
-            "```",
+            "## Incomplete or Failed Checks",
+            "",
+            "See the coverage summary for partial or failed checks.",
+            "",
+            "## Prioritized Next Manual Tests",
+            "",
+            "Manually verify only candidates supported by the evidence above, using controlled accounts and test-owned resources.",
+            "",
+            "## Limitations",
+            "",
+            "Automated and offline analysis cannot by itself prove exploitability. Authenticated behavior requires explicit controlled input.",
+            "",
+            "## Conclusion",
+            "",
+            "No engine automatically proves a vulnerability. Review all evidence and program rules before further testing.",
             "",
         ]
     )
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line is not None)
+
+
+def _report_finding(finding: dict[str, Any]) -> list[str]:
+    """Render only normalized, secret-safe finding fields."""
+    return [
+        f"### {finding.get('title', 'Untitled observation')}",
+        "",
+        f"- Severity: {str(finding.get('severity', 'informational')).title()}",
+        f"- Status: {finding.get('status', 'Observation')}",
+        f"- Confidence: {finding.get('confidence', 'unknown')}",
+        f"- Source tool: {finding.get('source_tool', 'unknown')}",
+        f"- Evidence summary: {finding.get('evidence_summary', finding.get('evidence', 'No secret-safe summary available.'))}",
+        f"- What it proves: {finding.get('what_it_proves', 'Only the described behavior was observed.')}",
+        f"- What it does not prove: {finding.get('what_it_does_not_prove', 'Exploitability or security impact was not established.')}",
+        f"- Manual verification: {finding.get('manual_verification', 'Review with controlled evidence if permitted.')}",
+        f"- Limitations: {finding.get('limitations', 'Automated evidence is limited.')}",
+        "",
+    ]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -335,12 +453,12 @@ def start_scan(
             del _jobs[oldest]
         _jobs[job_id] = job
     background_tasks.add_task(_run_assessment, job_id, target, request.profile)
-    return deepcopy(job)
+    return _public_job(job)
 
 
 @app.get("/api/scans/{job_id}")
 def scan_status(job_id: str) -> dict[str, Any]:
-    return _get_job(job_id)
+    return _public_job(_get_job(job_id))
 
 
 @app.get("/api/scans/{job_id}/report", response_class=PlainTextResponse)
