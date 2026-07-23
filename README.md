@@ -1,5 +1,14 @@
 # CyberCortex AI Agent
 
+## File upload analysis
+
+The v2.1 upload engine discovers upload evidence offline, records validation,
+metadata, and storage observations, and produces bounded manual verification
+plans. Normal scans never upload files. Optional replay is authenticated,
+scope-enforced, disabled by default, and restricted to benign researcher-owned
+files. Reports and the dashboard expose aggregate upload summaries without
+filenames. See [docs/FILE_UPLOAD_ENGINE.md](docs/FILE_UPLOAD_ENGINE.md).
+
 ## Business logic analysis
 
 The v2.1 development workflow includes modular, offline-first workflow discovery,
@@ -45,6 +54,9 @@ scan <target> --profile deep
 scan <target> --jwt-file verification_inputs/token.txt
 list tools
 jwt analyze
+upload analyze verification_inputs/upload-evidence.json
+upload plan verification_inputs/upload-evidence.json
+upload explain
 ```
 
 `baseline` is the default and runs target-only checks. `deep` adds bounded,

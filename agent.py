@@ -31,6 +31,12 @@ from tools.workflow_transition_analyzer import analyze_workflow_transitions
 from tools.business_rule_analyzer import analyze_business_rules, compare_workflows
 from tools.business_logic_test_planner import plan_business_logic_tests
 from tools.workflow_replay_checker import check_workflow_replay
+from tools.upload_discovery import discover_upload_surface
+from tools.upload_validation_analyzer import analyze_upload_validation
+from tools.upload_metadata_analyzer import analyze_upload_metadata
+from tools.upload_storage_analyzer import analyze_upload_storage
+from tools.upload_security_planner import plan_upload_security
+from tools.upload_replay_checker import check_upload_replay
 
 SYSTEM_PROMPT = """
 You are CyberCortex AI, a cybersecurity learning and analysis assistant.
@@ -543,6 +549,10 @@ CyberCortex AI commands
   workflow replay <file> | workflow explain
       Analyze sanitized business workflows offline. Replay is disabled by default.
 
+  upload analyze <file> | upload plan <file>
+  upload replay <file> | upload explain
+      Analyze upload evidence offline. Replay is disabled by default.
+
   doctor [--quick]
       Check local release readiness without running a live target scan.
 
@@ -783,6 +793,51 @@ def process_user_input(user_input: str) -> Any:
             "business_rule_analyzer",
             "business_logic_test_planner",
             "workflow_replay_checker",
+        )
+        return "\n\n".join(explain(name) for name in names)
+
+    if lowered.startswith("upload analyze "):
+        try:
+            data = _read_json_file(
+                cleaned[len("upload analyze ") :].strip(), "upload evidence"
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        return {
+            "success": True,
+            "discovery": discover_upload_surface(data),
+            "validation": analyze_upload_validation(data),
+            "metadata": analyze_upload_metadata(data),
+            "storage": analyze_upload_storage(data),
+            "automatic_execution": False,
+        }
+
+    if lowered.startswith("upload plan "):
+        try:
+            data = _read_json_file(
+                cleaned[len("upload plan ") :].strip(), "upload evidence"
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        return plan_upload_security(discover_upload_surface(data))
+
+    if lowered.startswith("upload replay "):
+        try:
+            data = _read_json_file(
+                cleaned[len("upload replay ") :].strip(), "upload replay"
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        return check_upload_replay(data, authenticated_profile=True)
+
+    if lowered in {"upload explain", "explain upload"}:
+        names = (
+            "upload_discovery",
+            "upload_validation_analyzer",
+            "upload_metadata_analyzer",
+            "upload_storage_analyzer",
+            "upload_security_planner",
+            "upload_replay_checker",
         )
         return "\n\n".join(explain(name) for name in names)
 

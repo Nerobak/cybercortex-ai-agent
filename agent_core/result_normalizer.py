@@ -352,6 +352,34 @@ def normalize_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
                 category="business_workflow_surface",
             )
         )
+    upload_discovery = _tool_output(results, "upload_discovery")
+    for item in normalize_finding_list(upload_discovery.get("observations"))[
+        :MAX_ITEMS
+    ]:
+        findings.append(
+            _finding(
+                "File-upload-related application behavior was observed.",
+                "upload_discovery",
+                evidence=[
+                    f"Type: {item.get('type', 'unknown')}; confidence: {item.get('confidence', 'unknown')}; network tested: false."
+                ],
+                category="upload_surface",
+            )
+        )
+    validation = _tool_output(results, "upload_validation_analyzer")
+    for item in normalize_finding_list(validation.get("candidates"))[:MAX_ITEMS]:
+        findings.append(
+            _finding(
+                "Upload validation consistency requires manual verification.",
+                "upload_validation_analyzer",
+                status="needs_manual_verification",
+                evidence=item.get("evidence")
+                or [
+                    "Observed evidence is insufficient to establish server-side behavior."
+                ],
+                category="upload_validation_candidate",
+            )
+        )
     return findings
 
 
@@ -529,6 +557,36 @@ def build_evidence_package(
                 "replay_status": _tool_output(results, "workflow_replay_checker").get(
                     "status", "not_applicable"
                 ),
+            },
+            "upload": {
+                "surface_observed": bool(
+                    _tool_output(results, "upload_discovery").get(
+                        "upload_surface_observed"
+                    )
+                ),
+                "observations": _tool_output(results, "upload_discovery").get(
+                    "observation_count", 0
+                ),
+                "validation_observations": len(
+                    _tool_output(results, "upload_validation_analyzer").get(
+                        "observations", []
+                    )
+                ),
+                "metadata_observations": len(
+                    _tool_output(results, "upload_metadata_analyzer").get(
+                        "observations", []
+                    )
+                ),
+                "storage_observations": _tool_output(
+                    results, "upload_storage_analyzer"
+                ).get("providers_observed", []),
+                "manual_plans": _tool_output(results, "upload_security_planner").get(
+                    "plan_count", 0
+                ),
+                "replay_status": _tool_output(results, "upload_replay_checker").get(
+                    "status", "not_applicable"
+                ),
+                "filenames_disclosed": False,
             },
         },
         "observations": [f for f in findings if f["status"] == "observation"],

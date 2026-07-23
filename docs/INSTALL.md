@@ -1,5 +1,14 @@
 # Installation Guide
 
+## Optional upload replay configuration
+
+Upload analysis and planning need no additional dependency and run offline.
+Replay remains disabled unless `UPLOAD_REPLAY_ENABLED=true` is explicitly set.
+Store controlled request JSON and benign researcher-owned files under an ignored
+local directory. The replay gate enforces configured scope, ownership
+confirmations, a 1 MiB limit, a benign extension allowlist, and executable,
+active-content, archive, and polyglot blocking.
+
 ## Optional business-logic replay configuration
 
 No additional dependency is required. Replay remains disabled unless

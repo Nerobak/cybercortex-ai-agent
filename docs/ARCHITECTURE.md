@@ -1,5 +1,14 @@
 # Architecture
 
+## File-upload extension
+
+Upload tools use the existing lazy registry and dependency-aware workflow.
+Normalized forms, requests, JavaScript, endpoint, workflow, OpenAPI, and GraphQL
+evidence flow through offline discovery and three observation-only analyzers,
+then a non-executing planner. Replay is separate, authenticated, default-disabled,
+scope-checked, and limited to benign researcher-owned files. See
+`FILE_UPLOAD_ENGINE.md`.
+
 ## Business-logic extension
 
 Business-logic tools use the existing lazy registry and dependency-aware workflow.
