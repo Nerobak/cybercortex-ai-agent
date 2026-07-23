@@ -4,6 +4,21 @@ import os
 # Load environment variables from .env
 load_dotenv()
 
+CONFIG_ERRORS: list[str] = []
+
+
+def _positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+        return value
+    except ValueError:
+        CONFIG_ERRORS.append(f"{name} must be a positive integer.")
+        return default
+
+
 # ============================================================
 # LLM Configuration
 # ============================================================
@@ -61,6 +76,12 @@ GRAPHQL_INTROSPECTION_ENABLED = (
 )
 GRAPHQL_TIMEOUT_SECONDS = int(os.getenv("GRAPHQL_TIMEOUT_SECONDS", "15"))
 GRAPHQL_MAX_RESPONSE_BYTES = int(os.getenv("GRAPHQL_MAX_RESPONSE_BYTES", "1000000"))
+JWT_REPLAY_ENABLED = os.getenv("JWT_REPLAY_ENABLED", "false").strip().lower() == "true"
+JWT_TIMEOUT_SECONDS = _positive_int("JWT_TIMEOUT_SECONDS", 15)
+JWT_MAX_RESPONSE_BYTES = _positive_int("JWT_MAX_RESPONSE_BYTES", 1000000)
+JWT_MAX_LIFETIME_SECONDS = _positive_int("JWT_MAX_LIFETIME_SECONDS", 86400)
+JWT_CLOCK_SKEW_SECONDS = _positive_int("JWT_CLOCK_SKEW_SECONDS", 300)
+JWT_MAX_TOKEN_BYTES = _positive_int("JWT_MAX_TOKEN_BYTES", 16384)
 
 # ============================================================
 # Output Directories
