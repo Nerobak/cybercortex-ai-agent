@@ -287,3 +287,20 @@ scan https://example.com
 # Optional GraphQL configuration
 
 GraphQL offline analysis requires no additional dependency. Introspection is disabled by default. To permit the bounded check for an explicitly authorized target, set `GRAPHQL_INTROSPECTION_ENABLED=true` and keep the endpoint inside `PENTEST_ALLOWLIST` or `PENTEST_ALLOWED_URL_PREFIXES`. Timeout and response limits are configured with `GRAPHQL_TIMEOUT_SECONDS` and `GRAPHQL_MAX_RESPONSE_BYTES`.
+
+# Optional JWT configuration
+
+JWT discovery, decoding, analysis, comparison, and planning require no additional
+dependency and send no traffic. Defaults are:
+
+```dotenv
+JWT_REPLAY_ENABLED=false
+JWT_TIMEOUT_SECONDS=15
+JWT_MAX_RESPONSE_BYTES=1000000
+JWT_MAX_LIFETIME_SECONDS=86400
+JWT_CLOCK_SKEW_SECONDS=300
+JWT_MAX_TOKEN_BYTES=16384
+```
+
+Keep replay disabled unless a program explicitly permits the exact controlled
+request. Run `doctor --quick` to validate JWT limits without printing secrets.

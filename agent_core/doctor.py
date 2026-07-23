@@ -11,6 +11,13 @@ from pathlib import Path
 
 from agent_core.version import __version__
 from tool_registry import validate_registry
+from config import (
+    CONFIG_ERRORS,
+    JWT_MAX_RESPONSE_BYTES,
+    JWT_MAX_TOKEN_BYTES,
+    JWT_REPLAY_ENABLED,
+    JWT_TIMEOUT_SECONDS,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -97,6 +104,35 @@ def doctor(*, quick: bool = False) -> str:
         "PASS" if registry_ok else "FAIL",
         "Registry",
         "valid" if registry_ok else "invalid or unavailable entries",
+    )
+    jwt_limits_valid = (
+        not CONFIG_ERRORS
+        and JWT_MAX_TOKEN_BYTES > 0
+        and JWT_TIMEOUT_SECONDS > 0
+        and JWT_MAX_RESPONSE_BYTES > 0
+    )
+    add(
+        "PASS" if jwt_limits_valid else "FAIL",
+        "JWT configuration",
+        (
+            "positive numeric limits parsed"
+            if jwt_limits_valid
+            else "invalid JWT configuration value"
+        ),
+    )
+    add(
+        "PASS" if not JWT_REPLAY_ENABLED else "WARN",
+        "JWT replay default",
+        (
+            "disabled"
+            if not JWT_REPLAY_ENABLED
+            else "enabled by environment; confirm explicit authorization"
+        ),
+    )
+    add(
+        "PASS",
+        "JWT secret output",
+        "doctor reports configuration state without values or credentials",
     )
     ignored = all(
         _git("check-ignore", path)

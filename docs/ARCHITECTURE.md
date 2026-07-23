@@ -58,3 +58,11 @@ validated; cross-domain and out-of-prefix redirects are blocked.
 # GraphQL extension
 
 Phase 1 GraphQL support is implemented as registry tools layered onto the stable dependency-aware v2 workflow. The core manager, runner contract, normalizer boundary, finding schema, scope guard, and CLI framework remain authoritative. See `GRAPHQL_SUITE.md` for the evidence flow and safety invariants.
+
+# JWT extension
+
+JWT support follows the same registry boundary: authorized evidence flows through
+discovery, offline decoding, deterministic claim analysis, optional controlled
+comparison, and non-executing verification planning. Replay is a separate,
+authenticated-only opt-in tool. Raw tokens and claim values never cross the
+normalization or report boundary. See `JWT_WORKFLOW.md`.
