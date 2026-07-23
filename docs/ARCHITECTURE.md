@@ -16,7 +16,7 @@ Sanitized evidence flows through discovery, canonical modeling, transition
 analysis, rule observations, and optional manual planning. Replay is a separate,
 default-disabled authenticated action and never runs from scan discovery.
 
-## CyberCortex AI Agent v2.0.0 Beta
+## CyberCortex AI Agent v2.1.0-beta
 
 The v2 pipeline is evidence-driven and dependency-aware: scope validation precedes network activity; independent checks run before crawl-dependent analyzers; normalized evidence separates observations, candidates needing manual verification, and verified findings. DeepSeek acts only as a local evidence analyst and may improve wording without changing deterministic classifications. When unavailable, the report writer emits a deterministic report. The local dashboard binds to `127.0.0.1`.
 

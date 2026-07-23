@@ -17,9 +17,14 @@ comparison, and non-executing verification plans. Optional replay is disabled by
 default and limited to explicitly supplied, in-scope controlled GET/HEAD requests.
 See [docs/BUSINESS_LOGIC_ENGINE.md](docs/BUSINESS_LOGIC_ENGINE.md).
 
-## CyberCortex AI Agent v2.0.0 Beta
+## CyberCortex AI Agent v2.1.0-beta
 
-Version metadata is sourced from `agent_core/version.py`. V2 uses an evidence-driven, dependency-aware workflow with baseline, deep, and authenticated profiles. Tool output is normalized before it reaches the local DeepSeek analyst; deterministic fallback reports remain available when the model is unavailable. The dashboard binds to localhost.
+Version metadata is sourced only from `agent_core/version.py`. v2.1 adds the
+GraphQL Security Suite, JWT Workflow Engine, Business Logic Analysis Engine,
+and File Upload Analysis Engine to the evidence-driven, dependency-aware core.
+Tool output is normalized before it reaches the local DeepSeek analyst;
+deterministic fallback reports remain available when the model is unavailable.
+The summary-only dashboard binds to localhost.
 
 Use `explain <tool>`, `explain latest`, `explain scan`, and `explain profiles` for deterministic operational guidance. Use `doctor --quick` or `doctor` for local release-readiness checks; neither starts a target scan or prints secrets.
 
@@ -51,8 +56,14 @@ No cloud AI services are required.
 scan <target>
 scan <target> --profile baseline
 scan <target> --profile deep
+scan <target> --profile authenticated
 scan <target> --jwt-file verification_inputs/token.txt
 list tools
+explain latest
+doctor --quick
+graphql analyze verification_inputs/query.graphql
+jwt analyze --file verification_inputs/token.jwt
+workflow analyze verification_inputs/workflow.json
 jwt analyze
 upload analyze verification_inputs/upload-evidence.json
 upload plan verification_inputs/upload-evidence.json
@@ -353,6 +364,20 @@ Upcoming work includes:
 * REST API
 
 ---
+
+## Known limitations
+
+Offline and automated analysis cannot establish exploitability by itself.
+Authenticated authorization boundaries require explicit controlled inputs and
+manual verification. Optional tools and the local reporting model may be
+unavailable; deterministic fallback still produces a report and sanitized
+evidence file.
+
+## Contributing
+
+Keep changes scoped, conservative, and covered by regression tests. Run Black,
+Ruff, compileall, and pytest before proposing a change. Never commit local
+credentials, captured requests, reports, or third-party personal information.
 
 # License
 
