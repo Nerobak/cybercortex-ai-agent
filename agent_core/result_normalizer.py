@@ -337,6 +337,21 @@ def normalize_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
                 category="jwt_surface",
             )
         )
+    workflow_discovery = _tool_output(results, "workflow_evidence_discovery")
+    for item in normalize_finding_list(
+        workflow_discovery.get("workflow_candidates"),
+        section="workflow_candidates",
+    )[:MAX_ITEMS]:
+        findings.append(
+            _finding(
+                "Business-workflow-related application behavior was observed.",
+                "workflow_evidence_discovery",
+                evidence=[
+                    f"Confidence: {item.get('confidence', 'unknown')}; steps: {len(item.get('observed_steps') or [])}; network tested: false."
+                ],
+                category="business_workflow_surface",
+            )
+        )
     return findings
 
 
@@ -479,6 +494,39 @@ def build_evidence_package(
                     "plan_count", 0
                 ),
                 "replay_status": _tool_output(results, "jwt_replay_checker").get(
+                    "status", "not_applicable"
+                ),
+            },
+            "business_logic": {
+                "workflow_candidates": len(
+                    _tool_output(results, "workflow_evidence_discovery").get(
+                        "workflow_candidates", []
+                    )
+                ),
+                "modeled_workflows": int(
+                    bool(_tool_output(results, "workflow_model_builder").get("model"))
+                ),
+                "steps_observed": len(
+                    _tool_output(results, "workflow_model_builder")
+                    .get("model", {})
+                    .get("steps", [])
+                ),
+                "transitions_observed": len(
+                    _tool_output(results, "workflow_model_builder")
+                    .get("model", {})
+                    .get("transitions", [])
+                ),
+                "business_rule_observations": len(
+                    _tool_output(results, "business_rule_analyzer").get(
+                        "observations", []
+                    )
+                ),
+                "manual_plans": len(
+                    _tool_output(results, "business_logic_test_planner").get(
+                        "plans", []
+                    )
+                ),
+                "replay_status": _tool_output(results, "workflow_replay_checker").get(
                     "status", "not_applicable"
                 ),
             },

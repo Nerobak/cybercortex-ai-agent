@@ -1,5 +1,11 @@
 # Roadmap
 
+## v2.1 development
+
+- Business Logic Analysis Engine: implemented on the feature branch with
+  offline-first discovery, modeling, comparison, observations, planning, and
+  default-disabled controlled replay.
+
 ## v2.0.0 Beta stabilization
 
 The beta milestone delivers dependency-aware profiles, normalized evidence, conservative observation/candidate boundaries, bounded discovery output, deterministic/DeepSeek reporting, the local dashboard, `explain`, and `doctor`.

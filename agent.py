@@ -25,6 +25,12 @@ from tools.jwt_verification_planner import plan_jwt_verification
 from tools.jwt_replay_checker import check_jwt_replay
 from tools.graphql_query_analyzer import analyze_graphql_query
 from tools.graphql_schema_analyzer import analyze_graphql_schema
+from tools.workflow_evidence_discovery import discover_workflow_evidence
+from tools.workflow_model_builder import build_workflow_model
+from tools.workflow_transition_analyzer import analyze_workflow_transitions
+from tools.business_rule_analyzer import analyze_business_rules, compare_workflows
+from tools.business_logic_test_planner import plan_business_logic_tests
+from tools.workflow_replay_checker import check_workflow_replay
 
 SYSTEM_PROMPT = """
 You are CyberCortex AI, a cybersecurity learning and analysis assistant.
@@ -65,6 +71,17 @@ def _read_controlled_file(path_value: str, label: str) -> str:
         return path.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise ValueError(f"Unable to read {label} file: {exc}") from exc
+
+
+def _read_json_file(path_value: str, label: str) -> Any:
+    import json
+
+    try:
+        return json.loads(_read_controlled_file(path_value, label))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid {label} JSON at line {exc.lineno}, column {exc.colno}."
+        ) from exc
 
 
 def _jwt_analysis(token: str) -> dict[str, Any]:
@@ -521,6 +538,11 @@ CyberCortex AI commands
   graphql analyze <file> | graphql schema <file> | graphql explain
       Analyze GraphQL evidence offline or explain the safe GraphQL suite.
 
+  workflow analyze <file> | workflow model <file>
+  workflow compare <file-a> <file-b> | workflow plan <file>
+  workflow replay <file> | workflow explain
+      Analyze sanitized business workflows offline. Replay is disabled by default.
+
   doctor [--quick]
       Check local release readiness without running a live target scan.
 
@@ -695,6 +717,72 @@ def process_user_input(user_input: str) -> Any:
             "graphql_schema_analyzer",
             "graphql_introspection_checker",
             "graphql_authz_planner",
+        )
+        return "\n\n".join(explain(name) for name in names)
+
+    if lowered.startswith("workflow analyze "):
+        try:
+            data = _read_json_file(
+                cleaned[len("workflow analyze ") :].strip(), "workflow"
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        discovery = discover_workflow_evidence(data)
+        model = build_workflow_model(data)
+        if not model.get("success"):
+            return {"success": True, "discovery": discovery, "model": model}
+        return {
+            "success": True,
+            "discovery": discovery,
+            "model": model,
+            "transition_analysis": analyze_workflow_transitions(model),
+            "business_rule_analysis": analyze_business_rules(model),
+        }
+
+    if lowered.startswith("workflow model "):
+        try:
+            return build_workflow_model(
+                _read_json_file(cleaned[len("workflow model ") :].strip(), "workflow")
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+
+    if lowered.startswith("workflow compare "):
+        try:
+            paths = shlex.split(cleaned[len("workflow compare ") :])
+            if len(paths) != 2:
+                raise ValueError("workflow compare requires exactly two local files.")
+            return compare_workflows(
+                _read_json_file(paths[0], "left workflow"),
+                _read_json_file(paths[1], "right workflow"),
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+
+    if lowered.startswith("workflow plan "):
+        try:
+            data = _read_json_file(cleaned[len("workflow plan ") :].strip(), "workflow")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        return plan_business_logic_tests(build_workflow_model(data))
+
+    if lowered.startswith("workflow replay "):
+        try:
+            data = _read_json_file(
+                cleaned[len("workflow replay ") :].strip(), "workflow replay"
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        return check_workflow_replay(data, authenticated_profile=True)
+
+    if lowered in {"workflow explain", "explain workflow"}:
+        names = (
+            "workflow_evidence_discovery",
+            "workflow_model_builder",
+            "workflow_transition_analyzer",
+            "business_rule_analyzer",
+            "business_logic_test_planner",
+            "workflow_replay_checker",
         )
         return "\n\n".join(explain(name) for name in names)
 

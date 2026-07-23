@@ -1,5 +1,13 @@
 # CyberCortex AI Agent
 
+## Business logic analysis
+
+The v2.1 development workflow includes modular, offline-first workflow discovery,
+canonical modeling, transition and business-rule observations, redacted trace
+comparison, and non-executing verification plans. Optional replay is disabled by
+default and limited to explicitly supplied, in-scope controlled GET/HEAD requests.
+See [docs/BUSINESS_LOGIC_ENGINE.md](docs/BUSINESS_LOGIC_ENGINE.md).
+
 ## CyberCortex AI Agent v2.0.0 Beta
 
 Version metadata is sourced from `agent_core/version.py`. V2 uses an evidence-driven, dependency-aware workflow with baseline, deep, and authenticated profiles. Tool output is normalized before it reaches the local DeepSeek analyst; deterministic fallback reports remain available when the model is unavailable. The dashboard binds to localhost.

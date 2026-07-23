@@ -12,6 +12,11 @@ from pathlib import Path
 from agent_core.version import __version__
 from tool_registry import validate_registry
 from config import (
+    BUSINESS_LOGIC_MAX_REQUESTS_PER_RUN,
+    BUSINESS_LOGIC_MAX_RESPONSE_BYTES,
+    BUSINESS_LOGIC_MAX_STEPS,
+    BUSINESS_LOGIC_REPLAY_ENABLED,
+    BUSINESS_LOGIC_TIMEOUT_SECONDS,
     CONFIG_ERRORS,
     JWT_MAX_RESPONSE_BYTES,
     JWT_MAX_TOKEN_BYTES,
@@ -134,6 +139,32 @@ def doctor(*, quick: bool = False) -> str:
         "JWT secret output",
         "doctor reports configuration state without values or credentials",
     )
+    business_limits_valid = (
+        BUSINESS_LOGIC_TIMEOUT_SECONDS > 0
+        and BUSINESS_LOGIC_MAX_RESPONSE_BYTES > 0
+        and BUSINESS_LOGIC_MAX_STEPS > 0
+        and BUSINESS_LOGIC_MAX_REQUESTS_PER_RUN > 0
+        and BUSINESS_LOGIC_MAX_REQUESTS_PER_RUN <= BUSINESS_LOGIC_MAX_STEPS
+    )
+    add(
+        "PASS" if business_limits_valid else "FAIL",
+        "Business-logic configuration",
+        "positive bounded limits parsed" if business_limits_valid else "invalid limits",
+    )
+    add(
+        "PASS" if not BUSINESS_LOGIC_REPLAY_ENABLED else "WARN",
+        "Business-logic replay default",
+        (
+            "disabled"
+            if not BUSINESS_LOGIC_REPLAY_ENABLED
+            else "enabled by environment; confirm explicit authorization"
+        ),
+    )
+    add(
+        "PASS",
+        "Business-logic secret output",
+        "configuration, workflow, and dashboard diagnostics omit private values",
+    )
     ignored = all(
         _git("check-ignore", path)
         for path in (
@@ -155,6 +186,15 @@ def doctor(*, quick: bool = False) -> str:
         "PASS" if 'host="127.0.0.1"' in source else "FAIL",
         "Dashboard binding",
         "localhost only" if 'host="127.0.0.1"' in source else "review required",
+    )
+    add(
+        "PASS" if "_business_logic_summary" in source else "FAIL",
+        "Dashboard business-logic redaction",
+        (
+            "summary-only projection present"
+            if "_business_logic_summary" in source
+            else "review required"
+        ),
     )
     if quick:
         add("WARN", "Ollama/model", "not contacted in quick mode")
