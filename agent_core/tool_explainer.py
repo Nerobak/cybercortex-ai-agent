@@ -78,6 +78,11 @@ def explain_latest(result: dict[str, Any] | None) -> str:
     report = ((result.get("results") or {}).get("ai_report_writer") or {}).get(
         "output"
     ) or {}
+    surface = evidence.get("observed_surface") or {}
+    graphql = surface.get("graphql") or {}
+    jwt = surface.get("jwt") or {}
+    business = surface.get("business_logic") or {}
+    upload = surface.get("upload") or {}
     partial = list(execution.get("timed_out_partial", [])) + list(
         execution.get("timed_out", [])
     )
@@ -94,6 +99,17 @@ def explain_latest(result: dict[str, Any] | None) -> str:
     def names(key: str) -> str:
         return ", ".join(execution.get(key, [])) or "none"
 
+    completed = list(execution.get("completed", [])) + list(
+        execution.get("completed_with_fallback", [])
+    )
+
+    def summary(label: str, relevant: bool, facts: list[str]) -> str:
+        return (
+            f"{label} summary: " + "; ".join(facts)
+            if relevant
+            else f"{label} summary: Not Applicable"
+        )
+
     return "\n".join(
         [
             "Most recent scan",
@@ -101,13 +117,63 @@ def explain_latest(result: dict[str, Any] | None) -> str:
             f"Profile: {assessment.get('profile', 'unknown')}",
             f"Assessment status: {result.get('assessment_status') or evidence.get('assessment_status', 'unknown')}",
             f"Coverage: {coverage.get('coverage_percentage', 0)}%",
-            f"Completed tools: {names('completed')}",
+            f"Completed tools: {', '.join(completed) or 'none'}",
             f"Partial/timed-out tools: {', '.join(partial) or 'none'}",
             f"Failed tools: {names('failed')}",
-            f"Skipped tools: {names('skipped')}",
+            (
+                "Skipped tools: "
+                + ", ".join(
+                    list(execution.get("skipped", []))
+                    + list(execution.get("not_applicable", []))
+                )
+                if execution.get("skipped") or execution.get("not_applicable")
+                else "Skipped tools: none"
+            ),
             f"Observations: {len(evidence.get('observations', []))}",
             f"Candidates: {len(evidence.get('candidate_findings', []))}",
             f"Verified findings: {len(evidence.get('verified_findings', []))}",
+            summary(
+                "GraphQL",
+                bool(
+                    graphql.get("endpoints_observed")
+                    or graphql.get("operations_observed")
+                ),
+                [
+                    f"endpoints observed {graphql.get('endpoints_observed', 0)}",
+                    f"confirmed {graphql.get('confirmed_endpoints', 0)}",
+                    f"introspection {graphql.get('introspection_status', 'not tested')}",
+                    f"authorization plans {graphql.get('manual_authorization_plans', 0)}",
+                ],
+            ),
+            summary(
+                "JWT",
+                bool(jwt.get("tokens_observed")),
+                [
+                    f"tokens observed {jwt.get('tokens_observed', 0)}",
+                    f"controlled comparisons {jwt.get('comparison_count', 0)}",
+                    f"verification plans {jwt.get('manual_plans', 0)}",
+                    f"replay {jwt.get('replay_status', 'not applicable')}",
+                ],
+            ),
+            summary(
+                "Business logic",
+                bool(business.get("workflow_candidates")),
+                [
+                    f"workflow candidates {business.get('workflow_candidates', 0)}",
+                    f"modeled {business.get('modeled_workflows', 0)}",
+                    f"manual plans {business.get('manual_plans', 0)}",
+                    f"replay {business.get('replay_status', 'not applicable')}",
+                ],
+            ),
+            summary(
+                "File upload",
+                bool(upload.get("surface_observed")),
+                [
+                    f"upload candidates {upload.get('observations', 0)}",
+                    f"manual plans {upload.get('manual_plans', 0)}",
+                    f"replay {upload.get('replay_status', 'not applicable')}",
+                ],
+            ),
             f"Report mode: {report.get('report_mode', 'not available')}",
             f"Report path: {report.get('report_file') or report.get('report', 'not available')}",
             f"Evidence path: {report.get('evidence_file') or report.get('evidence', 'not available')}",

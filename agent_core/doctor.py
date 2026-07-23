@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from agent_core.version import __version__
 from tool_registry import validate_registry
@@ -18,10 +20,15 @@ from config import (
     BUSINESS_LOGIC_REPLAY_ENABLED,
     BUSINESS_LOGIC_TIMEOUT_SECONDS,
     CONFIG_ERRORS,
+    GRAPHQL_INTROSPECTION_ENABLED,
+    GRAPHQL_MAX_RESPONSE_BYTES,
+    GRAPHQL_TIMEOUT_SECONDS,
     JWT_MAX_RESPONSE_BYTES,
     JWT_MAX_TOKEN_BYTES,
     JWT_REPLAY_ENABLED,
     JWT_TIMEOUT_SECONDS,
+    OPENAI_BASE_URL,
+    OPENAI_MODEL,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +52,7 @@ def doctor(*, quick: bool = False) -> str:
 
     branch = _git("branch", "--show-current")
     add(
-        "PASS" if branch == "develop-v2" else "WARN",
+        "PASS" if branch == "release/v2.1.0-beta-rc" else "WARN",
         "Git branch",
         branch or "unavailable",
     )
@@ -110,6 +117,18 @@ def doctor(*, quick: bool = False) -> str:
         "Registry",
         "valid" if registry_ok else "invalid or unavailable entries",
     )
+    graphql_limits_valid = (
+        GRAPHQL_TIMEOUT_SECONDS > 0 and GRAPHQL_MAX_RESPONSE_BYTES > 0
+    )
+    add(
+        "PASS" if graphql_limits_valid else "FAIL",
+        "GraphQL configuration",
+        (
+            "positive bounded limits; introspection is explicit opt-in"
+            if graphql_limits_valid and not GRAPHQL_INTROSPECTION_ENABLED
+            else "review limits or active introspection setting"
+        ),
+    )
     jwt_limits_valid = (
         not CONFIG_ERRORS
         and JWT_MAX_TOKEN_BYTES > 0
@@ -165,6 +184,44 @@ def doctor(*, quick: bool = False) -> str:
         "Business-logic secret output",
         "configuration, workflow, and dashboard diagnostics omit private values",
     )
+    upload_replay_enabled = (
+        os.getenv("UPLOAD_REPLAY_ENABLED", "false").strip().lower() == "true"
+    )
+    add(
+        "PASS",
+        "File-upload configuration",
+        "offline analyzers use bounded evidence and omit file content",
+    )
+    add(
+        "PASS" if not upload_replay_enabled else "WARN",
+        "File-upload replay default",
+        (
+            "disabled"
+            if not upload_replay_enabled
+            else "enabled by environment; confirm explicit authorization"
+        ),
+    )
+    add(
+        (
+            "PASS"
+            if not (
+                JWT_REPLAY_ENABLED
+                or BUSINESS_LOGIC_REPLAY_ENABLED
+                or upload_replay_enabled
+            )
+            else "WARN"
+        ),
+        "All replay defaults",
+        (
+            "disabled"
+            if not (
+                JWT_REPLAY_ENABLED
+                or BUSINESS_LOGIC_REPLAY_ENABLED
+                or upload_replay_enabled
+            )
+            else "one or more replay features enabled by environment"
+        ),
+    )
     ignored = all(
         _git("check-ignore", path)
         for path in (
@@ -174,6 +231,10 @@ def doctor(*, quick: bool = False) -> str:
             "verification_inputs/example",
             "sample.request.txt",
             "sample.burp",
+            "sample.jwt",
+            "sample.graphql",
+            "sample.workflow.json",
+            "sample.upload.json",
         )
     )
     add(
@@ -196,14 +257,72 @@ def doctor(*, quick: bool = False) -> str:
             else "review required"
         ),
     )
+    documentation = (
+        "README.md",
+        "docs/ARCHITECTURE.md",
+        "docs/INSTALL.md",
+        "docs/TOOLS.md",
+        "docs/ROADMAP.md",
+        "docs/GRAPHQL_SUITE.md",
+        "docs/JWT_WORKFLOW.md",
+        "docs/BUSINESS_LOGIC_ENGINE.md",
+        "docs/FILE_UPLOAD_ENGINE.md",
+        "docs/RELEASE_NOTES_V2_BETA.md",
+        "docs/RELEASE_NOTES_V2_1_BETA.md",
+    )
+    missing_docs = [name for name in documentation if not (ROOT / name).is_file()]
+    add(
+        "PASS" if not missing_docs else "FAIL",
+        "Documentation files",
+        "present" if not missing_docs else "missing: " + ", ".join(missing_docs),
+    )
+    version_files = ("README.md", "docs/RELEASE_NOTES_V2_1_BETA.md")
+    inconsistent = [
+        name
+        for name in version_files
+        if (ROOT / name).is_file()
+        and __version__ not in (ROOT / name).read_text(encoding="utf-8")
+    ]
+    add(
+        "PASS" if not inconsistent else "FAIL",
+        "Version consistency",
+        "canonical version referenced" if not inconsistent else "review documentation",
+    )
     if quick:
-        add("WARN", "Ollama/model", "not contacted in quick mode")
+        add("WARN", "Ollama reachability", "not contacted in quick mode")
+        add("WARN", "Configured model", "not queried in quick mode")
         add("WARN", "Tests", "not run in quick mode")
     else:
+        reachable = False
+        if OPENAI_BASE_URL:
+            try:
+                with urlopen(OPENAI_BASE_URL.rstrip("/") + "/models", timeout=2):
+                    reachable = True
+            except (OSError, URLError, ValueError):
+                reachable = False
         add(
-            "WARN",
-            "Ollama/model",
-            "configuration checked; use Ollama CLI to confirm local availability",
+            "PASS" if reachable else "WARN",
+            "Ollama reachability",
+            "reachable" if reachable else "unavailable or not configured",
+        )
+        model_available = False
+        if shutil.which("ollama") and OPENAI_MODEL:
+            try:
+                listed = subprocess.run(
+                    ["ollama", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                model_available = (
+                    listed.returncode == 0 and OPENAI_MODEL in listed.stdout
+                )
+            except (OSError, subprocess.SubprocessError):
+                model_available = False
+        add(
+            "PASS" if model_available else "WARN",
+            "Configured model",
+            "available" if model_available else "unavailable or not configured",
         )
         compile_result = subprocess.run(
             [
@@ -226,7 +345,7 @@ def doctor(*, quick: bool = False) -> str:
             "passed" if compile_result.returncode == 0 else "failed",
         )
         add("WARN", "Tests", "run the release quality-gate command for full status")
-    lines = [f"CyberCortex V2 Release Readiness ({__version__})", ""]
+    lines = [f"CyberCortex v{__version__} Release Readiness", ""]
     lines.extend(f"[{level}] {name}: {detail}" for level, name, detail in rows)
     lines += [
         "",

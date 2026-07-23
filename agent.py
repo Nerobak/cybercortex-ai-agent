@@ -528,6 +528,7 @@ CyberCortex AI commands
   scan <target>
   scan <target> --profile baseline
   scan <target> --profile deep
+  scan <target> --profile authenticated
       Run the security workflow against an authorized in-scope target.
 
   list tools
@@ -562,9 +563,9 @@ CyberCortex AI commands
   exit
       Exit CyberCortex AI.
 
-Authenticated tools require explicit controlled input. Baseline scans do not
-automatically test IDOR, JWT acceptance, GraphQL authorization, business logic,
-or file uploads. Scope and program rules always apply.
+Offline analysis is the default. Replay features are disabled by default.
+Authenticated testing requires explicit controlled input. Scope and program
+rules always apply. No engine automatically proves a vulnerability.
 
 Examples
 
