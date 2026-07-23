@@ -16,6 +16,15 @@ MAX_TEXT = 1500
 SECRET_KEYS = re.compile(
     r"authorization|cookie|jwt|token|api.?key|secret|password", re.I
 )
+SAFE_METADATA_KEYS = {
+    "tokens_observed",
+    "token_count",
+    "token_source",
+    "token_length",
+    "controlled_token_count",
+    "token_type",
+    "token_type_indicators",
+}
 EXCLUDED_KEYS = {
     "body",
     "html",
@@ -30,7 +39,7 @@ EXCLUDED_KEYS = {
 
 
 def redact(value: Any, key: str = "") -> Any:
-    if SECRET_KEYS.search(key):
+    if SECRET_KEYS.search(key) and key.lower() not in SAFE_METADATA_KEYS:
         if isinstance(value, list):
             return []
         if isinstance(value, dict):
@@ -42,7 +51,11 @@ def redact(value: Any, key: str = "") -> Any:
             item_key = str(raw_key)
             if item_key.lower() in EXCLUDED_KEYS:
                 continue
-            if SECRET_KEYS.search(item_key) and isinstance(item, list):
+            if (
+                SECRET_KEYS.search(item_key)
+                and item_key.lower() not in SAFE_METADATA_KEYS
+                and isinstance(item, list)
+            ):
                 cleaned[item_key] = []
                 cleaned[f"{item_key.rstrip('s')}_count"] = len(item)
             else:
@@ -310,6 +323,20 @@ def normalize_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
                 category="graphql_surface",
             )
         )
+    jwt_discovery = _tool_output(results, "jwt_discovery")
+    for item in normalize_finding_list(jwt_discovery.get("tokens_observed"))[
+        :MAX_ITEMS
+    ]:
+        findings.append(
+            _finding(
+                "JWT-related authentication metadata was observed.",
+                "jwt_discovery",
+                evidence=[
+                    f"Source: {item.get('token_source', 'unknown')}; algorithm: {item.get('algorithm') or 'unknown'}; confidence: {item.get('confidence', 'unknown')}; network tested: false."
+                ],
+                category="jwt_surface",
+            )
+        )
     return findings
 
 
@@ -399,6 +426,60 @@ def build_evidence_package(
                 ),
                 "manual_authorization_plans": len(
                     _tool_output(results, "graphql_authz_planner").get("plans", [])
+                ),
+            },
+            "jwt": {
+                "tokens_observed": _tool_output(results, "jwt_discovery").get(
+                    "token_count", 0
+                ),
+                "sources": sorted(
+                    {
+                        item.get("token_source")
+                        for item in _tool_output(results, "jwt_discovery").get(
+                            "tokens_observed", []
+                        )
+                        if isinstance(item, dict) and item.get("token_source")
+                    }
+                ),
+                "algorithms": sorted(
+                    {
+                        item.get("algorithm")
+                        for item in _tool_output(results, "jwt_discovery").get(
+                            "tokens_observed", []
+                        )
+                        if isinstance(item, dict) and item.get("algorithm")
+                    }
+                ),
+                "issuer_present": bool(
+                    _tool_output(results, "jwt_decoder")
+                    .get("claims_summary", {})
+                    .get("iss_present")
+                ),
+                "audience_present": bool(
+                    _tool_output(results, "jwt_decoder")
+                    .get("claims_summary", {})
+                    .get("aud_present")
+                ),
+                "expiration_observations": _tool_output(results, "jwt_claims_analyzer")
+                .get("time_analysis", {})
+                .get("observations", []),
+                "role_claim_names": _tool_output(results, "jwt_decoder")
+                .get("claims_summary", {})
+                .get("role_claim_names", []),
+                "scope_claim_names": _tool_output(results, "jwt_decoder")
+                .get("claims_summary", {})
+                .get("scope_claim_names", []),
+                "signature_verification_status": _tool_output(
+                    results, "jwt_decoder"
+                ).get("verification_status", "not_verified"),
+                "comparison_count": _tool_output(results, "jwt_comparison_analyzer")
+                .get("comparison_summary", {})
+                .get("controlled_token_count", 0),
+                "manual_plans": _tool_output(results, "jwt_verification_planner").get(
+                    "plan_count", 0
+                ),
+                "replay_status": _tool_output(results, "jwt_replay_checker").get(
+                    "status", "not_applicable"
                 ),
             },
         },

@@ -161,3 +161,8 @@ Actively developed and continuously improving.
 # v2.1 development planning
 
 Phase 1 adds the safe GraphQL Security Suite while retaining v2.0.0-beta as the canonical current release. Future phases may expand controlled evidence ingestion and report presentation; automatic authorization exploitation, mutation execution, amplification, and denial-of-service testing are out of scope.
+
+The v2.1 JWT workflow is implemented as an offline-first registry extension.
+Future work may add richer controlled evidence import. Automated token mutation,
+key confusion, brute force, and unsanctioned replay remain explicitly out of
+scope. The canonical released version remains v2.0.0-beta.

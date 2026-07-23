@@ -213,6 +213,31 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
             "## GraphQL Authorization Planning\n\n"
             f"Controlled manual plans: {graphql.get('manual_authorization_plans', 0)}. Planning requires two controlled accounts, test-owned objects, and redacted differential evidence. Third-party access, payment, destructive actions, authentication bypass, batching, alias amplification, recursion, and denial-of-service queries are prohibited.\n\n"
         )
+    jwt = (results.get("observed_surface") or {}).get("jwt") or {}
+    jwt_text = ""
+    if jwt.get("tokens_observed"):
+        jwt_text = (
+            "## JWT Surface\n\n"
+            "JWT-related authentication metadata was observed.\n\n"
+            f"- Tokens observed: {jwt.get('tokens_observed', 0)}\n"
+            f"- Sources: {', '.join(jwt.get('sources', [])) or 'not recorded'}\n"
+            f"- Algorithms: {', '.join(jwt.get('algorithms', [])) or 'not decoded'}\n"
+            f"- Issuer present: {bool(jwt.get('issuer_present'))}\n"
+            f"- Audience present: {bool(jwt.get('audience_present'))}\n"
+            f"- Expiration observations: {', '.join(jwt.get('expiration_observations', [])) or 'none'}\n"
+            f"- Signature verification: {jwt.get('signature_verification_status', 'not_verified')}\n\n"
+            "All JWT items are observations unless controlled runtime evidence proves policy impact. No raw tokens, signatures, Authorization headers, cookies, or claim values are included.\n\n"
+        )
+        if jwt.get("comparison_count"):
+            jwt_text += (
+                "## JWT Comparison\n\n"
+                f"Controlled tokens compared: {jwt.get('comparison_count', 0)}. Differences require manual authorization-boundary verification.\n\n"
+            )
+        if jwt.get("manual_plans"):
+            jwt_text += (
+                "## JWT Verification Planning\n\n"
+                f"Safe manual plans: {jwt.get('manual_plans', 0)}. Explicit authorization, controlled accounts, test-owned resources, reversible steps, redacted evidence, and stop conditions are required.\n\n"
+            )
     contact_text = (
         "Public contact information observed in JavaScript.\n\n"
         if contacts
@@ -237,6 +262,7 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
         + contact_text
         + secret_text
         + graphql_text
+        + jwt_text
         + "## Informational and Defense-in-Depth Observations\n\n"
         "The application does not advertise COOP, COEP, and CORP when those headers are recorded as absent. These browser isolation headers are defense-in-depth controls and their absence does not establish a vulnerability or direct exploit path.\n\n"
         "Observed API-related routes are route-name evidence only; they are not identified as functioning API endpoints without response evidence. Crawler counts represent URLs observed before timeout, not pages proven to exist.\n\n"
@@ -346,6 +372,11 @@ Rules:
 21. Introspection availability is an observation, never a vulnerability by itself.
 22. Use "GraphQL-related application behavior was observed", not "GraphQL
     vulnerability detected", unless supplied verified controlled evidence proves it.
+23. When JWT evidence is relevant, add `## JWT Surface`, `## JWT Comparison`,
+    and `## JWT Verification Planning` only as applicable. Say "JWT-related
+    authentication metadata was observed." Never include raw tokens, signatures,
+    Authorization headers, cookies, or claim values. Decoded claims alone never
+    establish a vulnerability.
 
 Target:
 {target}
@@ -416,6 +447,9 @@ When GraphQL evidence is relevant, add `## GraphQL Surface` with confidence,
 status, source, limitations, and whether network testing occurred. Add
 `## GraphQL Authorization Planning` only when controlled plans exist, including
 prerequisites, evidence required, and prohibited actions. Never include a raw schema.
+
+When JWT evidence is relevant, add `## JWT Surface`; add comparison and
+verification-planning sections only when corresponding evidence exists.
 
 ## Prioritized Next Manual Tests
 

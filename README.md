@@ -368,3 +368,11 @@ CyberCortex AI Agent is the first major component of that ecosystem.
 # GraphQL v2.1 Phase 1
 
 The development branch includes a modular, default-safe GraphQL suite for endpoint observations, offline query/schema analysis, opt-in bounded introspection, and controlled-account authorization planning. GraphQL behavior and introspection availability are observations, not vulnerabilities. See [docs/GRAPHQL_SUITE.md](docs/GRAPHQL_SUITE.md).
+
+# JWT v2.1 Workflow
+
+The development branch also includes offline JWT discovery, secret-safe decoding,
+header/claim analysis, controlled comparison, and manual verification planning.
+Optional replay is disabled by default and requires an authenticated profile,
+explicit opt-in, a researcher-owned token, and an in-scope controlled request.
+See [docs/JWT_WORKFLOW.md](docs/JWT_WORKFLOW.md).

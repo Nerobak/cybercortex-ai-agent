@@ -18,7 +18,11 @@ from config import (
 )
 from tools.scope_guard import enforce_scope
 from tool_registry import validate_registry
-from tools.jwt_security_analyzer import analyze_jwt
+from tools.jwt_decoder import jwt_decoder
+from tools.jwt_claims_analyzer import analyze_jwt_claims
+from tools.jwt_comparison_analyzer import compare_jwts
+from tools.jwt_verification_planner import plan_jwt_verification
+from tools.jwt_replay_checker import check_jwt_replay
 from tools.graphql_query_analyzer import analyze_graphql_query
 from tools.graphql_schema_analyzer import analyze_graphql_schema
 
@@ -48,6 +52,27 @@ Rules:
 """
 
 LATEST_SCAN_RESULT: dict[str, Any] | None = None
+MAX_CONTROLLED_INPUT_BYTES = 64 * 1024
+
+
+def _read_controlled_file(path_value: str, label: str) -> str:
+    path = Path(path_value)
+    try:
+        if path.stat().st_size > MAX_CONTROLLED_INPUT_BYTES:
+            raise ValueError(
+                f"{label} file exceeds the {MAX_CONTROLLED_INPUT_BYTES}-byte limit."
+            )
+        return path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"Unable to read {label} file: {exc}") from exc
+
+
+def _jwt_analysis(token: str) -> dict[str, Any]:
+    decoded = jwt_decoder(token)
+    if not decoded.get("success"):
+        return decoded
+    claims = analyze_jwt_claims(token)
+    return {**decoded, "claims_analysis": claims}
 
 
 def create_llm_client() -> OpenAI:
@@ -488,8 +513,10 @@ CyberCortex AI commands
   explain <tool> | explain latest | explain scan | explain profiles
       Explain deterministic capabilities, evidence, limitations, or the latest scan.
 
-  jwt analyze [token]
-      Analyze an explicitly supplied JWT offline. With no token, prompt securely.
+  jwt analyze [token] | jwt analyze --file <path>
+  jwt compare <file-a> <file-b> | jwt plan <file>
+  jwt replay <request-file> | jwt explain
+      Use the offline-first JWT workflow. Replay remains disabled unless explicitly enabled.
 
   graphql analyze <file> | graphql schema <file> | graphql explain
       Analyze GraphQL evidence offline or explain the safe GraphQL suite.
@@ -584,10 +611,60 @@ def process_user_input(user_input: str) -> Any:
         return doctor(quick=lowered.endswith("--quick"))
 
     if lowered == "jwt analyze" or lowered.startswith("jwt analyze "):
-        token = cleaned[len("jwt analyze") :].strip()
+        argument = cleaned[len("jwt analyze") :].strip()
+        if argument.startswith("--file "):
+            try:
+                token = _read_controlled_file(argument[7:].strip(), "JWT")
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+        else:
+            token = argument
         if not token:
             token = getpass.getpass("JWT (hidden): ").strip()
-        return analyze_jwt(token)
+        return _jwt_analysis(token)
+
+    if lowered.startswith("jwt compare "):
+        try:
+            arguments = shlex.split(cleaned[len("jwt compare ") :])
+            if len(arguments) < 2:
+                raise ValueError("jwt compare requires at least two local files.")
+            return compare_jwts(
+                [_read_controlled_file(path, "JWT") for path in arguments]
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+
+    if lowered.startswith("jwt plan "):
+        try:
+            token = _read_controlled_file(cleaned[len("jwt plan ") :].strip(), "JWT")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        decoded = jwt_decoder(token)
+        return plan_jwt_verification(decoded) if decoded.get("success") else decoded
+
+    if lowered.startswith("jwt replay "):
+        import json
+
+        try:
+            request_data = json.loads(
+                _read_controlled_file(
+                    cleaned[len("jwt replay ") :].strip(), "JWT request"
+                )
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            return {"success": False, "error": f"Invalid JWT request file: {exc}"}
+        return check_jwt_replay(request_data, authenticated_profile=True)
+
+    if lowered in {"jwt explain", "explain jwt"}:
+        names = (
+            "jwt_discovery",
+            "jwt_decoder",
+            "jwt_claims_analyzer",
+            "jwt_comparison_analyzer",
+            "jwt_verification_planner",
+            "jwt_replay_checker",
+        )
+        return "\n\n".join(explain(name) for name in names)
 
     if lowered.startswith("graphql analyze "):
         path = Path(cleaned[len("graphql analyze ") :].strip())

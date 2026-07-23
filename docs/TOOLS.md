@@ -60,3 +60,15 @@ tools. An observed ID parameter is a candidate manual test, not verified IDOR.
 - `graphql_authz_planner`: authenticated-profile manual planning for controlled accounts; never executes tests.
 
 Use `explain <tool>` for complete inputs, evidence, limitations, false positives, relevance, examples, and safety notes.
+
+# JWT tools
+
+- `jwt_discovery`: offline JWT metadata discovery from existing evidence.
+- `jwt_decoder`: size-bounded Base64URL decoding with sensitive-value redaction.
+- `jwt_claims_analyzer`: deterministic header, registered/custom claim-name, and time observations.
+- `jwt_comparison_analyzer`: controlled token comparison without raw values.
+- `jwt_verification_planner`: safe manual plans with prerequisites and stop conditions.
+- `jwt_replay_checker`: authenticated-only, disabled-by-default bounded replay.
+
+The compatibility `jwt_security_analyzer` remains available. Prefer the modular
+tools and `jwt analyze`, `jwt compare`, `jwt plan`, or `jwt explain`.

@@ -408,6 +408,72 @@ class ToolRunner:
                 )
                 self._notify("jwt_security_analyzer", results["jwt_security_analyzer"])
 
+        # JWT workflow stages are offline unless a separately supplied replay
+        # request passes every opt-in safety check. A normal scan never replays.
+        if "jwt_discovery" in selected:
+            jwt_evidence = (
+                {"controlled_token": jwt_token}
+                if jwt_token
+                else {
+                    "requests": crawl_output.get("requests", []),
+                    "headers": crawl_output.get("headers", {}),
+                    "cookies": crawl_output.get("cookies", {}),
+                    "javascript_strings": crawl_output.get("javascript_strings", []),
+                }
+            )
+            results["jwt_discovery"] = self._execute(
+                "jwt_discovery",
+                (jwt_evidence,),
+                {},
+                {"controlled_token_supplied": bool(jwt_token)},
+            )
+        jwt_decoded: dict[str, Any] = {}
+        if "jwt_decoder" in selected:
+            if jwt_token:
+                results["jwt_decoder"] = self._execute(
+                    "jwt_decoder", (jwt_token,), {}, {"controlled_token_supplied": True}
+                )
+                jwt_decoded = results["jwt_decoder"].get("output") or {}
+            else:
+                results["jwt_decoder"] = self._envelope(
+                    "jwt_decoder",
+                    "not_applicable",
+                    error="No researcher-supplied controlled JWT was provided.",
+                )
+                self._notify("jwt_decoder", results["jwt_decoder"])
+        if "jwt_claims_analyzer" in selected:
+            if jwt_token and jwt_decoded.get("success"):
+                results["jwt_claims_analyzer"] = self._execute(
+                    "jwt_claims_analyzer",
+                    (jwt_token,),
+                    {},
+                    {"successful_decode": True},
+                )
+            else:
+                results["jwt_claims_analyzer"] = self._envelope(
+                    "jwt_claims_analyzer",
+                    "not_applicable",
+                    error="Successful controlled JWT decoding was unavailable.",
+                )
+                self._notify("jwt_claims_analyzer", results["jwt_claims_analyzer"])
+        for name, reason in (
+            (
+                "jwt_comparison_analyzer",
+                "At least two researcher-controlled JWTs were not supplied.",
+            ),
+            (
+                "jwt_verification_planner",
+                "Controlled-account context and sufficient JWT evidence were not supplied.",
+            ),
+            (
+                "jwt_replay_checker",
+                "Replay requires an explicit opt-in controlled request and never runs from a scan token.",
+            ),
+        ):
+            if name in selected:
+                results[name] = self._envelope(name, "not_applicable", error=reason)
+                self._notify(name, results[name])
+
         for name in ("request_replay_engine", "authorization_differential_tester"):
             if name in selected:
                 results[name] = self._envelope(
@@ -441,6 +507,7 @@ class ToolRunner:
             for name, env in results.items()
             if env.get("status") in {"skipped", "not_applicable"}
         ]
+        pre_applicable = len(selected) - len(pre_skipped)
         pre_coverage = {
             "planned_tools": sorted(selected),
             "completed_tools": pre_completed,
@@ -448,8 +515,8 @@ class ToolRunner:
             "timed_out_tools": pre_timed_out,
             "skipped_tools": pre_skipped,
             "coverage_percentage": (
-                round(100 * len(pre_completed) / len(selected), 1)
-                if selected
+                round(100 * len(pre_completed) / pre_applicable, 1)
+                if pre_applicable
                 else 100.0
             ),
         }
@@ -510,6 +577,7 @@ class ToolRunner:
             if required_failures or ai_limited
             else "completed"
         )
+        applicable_count = len(planned) - len(skipped)
         coverage = {
             "planned_tools": planned,
             "completed_tools": completed + completed_with_fallback,
@@ -526,10 +594,10 @@ class ToolRunner:
                         + len(completed_with_fallback)
                         + 0.5 * len(partial)
                     )
-                    / len(planned),
+                    / applicable_count,
                     1,
                 )
-                if planned
+                if applicable_count
                 else 100.0
             ),
         }
@@ -537,6 +605,12 @@ class ToolRunner:
         optional = {
             "nuclei_scan",
             "jwt_security_analyzer",
+            "jwt_discovery",
+            "jwt_decoder",
+            "jwt_claims_analyzer",
+            "jwt_comparison_analyzer",
+            "jwt_verification_planner",
+            "jwt_replay_checker",
             "authz_test_planner",
             "request_replay_engine",
             "authorization_differential_tester",
