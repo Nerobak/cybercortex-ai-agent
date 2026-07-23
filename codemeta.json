@@ -1,0 +1,30 @@
+{
+  "@context": "https://doi.org/10.5063/schema/codemeta-2.0",
+  "@type": "SoftwareSourceCode",
+  "name": "CyberCortex AI Agent",
+  "description": "An AI-assisted cybersecurity platform that coordinates modular security tools, scope controls, evidence analysis, and report generation for authorized security testing and defensive research.",
+  "codeRepository": "https://github.com/Nerobak/cybercortex-ai-agent",
+  "issueTracker": "https://github.com/Nerobak/cybercortex-ai-agent/issues",
+  "license": "https://spdx.org/licenses/MIT",
+  "version": "2.1.0-beta",
+  "datePublished": "2026-07-23",
+  "identifier": "https://doi.org/10.5281/zenodo.21519975",
+  "programmingLanguage": "Python",
+  "applicationCategory": "Cybersecurity",
+  "keywords": [
+    "cybersecurity",
+    "artificial intelligence",
+    "AI agents",
+    "web application security",
+    "security automation",
+    "vulnerability assessment"
+  ],
+  "author": [
+    {
+      "@type": "Person",
+      "givenName": "Nermin",
+      "familyName": "Zlatanovic",
+      "@id": "https://orcid.org/0009-0007-1918-8671"
+    }
+  ]
+}
