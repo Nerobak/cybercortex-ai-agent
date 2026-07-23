@@ -56,6 +56,11 @@ MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "2"))
 
 NUCLEI_SEVERITY = os.getenv("NUCLEI_SEVERITY", "low")
 AI_REPORT_TIMEOUT_SECONDS = int(os.getenv("AI_REPORT_TIMEOUT_SECONDS", "300"))
+GRAPHQL_INTROSPECTION_ENABLED = (
+    os.getenv("GRAPHQL_INTROSPECTION_ENABLED", "false").strip().lower() == "true"
+)
+GRAPHQL_TIMEOUT_SECONDS = int(os.getenv("GRAPHQL_TIMEOUT_SECONDS", "15"))
+GRAPHQL_MAX_RESPONSE_BYTES = int(os.getenv("GRAPHQL_MAX_RESPONSE_BYTES", "1000000"))
 
 # ============================================================
 # Output Directories

@@ -51,3 +51,12 @@ sent, and profile applicability. `jwt_security_analyzer` is offline and runs
 only with explicit JWT input. Request replay and authorization differential
 tools likewise require authenticated researcher evidence and are not baseline
 tools. An observed ID parameter is a candidate manual test, not verified IDOR.
+# GraphQL tools
+
+- `graphql_endpoint_discovery`: offline, scope-validated endpoint confidence from gathered evidence; baseline/deep/authenticated.
+- `graphql_query_analyzer`: offline query structure and sensitive-name observations; deep/authenticated.
+- `graphql_schema_analyzer`: bounded offline schema planning observations; deep/authenticated.
+- `graphql_introspection_checker`: one opt-in, bounded, scope-safe standard request; deep/authenticated.
+- `graphql_authz_planner`: authenticated-profile manual planning for controlled accounts; never executes tests.
+
+Use `explain <tool>` for complete inputs, evidence, limitations, false positives, relevance, examples, and safety notes.

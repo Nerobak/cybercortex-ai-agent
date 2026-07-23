@@ -55,3 +55,6 @@ All target testing is controlled by `PENTEST_ALLOWLIST` and
 `PENTEST_ALLOWED_URL_PREFIXES`. A prefix configured for a host is the narrower
 authorization. Redirect destinations and discovered URLs are independently
 validated; cross-domain and out-of-prefix redirects are blocked.
+# GraphQL extension
+
+Phase 1 GraphQL support is implemented as registry tools layered onto the stable dependency-aware v2 workflow. The core manager, runner contract, normalizer boundary, finding schema, scope guard, and CLI framework remain authoritative. See `GRAPHQL_SUITE.md` for the evidence flow and safety invariants.

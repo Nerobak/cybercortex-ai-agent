@@ -365,3 +365,6 @@ https://github.com/nerobak
 CyberCortex is a growing ecosystem of AI-powered cybersecurity projects focused on empowering defenders, researchers, and bug bounty hunters through local AI, automation, and practical security engineering.
 
 CyberCortex AI Agent is the first major component of that ecosystem.
+# GraphQL v2.1 Phase 1
+
+The development branch includes a modular, default-safe GraphQL suite for endpoint observations, offline query/schema analysis, opt-in bounded introspection, and controlled-account authorization planning. GraphQL behavior and introspection availability are observations, not vulnerabilities. See [docs/GRAPHQL_SUITE.md](docs/GRAPHQL_SUITE.md).

@@ -19,6 +19,8 @@ from config import (
 from tools.scope_guard import enforce_scope
 from tool_registry import validate_registry
 from tools.jwt_security_analyzer import analyze_jwt
+from tools.graphql_query_analyzer import analyze_graphql_query
+from tools.graphql_schema_analyzer import analyze_graphql_schema
 
 SYSTEM_PROMPT = """
 You are CyberCortex AI, a cybersecurity learning and analysis assistant.
@@ -489,6 +491,9 @@ CyberCortex AI commands
   jwt analyze [token]
       Analyze an explicitly supplied JWT offline. With no token, prompt securely.
 
+  graphql analyze <file> | graphql schema <file> | graphql explain
+      Analyze GraphQL evidence offline or explain the safe GraphQL suite.
+
   doctor [--quick]
       Check local release readiness without running a live target scan.
 
@@ -583,6 +588,38 @@ def process_user_input(user_input: str) -> Any:
         if not token:
             token = getpass.getpass("JWT (hidden): ").strip()
         return analyze_jwt(token)
+
+    if lowered.startswith("graphql analyze "):
+        path = Path(cleaned[len("graphql analyze ") :].strip())
+        try:
+            return analyze_graphql_query(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            return {
+                "success": False,
+                "error": f"Unable to read GraphQL query file: {exc}",
+            }
+
+    if lowered.startswith("graphql schema "):
+        import json
+
+        path = Path(cleaned[len("graphql schema ") :].strip())
+        try:
+            return analyze_graphql_schema(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": f"Unable to read GraphQL schema file: {exc}",
+            }
+
+    if lowered == "graphql explain":
+        names = (
+            "graphql_endpoint_discovery",
+            "graphql_query_analyzer",
+            "graphql_schema_analyzer",
+            "graphql_introspection_checker",
+            "graphql_authz_planner",
+        )
+        return "\n\n".join(explain(name) for name in names)
 
     return ask_question(cleaned)
 

@@ -193,6 +193,26 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
         item for item in candidates if item.get("category") == "credential_candidate"
     ]
     coverage = results.get("coverage") or {}
+    graphql = (results.get("observed_surface") or {}).get("graphql") or {}
+    graphql_relevant = bool(
+        graphql.get("endpoints_observed")
+        or graphql.get("operations_observed")
+        or graphql.get("manual_authorization_plans")
+        or graphql.get("introspection_status")
+        not in {None, "not_tested", "not_applicable"}
+    )
+    graphql_text = ""
+    if graphql_relevant:
+        graphql_text = (
+            "## GraphQL Surface\n\n"
+            f"- Endpoints observed: {graphql.get('endpoints_observed', 0)}\n"
+            f"- Confirmed endpoints: {graphql.get('confirmed_endpoints', 0)}\n"
+            f"- Operations observed: {graphql.get('operations_observed', 0)}\n"
+            f"- Introspection status: {graphql.get('introspection_status', 'not tested')}\n\n"
+            "GraphQL-related application behavior was observed. Introspection availability and schema or field names do not by themselves establish a security vulnerability.\n\n"
+            "## GraphQL Authorization Planning\n\n"
+            f"Controlled manual plans: {graphql.get('manual_authorization_plans', 0)}. Planning requires two controlled accounts, test-owned objects, and redacted differential evidence. Third-party access, payment, destructive actions, authentication bypass, batching, alias amplification, recursion, and denial-of-service queries are prohibited.\n\n"
+        )
     contact_text = (
         "Public contact information observed in JavaScript.\n\n"
         if contacts
@@ -216,6 +236,7 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
         "## JavaScript Review\n\n"
         + contact_text
         + secret_text
+        + graphql_text
         + "## Informational and Defense-in-Depth Observations\n\n"
         "The application does not advertise COOP, COEP, and CORP when those headers are recorded as absent. These browser isolation headers are defense-in-depth controls and their absence does not establish a vulnerability or direct exploit path.\n\n"
         "Observed API-related routes are route-name evidence only; they are not identified as functioning API endpoints without response evidence. Crawler counts represent URLs observed before timeout, not pages proven to exist.\n\n"
@@ -322,6 +343,9 @@ Rules:
     functioning API response evidence exists.
 20. Describe crawler output as "N URLs observed before timeout", never pages
     discovered or initial pages.
+21. Introspection availability is an observation, never a vulnerability by itself.
+22. Use "GraphQL-related application behavior was observed", not "GraphQL
+    vulnerability detected", unless supplied verified controlled evidence proves it.
 
 Target:
 {target}
@@ -387,6 +411,11 @@ Only evidence-backed verified findings.
 
 Include DNS, HTTP status, effective URL, redirect chain, technologies, pages
 observed, observed API-related routes, JavaScript files, parameters, and object references.
+
+When GraphQL evidence is relevant, add `## GraphQL Surface` with confidence,
+status, source, limitations, and whether network testing occurred. Add
+`## GraphQL Authorization Planning` only when controlled plans exist, including
+prerequisites, evidence required, and prohibited actions. Never include a raw schema.
 
 ## Prioritized Next Manual Tests
 

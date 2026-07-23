@@ -284,3 +284,6 @@ ask Explain Content Security Policy
 
 scan https://example.com
 ```
+# Optional GraphQL configuration
+
+GraphQL offline analysis requires no additional dependency. Introspection is disabled by default. To permit the bounded check for an explicitly authorized target, set `GRAPHQL_INTROSPECTION_ENABLED=true` and keep the endpoint inside `PENTEST_ALLOWLIST` or `PENTEST_ALLOWED_URL_PREFIXES`. Timeout and response limits are configured with `GRAPHQL_TIMEOUT_SECONDS` and `GRAPHQL_MAX_RESPONSE_BYTES`.
