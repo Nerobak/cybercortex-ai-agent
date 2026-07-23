@@ -1,3 +1,3 @@
 """Canonical CyberCortex release version."""
 
-__version__ = "2.0.0-beta"
+__version__ = "2.1.0-beta"
