@@ -252,6 +252,21 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
                 "## Manual Business Logic Verification Plans\n\n"
                 f"Safe manual plans: {business.get('manual_plans', 0)}. Controlled accounts, test-owned resources, reversible actions, stop conditions, and prohibited actions are mandatory.\n\n"
             )
+    upload = (results.get("observed_surface") or {}).get("upload") or {}
+    upload_text = ""
+    if upload.get("surface_observed"):
+        storage = ", ".join(upload.get("storage_observations", [])) or "none"
+        upload_text = (
+            "## Upload Surface\n\n"
+            "File-upload-related application behavior was observed from existing evidence. No file was uploaded automatically.\n\n"
+            f"- Upload observations: {upload.get('observations', 0)}\n"
+            f"- Storage indicators: {storage}\n"
+            f"- Replay status: {upload.get('replay_status', 'not applicable')}\n\n"
+            "## Upload Observations\n\n"
+            f"Validation observations: {upload.get('validation_observations', 0)}; metadata observations: {upload.get('metadata_observations', 0)}. These are observations only and do not establish server-side validation, authorization failure, or storage exposure. Filenames are excluded.\n\n"
+            "## Manual Upload Verification\n\n"
+            f"Safe manual plans: {upload.get('manual_plans', 0)}. Use only explicitly authorized workflows, controlled accounts, test-owned resources, and benign researcher-owned bounded files. Malware, exploits, shells, executables, archives, polyglots, oversized files, and third-party files are prohibited.\n\n"
+        )
         if jwt.get("manual_plans"):
             jwt_text += (
                 "## JWT Verification Planning\n\n"
@@ -283,6 +298,7 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
         + graphql_text
         + jwt_text
         + business_text
+        + upload_text
         + "## Informational and Defense-in-Depth Observations\n\n"
         "The application does not advertise COOP, COEP, and CORP when those headers are recorded as absent. These browser isolation headers are defense-in-depth controls and their absence does not establish a vulnerability or direct exploit path.\n\n"
         "Observed API-related routes are route-name evidence only; they are not identified as functioning API endpoints without response evidence. Crawler counts represent URLs observed before timeout, not pages proven to exist.\n\n"
@@ -397,6 +413,10 @@ Rules:
     authentication metadata was observed." Never include raw tokens, signatures,
     Authorization headers, cookies, or claim values. Decoded claims alone never
     establish a vulnerability.
+24. When upload evidence is relevant, add `## Upload Surface`,
+    `## Upload Observations`, and `## Manual Upload Verification`. State that no
+    file was uploaded automatically. Never include filenames or file bodies, and
+    never infer server validation, authorization failure, or storage exposure.
 
 Target:
 {target}
@@ -470,6 +490,10 @@ prerequisites, evidence required, and prohibited actions. Never include a raw sc
 
 When JWT evidence is relevant, add `## JWT Surface`; add comparison and
 verification-planning sections only when corresponding evidence exists.
+
+When upload evidence is relevant, add `## Upload Surface`, `## Upload
+Observations`, and `## Manual Upload Verification` with conservative
+observation-only wording and the prohibited file categories.
 
 ## Prioritized Next Manual Tests
 

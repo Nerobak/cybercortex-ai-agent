@@ -351,6 +351,91 @@ class ToolRunner:
             )
             self._notify("graphql_authz_planner", results["graphql_authz_planner"])
 
+        # Upload analysis consumes only existing normalized evidence. It never
+        # sends a file during a normal workflow; replay is a separate opt-in.
+        upload_evidence = {
+            **surface,
+            "requests": crawl_output.get("requests", []),
+            "forms": crawl_output.get("forms", []),
+            "form_actions": crawl_output.get("form_actions", []),
+            "fetch_urls": crawl_output.get("fetch_urls", []),
+            "javascript_strings": crawl_output.get("javascript_strings", []),
+            "openapi": crawl_output.get("openapi", {}),
+            "graphql_schema": (
+                schema_evidence if isinstance(schema_evidence, dict) else {}
+            ),
+            "workflow_models": crawl_output.get("workflow_models", []),
+        }
+        upload_discovery: dict[str, Any] = {}
+        if "upload_discovery" in selected and not expired():
+            results["upload_discovery"] = self._execute(
+                "upload_discovery",
+                (upload_evidence,),
+                {},
+                {"offline_evidence_sources": sorted(upload_evidence)},
+            )
+            upload_discovery = results["upload_discovery"].get("output") or {}
+        upload_observed = bool(upload_discovery.get("upload_surface_observed"))
+        for name in (
+            "upload_validation_analyzer",
+            "upload_metadata_analyzer",
+            "upload_storage_analyzer",
+        ):
+            if name not in selected:
+                continue
+            if upload_observed:
+                results[name] = self._execute(
+                    name,
+                    (upload_evidence,),
+                    {},
+                    {"upload_surface_observed": True},
+                )
+            else:
+                results[name] = self._envelope(
+                    name,
+                    "not_applicable",
+                    error="No upload surface was observed in existing evidence.",
+                )
+                self._notify(name, results[name])
+        if "upload_security_planner" in selected:
+            if upload_observed:
+                combined_upload_evidence = {
+                    "upload_surface_observed": True,
+                    "observations": upload_discovery.get("observations", []),
+                    "validation": (
+                        results.get("upload_validation_analyzer", {}).get("output")
+                        or {}
+                    ),
+                    "metadata": (
+                        results.get("upload_metadata_analyzer", {}).get("output") or {}
+                    ),
+                    "storage": (
+                        results.get("upload_storage_analyzer", {}).get("output") or {}
+                    ),
+                }
+                results["upload_security_planner"] = self._execute(
+                    "upload_security_planner",
+                    (combined_upload_evidence,),
+                    {},
+                    {"upload_surface_observed": True},
+                )
+            else:
+                results["upload_security_planner"] = self._envelope(
+                    "upload_security_planner",
+                    "not_applicable",
+                    error="Manual planning requires observed upload evidence.",
+                )
+                self._notify(
+                    "upload_security_planner", results["upload_security_planner"]
+                )
+        if "upload_replay_checker" in selected:
+            results["upload_replay_checker"] = self._envelope(
+                "upload_replay_checker",
+                "not_applicable",
+                error="Replay requires a separate explicit opt-in controlled request and never runs automatically.",
+            )
+            self._notify("upload_replay_checker", results["upload_replay_checker"])
+
         if "authz_test_planner" in selected:
             parameter_output = results.get("parameter_analyzer", {}).get("output") or {}
             parameter_findings = (
@@ -705,6 +790,12 @@ class ToolRunner:
             "business_rule_analyzer",
             "business_logic_test_planner",
             "workflow_replay_checker",
+            "upload_discovery",
+            "upload_validation_analyzer",
+            "upload_metadata_analyzer",
+            "upload_storage_analyzer",
+            "upload_security_planner",
+            "upload_replay_checker",
         }
         required = set(planned) - optional - reporting
         coverage_detail = {

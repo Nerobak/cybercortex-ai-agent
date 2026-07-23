@@ -5,6 +5,9 @@
 - Business Logic Analysis Engine: implemented on the feature branch with
   offline-first discovery, modeling, comparison, observations, planning, and
   default-disabled controlled replay.
+- File Upload Analysis Engine: implemented with offline discovery, validation,
+  metadata and storage observations, safe planning, conservative reporting, and
+  default-disabled bounded replay.
 
 ## v2.0.0 Beta stabilization
 
@@ -15,7 +18,7 @@ The beta milestone delivers dependency-aware profiles, normalized evidence, cons
 - GraphQL testing suite, activated only after endpoint evidence
 - Controlled JWT verification workflows
 - Business-logic analysis engine
-- Evidence-driven file-upload analysis
+- Evidence-driven file-upload analysis (implemented)
 - Authenticated object-authorization workflows with controlled accounts
 
 This project is under active development. The goal is to build a fully local AI Security Agent capable of assisting security researchers and bug bounty hunters with authorized reconnaissance, analysis, and reporting.

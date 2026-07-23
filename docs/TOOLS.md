@@ -1,5 +1,18 @@
 # Tools
 
+## File upload tools
+
+- `upload_discovery`: offline upload surface discovery
+- `upload_validation_analyzer`: observed type, MIME, size, and filename controls
+- `upload_metadata_analyzer`: naming, path, disposition, and metadata observations
+- `upload_storage_analyzer`: observation-only S3, Azure Blob, GCS, CDN, and local indicators
+- `upload_security_planner`: eight bounded, non-executing manual plans
+- `upload_replay_checker`: default-disabled, authenticated bounded replay
+
+Use `upload explain` for complete metadata. `upload analyze <file>` and
+`upload plan <file>` are offline. Replay accepts only explicitly confirmed,
+researcher-owned benign files and remains an observation.
+
 ## Business logic tools
 
 - `workflow_evidence_discovery`: offline candidate discovery from sanitized evidence
