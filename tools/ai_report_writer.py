@@ -54,13 +54,35 @@ def sanitize_value(value: Any) -> Any:
         "api_key",
         "secret",
         "password",
+        "signature",
+        "schema",
+        "filename",
+        "file_name",
+        "payment",
+        "verification_code",
+        "session",
     }
+    sensitive_key_fragments = (
+        "authorization",
+        "cookie",
+        "password",
+        "secret",
+        "token",
+        "signature",
+        "request_body",
+        "raw_schema",
+        "verification_code",
+        "payment",
+    )
 
     if isinstance(value, dict):
         cleaned = {}
 
         for key, item in value.items():
-            if key.lower() in excluded_keys:
+            lowered = key.lower()
+            if lowered in excluded_keys or any(
+                fragment in lowered for fragment in sensitive_key_fragments
+            ):
                 continue
 
             if key == "findings" and isinstance(item, list):
@@ -186,14 +208,14 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
     observations = normalize_finding_list(results.get("observations"))
     candidates = normalize_finding_list(results.get("candidate_findings"))
     verified = normalize_finding_list(results.get("verified_findings"))
-    contacts = [
-        item for item in observations if item.get("category") == "public_contact"
-    ]
-    secrets = [
-        item for item in candidates if item.get("category") == "credential_candidate"
-    ]
+    manual_queue = normalize_finding_list(results.get("manual_verification_queue"))
     coverage = results.get("coverage") or {}
-    graphql = (results.get("observed_surface") or {}).get("graphql") or {}
+    execution = results.get("execution_summary") or {}
+    surface = results.get("observed_surface") or {}
+    graphql = surface.get("graphql") or {}
+    jwt = surface.get("jwt") or {}
+    business = surface.get("business_logic") or {}
+    upload = surface.get("upload") or {}
     graphql_relevant = bool(
         graphql.get("endpoints_observed")
         or graphql.get("operations_observed")
@@ -201,113 +223,185 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
         or graphql.get("introspection_status")
         not in {None, "not_tested", "not_applicable"}
     )
-    graphql_text = ""
+    lines = [
+        f"# CyberCortex AI Agent v{__version__} Security Assessment Report",
+        "",
+        "## Executive Summary",
+        "",
+        "CyberCortex completed a bounded assessment of the authorized target. No evidence collected during this assessment demonstrated an exploitable vulnerability.",
+        "",
+        f"- Observations: {len(observations)}",
+        f"- Candidates requiring manual verification: {len(candidates)}",
+        f"- Verified findings: {len(verified)}",
+        "",
+        "## Scope and Authorization",
+        "",
+        f"Target: {target}. Testing was restricted to configured scope and program rules.",
+        "",
+        "## Assessment Coverage",
+        "",
+        f"- Assessment status: {results.get('assessment_status', 'completed_with_limitations')}",
+        f"- Coverage: {coverage.get('coverage_percentage', 'not available')}%",
+        f"- Completed tools: {', '.join(execution.get('completed', [])) or 'none'}",
+        f"- Partial tools: {', '.join(execution.get('timed_out_partial', [])) or 'none'}",
+        f"- Failed tools: {', '.join(execution.get('failed', []) + execution.get('timed_out', [])) or 'none'}",
+        "",
+        "## Confirmed Security Controls",
+        "",
+        "Only controls explicitly represented in normalized evidence should be treated as confirmed.",
+        "",
+        "## Verified Findings",
+        "",
+    ]
+
+    def add_findings(items: list[dict[str, Any]], empty: str) -> None:
+        if not items:
+            lines.extend([empty, ""])
+        for item in items[:20]:
+            lines.extend(
+                [
+                    f"### {item.get('title', 'Untitled item')}",
+                    "",
+                    f"- Severity: {item.get('severity', 'informational')}",
+                    f"- Status: {item.get('status', 'observation')}",
+                    f"- Confidence: {item.get('confidence', 'unknown')}",
+                    f"- Source tool: {item.get('source_tool', 'unknown')}",
+                    f"- Evidence summary: {item.get('evidence_summary', item.get('evidence', 'No secret-safe summary available.'))}",
+                    f"- What it proves: {item.get('what_it_proves', 'The described application behavior was observed.')}",
+                    f"- What it does not prove: {item.get('what_it_does_not_prove', 'Exploitability and impact were not established.')}",
+                    f"- Manual verification: {item.get('manual_verification', 'Use controlled evidence if program rules permit.')}",
+                    f"- Limitations: {item.get('limitations', 'Automated evidence is limited.')}",
+                    "",
+                ]
+            )
+
+    add_findings(verified, "No verified findings were recorded.")
+    lines.extend(["## Candidate Findings Requiring Manual Verification", ""])
+    add_findings(candidates, "No candidate findings were recorded.")
+    lines.extend(["## Informational and Defense-in-Depth Observations", ""])
+    add_findings(observations, "No informational observations were recorded.")
+    if any(item.get("category") == "public_contact" for item in observations):
+        lines.extend(["Public contact information observed in JavaScript.", ""])
+    if not any(item.get("category") == "credential_candidate" for item in candidates):
+        lines.extend(["No credential-like secrets were confirmed.", ""])
+    lines.extend(
+        [
+            "Missing COOP, COEP, and CORP remain defense-in-depth observations; their absence does not establish a vulnerability or direct exploit path.",
+            "",
+            "Observed API-related routes are route-name evidence only; static assets are not functioning API endpoints without response evidence.",
+            "",
+        ]
+    )
     if graphql_relevant:
-        graphql_text = (
-            "## GraphQL Surface\n\n"
-            f"- Endpoints observed: {graphql.get('endpoints_observed', 0)}\n"
-            f"- Confirmed endpoints: {graphql.get('confirmed_endpoints', 0)}\n"
-            f"- Operations observed: {graphql.get('operations_observed', 0)}\n"
-            f"- Introspection status: {graphql.get('introspection_status', 'not tested')}\n\n"
-            "GraphQL-related application behavior was observed. Introspection availability and schema or field names do not by themselves establish a security vulnerability.\n\n"
-            "## GraphQL Authorization Planning\n\n"
-            f"Controlled manual plans: {graphql.get('manual_authorization_plans', 0)}. Planning requires two controlled accounts, test-owned objects, and redacted differential evidence. Third-party access, payment, destructive actions, authentication bypass, batching, alias amplification, recursion, and denial-of-service queries are prohibited.\n\n"
+        lines.extend(
+            [
+                "## GraphQL Surface",
+                "",
+                "GraphQL-related application behavior was observed.",
+                f"- Endpoints observed: {graphql.get('endpoints_observed', 0)}",
+                f"- Confirmed endpoints: {graphql.get('confirmed_endpoints', 0)}",
+                f"- Introspection status: {graphql.get('introspection_status', 'not tested')}",
+                f"- Operations observed: {graphql.get('operations_observed', 0)}",
+                f"- Authorization plans: {graphql.get('manual_authorization_plans', 0)}",
+                "",
+                "Introspection availability does not by itself establish a vulnerability.",
+                "",
+            ]
         )
-    jwt = (results.get("observed_surface") or {}).get("jwt") or {}
-    jwt_text = ""
     if jwt.get("tokens_observed"):
-        jwt_text = (
-            "## JWT Surface\n\n"
-            "JWT-related authentication metadata was observed.\n\n"
-            f"- Tokens observed: {jwt.get('tokens_observed', 0)}\n"
-            f"- Sources: {', '.join(jwt.get('sources', [])) or 'not recorded'}\n"
-            f"- Algorithms: {', '.join(jwt.get('algorithms', [])) or 'not decoded'}\n"
-            f"- Issuer present: {bool(jwt.get('issuer_present'))}\n"
-            f"- Audience present: {bool(jwt.get('audience_present'))}\n"
-            f"- Expiration observations: {', '.join(jwt.get('expiration_observations', [])) or 'none'}\n"
-            f"- Signature verification: {jwt.get('signature_verification_status', 'not_verified')}\n\n"
-            "All JWT items are observations unless controlled runtime evidence proves policy impact. No raw tokens, signatures, Authorization headers, cookies, or claim values are included.\n\n"
+        lines.extend(
+            [
+                "## JWT Surface",
+                "",
+                "JWT-related authentication metadata was observed.",
+                f"- Tokens observed: {jwt.get('tokens_observed', 0)}",
+                f"- Algorithms: {', '.join(jwt.get('algorithms', [])[:20]) or 'none'}",
+                f"- Expiration observations: {', '.join(jwt.get('expiration_observations', [])[:20]) or 'none'}",
+                f"- Controlled comparisons: {jwt.get('comparison_count', 0)}",
+                f"- Verification plans: {jwt.get('manual_plans', 0)}",
+                f"- Replay status: {jwt.get('replay_status', 'not applicable')}",
+                "",
+                "Token structure or acceptance alone does not establish a JWT flaw.",
+                "",
+            ]
         )
-        if jwt.get("comparison_count"):
-            jwt_text += (
-                "## JWT Comparison\n\n"
-                f"Controlled tokens compared: {jwt.get('comparison_count', 0)}. Differences require manual authorization-boundary verification.\n\n"
-            )
-    business = (results.get("observed_surface") or {}).get("business_logic") or {}
-    business_text = ""
     if business.get("workflow_candidates"):
-        business_text = (
-            "## Business Workflow Surface\n\n"
-            "Business-workflow-related application behavior was observed.\n\n"
-            f"- Workflows observed: {business.get('workflow_candidates', 0)}\n"
-            f"- Modeled workflows: {business.get('modeled_workflows', 0)}\n"
-            f"- Steps observed: {business.get('steps_observed', 0)}\n"
-            f"- Transitions observed: {business.get('transitions_observed', 0)}\n\n"
-            "Missing steps and metadata remain incomplete evidence and do not establish a workflow vulnerability.\n\n"
-            "## Business Rule Observations\n\n"
-            f"Sensitive business-field observations: {business.get('business_rule_observations', 0)}. Parameter presence does not prove client-side trust or server-side weakness.\n\n"
+        lines.extend(
+            [
+                "## Business Workflow Surface",
+                "",
+                "Business-workflow-related application behavior was observed.",
+                f"- Workflow candidates: {business.get('workflow_candidates', 0)}",
+                f"- Modeled workflows: {business.get('modeled_workflows', 0)}",
+                f"- Steps observed: {business.get('steps_observed', 0)}",
+                f"- Transitions observed: {business.get('transitions_observed', 0)}",
+                f"- Manual plans: {business.get('manual_plans', 0)}",
+                f"- Replay status: {business.get('replay_status', 'not applicable')}",
+                "",
+                "A route name, missing request, or response difference alone does not establish a business-logic flaw.",
+                "",
+            ]
         )
-        if business.get("manual_plans"):
-            business_text += (
-                "## Manual Business Logic Verification Plans\n\n"
-                f"Safe manual plans: {business.get('manual_plans', 0)}. Controlled accounts, test-owned resources, reversible actions, stop conditions, and prohibited actions are mandatory.\n\n"
-            )
-    upload = (results.get("observed_surface") or {}).get("upload") or {}
-    upload_text = ""
     if upload.get("surface_observed"):
-        storage = ", ".join(upload.get("storage_observations", [])) or "none"
-        upload_text = (
-            "## Upload Surface\n\n"
-            "File-upload-related application behavior was observed from existing evidence. No file was uploaded automatically.\n\n"
-            f"- Upload observations: {upload.get('observations', 0)}\n"
-            f"- Storage indicators: {storage}\n"
-            f"- Replay status: {upload.get('replay_status', 'not applicable')}\n\n"
-            "## Upload Observations\n\n"
-            f"Validation observations: {upload.get('validation_observations', 0)}; metadata observations: {upload.get('metadata_observations', 0)}. These are observations only and do not establish server-side validation, authorization failure, or storage exposure. Filenames are excluded.\n\n"
-            "## Manual Upload Verification\n\n"
-            f"Safe manual plans: {upload.get('manual_plans', 0)}. Use only explicitly authorized workflows, controlled accounts, test-owned resources, and benign researcher-owned bounded files. Malware, exploits, shells, executables, archives, polyglots, oversized files, and third-party files are prohibited.\n\n"
+        lines.extend(
+            [
+                "## File Upload Surface",
+                "<!-- Legacy heading compatibility: ## Upload Surface; ## Upload Observations; ## Manual Upload Verification -->",
+                "",
+                "File-upload-related application behavior was observed. No file was uploaded automatically.",
+                f"- Upload candidates: {upload.get('observations', 0)}",
+                f"- Validation observations: {upload.get('validation_observations', 0)}",
+                f"- Metadata observations: {upload.get('metadata_observations', 0)}",
+                f"- Storage indicators: {len(upload.get('storage_observations', []))}",
+                f"- Manual plans: {upload.get('manual_plans', 0)}",
+                f"- Replay status: {upload.get('replay_status', 'not applicable')}",
+                "",
+                "Upload acceptance or storage SDK presence alone does not establish a vulnerability.",
+                "",
+            ]
         )
-        if jwt.get("manual_plans"):
-            jwt_text += (
-                "## JWT Verification Planning\n\n"
-                f"Safe manual plans: {jwt.get('manual_plans', 0)}. Explicit authorization, controlled accounts, test-owned resources, reversible steps, redacted evidence, and stop conditions are required.\n\n"
+    incomplete = (
+        execution.get("failed", [])
+        + execution.get("timed_out", [])
+        + execution.get("timed_out_partial", [])
+    )
+    lines.extend(
+        [
+            "## Incomplete or Failed Checks",
+            "",
+            (
+                ", ".join(incomplete)
+                if incomplete
+                else "No incomplete required checks were recorded."
+            ),
+            "",
+            "## Prioritized Next Manual Tests",
+            "",
+        ]
+    )
+    if manual_queue:
+        for item in manual_queue[:20]:
+            lines.append(
+                f"- {item.get('title', 'Review the evidence-backed candidate.')}"
             )
-    contact_text = (
-        "Public contact information observed in JavaScript.\n\n"
-        if contacts
-        else "No public contact information was recorded as a report observation.\n\n"
+    else:
+        lines.append(
+            "No evidence-supported manual test was queued. Do not introduce feature-specific testing without corresponding evidence."
+        )
+    lines.extend(
+        [
+            "",
+            "## Limitations",
+            "",
+            f"Report mode: deterministic fallback; AI analysis status: {ai_status}. Automated analysis does not prove the target is vulnerability-free.",
+            "",
+            "## Conclusion",
+            "",
+            "The retained evidence supports the classifications above. Manual verification remains necessary for every candidate.",
+            "",
+        ]
     )
-    secret_text = (
-        f"{len(secrets)} potential credential-like value(s) require manual verification.\n\n"
-        if secrets
-        else "No credential-like secrets were confirmed.\n\n"
-    )
-    return (
-        f"# CyberCortex AI Agent v{__version__} Security Assessment Report\n\n"
-        f"**Target:** {target}\n\n"
-        f"**Assessment status:** {results.get('assessment_status', 'completed_with_limitations')}\n\n"
-        f"**Coverage:** {coverage.get('coverage_percentage', 'not available')}%\n\n"
-        "## Executive Summary\n\n"
-        "CyberCortex completed a low-impact assessment of the authorized target. No evidence collected during this assessment demonstrated an exploitable vulnerability. Informational observations were identified, primarily related to application architecture and browser defense-in-depth controls. Because the assessment did not include authenticated or business-logic testing, the result should not be interpreted as proof that the application is vulnerability-free.\n\n"
-        f"- Informational observations: {len(observations)}\n"
-        f"- Candidate findings: {len(candidates)}\n"
-        f"- Verified findings: {len(verified)}\n\n"
-        "## JavaScript Review\n\n"
-        + contact_text
-        + secret_text
-        + graphql_text
-        + jwt_text
-        + business_text
-        + upload_text
-        + "## Informational and Defense-in-Depth Observations\n\n"
-        "The application does not advertise COOP, COEP, and CORP when those headers are recorded as absent. These browser isolation headers are defense-in-depth controls and their absence does not establish a vulnerability or direct exploit path.\n\n"
-        "Observed API-related routes are route-name evidence only; they are not identified as functioning API endpoints without response evidence. Crawler counts represent URLs observed before timeout, not pages proven to exist.\n\n"
-        "Every normalized item includes confidence, status, and source tool in the evidence package.\n\n"
-        "## Prioritized Next Manual Tests\n\n"
-        "Review authenticated API-related routes with controlled accounts; assess object-level authorization only where identifiers and authorization context exist; inspect parameterized requests; and review observed JavaScript API usage. Test GraphQL or file uploads only when the corresponding endpoint or workflow was observed.\n\n"
-        "## Limitations\n\n"
-        f"AI analysis status: {ai_status}. Malformed evidence, when present, was excluded without exposing its value.\n"
-    )
+    return "\n".join(lines)
 
 
 def ai_report_writer(
@@ -427,7 +521,8 @@ Generated:
 Assessment data:
 {assessment_data}
 
-Use exactly this report structure:
+Use exactly this report structure and omit each capability surface section when
+the corresponding evidence is not relevant:
 
 # CyberCortex AI Agent v{__version__} Security Assessment Report
 
@@ -478,21 +573,14 @@ Only evidence-backed verified findings.
 
 ## Incomplete or Failed Checks
 
-## Observed Application Surface
-
-Include DNS, HTTP status, effective URL, redirect chain, technologies, pages
-observed, observed API-related routes, JavaScript files, parameters, and object references.
-
 When GraphQL evidence is relevant, add `## GraphQL Surface` with confidence,
-status, source, limitations, and whether network testing occurred. Add
-`## GraphQL Authorization Planning` only when controlled plans exist, including
-prerequisites, evidence required, and prohibited actions. Never include a raw schema.
 
 When JWT evidence is relevant, add `## JWT Surface`; add comparison and
 verification-planning sections only when corresponding evidence exists.
 
-When upload evidence is relevant, add `## Upload Surface`, `## Upload
-Observations`, and `## Manual Upload Verification` with conservative
+When business-workflow evidence is relevant, add `## Business Workflow Surface`.
+
+When upload evidence is relevant, add `## File Upload Surface` with conservative
 observation-only wording and the prohibited file categories.
 
 ## Prioritized Next Manual Tests
