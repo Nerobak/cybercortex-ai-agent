@@ -1,5 +1,16 @@
 # Tools
 
+## Business logic tools
+
+- `workflow_evidence_discovery`: offline candidate discovery from sanitized evidence
+- `workflow_model_builder`: deterministic canonical workflow model
+- `workflow_transition_analyzer`: ordering, state, actor, ownership, and replay observations
+- `business_rule_analyzer`: deterministic field/rule observations and redacted comparison
+- `business_logic_test_planner`: non-executing controlled verification plans
+- `workflow_replay_checker`: default-disabled bounded authenticated GET/HEAD replay
+
+Use `workflow explain` for complete registry metadata and safety limitations.
+
 ## CyberCortex AI Agent v2.0.0 Beta
 
 Every registered tool declares its category, profiles, prerequisites, traffic behavior, input, evidence, limitations, false positives, verification guidance, relevance, example usage, and safety notes. Inspect those facts with `explain <tool>`, compare profiles with `explain profiles`, review workflow boundaries with `explain scan`, or summarize the current session with `explain latest`.

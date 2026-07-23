@@ -89,6 +89,37 @@ def _finding_summary(results: dict[str, Any]) -> list[dict[str, str]]:
     return findings
 
 
+def _business_logic_summary(results: dict[str, Any]) -> dict[str, Any]:
+    """Project only counts and classifications; never raw workflow evidence."""
+    discovery = (results.get("workflow_evidence_discovery") or {}).get("output") or {}
+    model_output = (results.get("workflow_model_builder") or {}).get("output") or {}
+    model = model_output.get("model") or {}
+    transition = (results.get("workflow_transition_analyzer") or {}).get("output") or {}
+    planner = (results.get("business_logic_test_planner") or {}).get("output") or {}
+    replay = (results.get("workflow_replay_checker") or {}).get("output") or {}
+    return {
+        "workflow_candidates": len(discovery.get("workflow_candidates") or []),
+        "modeled_workflows": 1 if model else 0,
+        "steps_observed": len(model.get("steps") or []),
+        "transitions_observed": len(model.get("transitions") or []),
+        "sensitive_operations": sum(
+            1
+            for step in model.get("steps") or []
+            if step.get("side_effect_class")
+            in {"sensitive", "destructive", "financial"}
+        ),
+        "manual_plans": len(planner.get("plans") or []),
+        "replay_status": replay.get("status", "not_applicable"),
+        "limitations": len(
+            [
+                item
+                for item in transition.get("observations") or []
+                if item.get("type") == "incomplete_sequence"
+            ]
+        ),
+    }
+
+
 def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None:
     parsed = urlparse(target)
 
@@ -130,6 +161,7 @@ def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None
             observed_surface=evidence["observed_surface"],
             graphql=evidence["observed_surface"].get("graphql", {}),
             jwt=evidence["observed_surface"].get("jwt", {}),
+            business_logic=_business_logic_summary(workflow["results"]),
             observations=evidence["observations"],
             candidates=evidence["candidate_findings"],
             verified_findings=evidence["verified_findings"],

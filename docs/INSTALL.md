@@ -1,5 +1,12 @@
 # Installation Guide
 
+## Optional business-logic replay configuration
+
+No additional dependency is required. Replay remains disabled unless
+`BUSINESS_LOGIC_REPLAY_ENABLED=true` is set explicitly. Keep the timeout,
+response-size, step, and request limits positive; `doctor` validates them without
+printing configuration values. Offline workflow commands accept local JSON files.
+
 ## CyberCortex AI Agent v2.0.0 Beta readiness
 
 After installation, run `doctor --quick`. Resolve `FAIL` entries before use and review environment-specific `WARN` entries. A full `doctor` additionally runs registry and compile checks; it does not scan a target. Keep `.env`, reports, logs, verification inputs, captured requests, Burp files, and local JWT inputs untracked. The dashboard binds only to `127.0.0.1`.

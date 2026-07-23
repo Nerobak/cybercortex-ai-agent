@@ -233,6 +233,25 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
                 "## JWT Comparison\n\n"
                 f"Controlled tokens compared: {jwt.get('comparison_count', 0)}. Differences require manual authorization-boundary verification.\n\n"
             )
+    business = (results.get("observed_surface") or {}).get("business_logic") or {}
+    business_text = ""
+    if business.get("workflow_candidates"):
+        business_text = (
+            "## Business Workflow Surface\n\n"
+            "Business-workflow-related application behavior was observed.\n\n"
+            f"- Workflows observed: {business.get('workflow_candidates', 0)}\n"
+            f"- Modeled workflows: {business.get('modeled_workflows', 0)}\n"
+            f"- Steps observed: {business.get('steps_observed', 0)}\n"
+            f"- Transitions observed: {business.get('transitions_observed', 0)}\n\n"
+            "Missing steps and metadata remain incomplete evidence and do not establish a workflow vulnerability.\n\n"
+            "## Business Rule Observations\n\n"
+            f"Sensitive business-field observations: {business.get('business_rule_observations', 0)}. Parameter presence does not prove client-side trust or server-side weakness.\n\n"
+        )
+        if business.get("manual_plans"):
+            business_text += (
+                "## Manual Business Logic Verification Plans\n\n"
+                f"Safe manual plans: {business.get('manual_plans', 0)}. Controlled accounts, test-owned resources, reversible actions, stop conditions, and prohibited actions are mandatory.\n\n"
+            )
         if jwt.get("manual_plans"):
             jwt_text += (
                 "## JWT Verification Planning\n\n"
@@ -263,6 +282,7 @@ def _deterministic_report(target: str, results: dict[str, Any], ai_status: str) 
         + secret_text
         + graphql_text
         + jwt_text
+        + business_text
         + "## Informational and Defense-in-Depth Observations\n\n"
         "The application does not advertise COOP, COEP, and CORP when those headers are recorded as absent. These browser isolation headers are defense-in-depth controls and their absence does not establish a vulnerability or direct exploit path.\n\n"
         "Observed API-related routes are route-name evidence only; they are not identified as functioning API endpoints without response evidence. Crawler counts represent URLs observed before timeout, not pages proven to exist.\n\n"

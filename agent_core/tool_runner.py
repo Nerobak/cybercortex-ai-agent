@@ -474,6 +474,86 @@ class ToolRunner:
                 results[name] = self._envelope(name, "not_applicable", error=reason)
                 self._notify(name, results[name])
 
+        # Business-logic stages consume only already-obtained sanitized metadata.
+        # Normal scans never invoke the replay checker with live requests.
+        workflow_discovery: dict[str, Any] = {}
+        workflow_model: dict[str, Any] = {}
+        workflow_input = {
+            "requests": crawl_output.get("requests", []),
+            "workflow_name": crawl_output.get("workflow_name"),
+        }
+        if "workflow_evidence_discovery" in selected:
+            if workflow_input["requests"]:
+                results["workflow_evidence_discovery"] = self._execute(
+                    "workflow_evidence_discovery",
+                    (workflow_input,),
+                    {},
+                    {"sanitized_request_count": len(workflow_input["requests"])},
+                )
+                workflow_discovery = (
+                    results["workflow_evidence_discovery"].get("output") or {}
+                )
+            else:
+                results["workflow_evidence_discovery"] = self._envelope(
+                    "workflow_evidence_discovery",
+                    "not_applicable",
+                    error="No ordered sanitized workflow evidence was available.",
+                )
+                self._notify(
+                    "workflow_evidence_discovery",
+                    results["workflow_evidence_discovery"],
+                )
+        if "workflow_model_builder" in selected:
+            candidates = workflow_discovery.get("workflow_candidates") or []
+            supported = candidates and candidates[0].get("confidence") != "low"
+            if supported:
+                results["workflow_model_builder"] = self._execute(
+                    "workflow_model_builder",
+                    (workflow_input,),
+                    {},
+                    {"workflow_candidate_count": len(candidates)},
+                )
+                workflow_model = results["workflow_model_builder"].get("output") or {}
+            else:
+                results["workflow_model_builder"] = self._envelope(
+                    "workflow_model_builder",
+                    "not_applicable",
+                    error="Sufficient ordered workflow evidence was unavailable.",
+                )
+                self._notify(
+                    "workflow_model_builder", results["workflow_model_builder"]
+                )
+        for name in ("workflow_transition_analyzer", "business_rule_analyzer"):
+            if name not in selected:
+                continue
+            if workflow_model.get("model"):
+                results[name] = self._execute(
+                    name,
+                    (workflow_model,),
+                    {},
+                    {"canonical_model_available": True},
+                )
+            else:
+                results[name] = self._envelope(
+                    name,
+                    "not_applicable",
+                    error="A canonical workflow model was unavailable.",
+                )
+                self._notify(name, results[name])
+        for name, reason in (
+            (
+                "business_logic_test_planner",
+                "Planner requires explicit controlled-account evidence and never runs from route names alone.",
+            ),
+            (
+                "workflow_replay_checker",
+                "Replay requires a separate explicit opt-in local request file and never runs automatically.",
+            ),
+        ):
+            if name in selected:
+                results[name] = self._envelope(name, "not_applicable", error=reason)
+                self._notify(name, results[name])
+
         for name in ("request_replay_engine", "authorization_differential_tester"):
             if name in selected:
                 results[name] = self._envelope(
@@ -619,6 +699,12 @@ class ToolRunner:
             "graphql_schema_analyzer",
             "graphql_introspection_checker",
             "graphql_authz_planner",
+            "workflow_evidence_discovery",
+            "workflow_model_builder",
+            "workflow_transition_analyzer",
+            "business_rule_analyzer",
+            "business_logic_test_planner",
+            "workflow_replay_checker",
         }
         required = set(planned) - optional - reporting
         coverage_detail = {
