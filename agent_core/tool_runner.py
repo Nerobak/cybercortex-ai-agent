@@ -91,7 +91,10 @@ class ToolRunner:
     ) -> dict[str, Any]:
         started, clock = _now(), time.monotonic()
         self._notify(name, {"tool": name, "status": "running", "started_at": started})
-        function = resolve_tool(name)
+        try:
+            function = resolve_tool(name)
+        except Exception:
+            function = None
         if function is None:
             envelope = self._envelope(
                 name,
@@ -122,6 +125,8 @@ class ToolRunner:
                 status = "timed_out"
             elif output_status == "completed_with_fallback":
                 status = "completed_with_fallback"
+            elif output_status in {"skipped", "not_applicable"}:
+                status = output_status
             elif isinstance(output, dict) and not output.get("success", True):
                 status = "failed"
             else:
@@ -253,6 +258,98 @@ class ToolRunner:
                 continue
             args = (urls,) if name == "parameter_analyzer" else (urls, hostname)
             results[name] = self._execute(name, args, {}, {"url_count": len(urls)})
+
+        # GraphQL modules consume only scope-normalized or explicitly supplied
+        # evidence. Optional stages are deterministically skipped when their
+        # prerequisite evidence is absent.
+        if "graphql_endpoint_discovery" in selected and not expired():
+            graphql_evidence = {
+                **surface,
+                "requests": crawl_output.get("requests", []),
+                "form_actions": crawl_output.get("form_actions", []),
+                "fetch_urls": crawl_output.get("fetch_urls", []),
+            }
+            results["graphql_endpoint_discovery"] = self._execute(
+                "graphql_endpoint_discovery",
+                (graphql_evidence, target),
+                {},
+                {
+                    "url_count": len(surface["all_urls"]),
+                    "network_checks_enabled": False,
+                },
+            )
+        discovery = results.get("graphql_endpoint_discovery", {}).get("output") or {}
+        graphql_queries = crawl_output.get("graphql_queries", [])
+        if "graphql_query_analyzer" in selected:
+            if graphql_queries:
+                # Analyze one bounded representative document in the automatic
+                # workflow; direct CLI analysis can inspect individual files.
+                results["graphql_query_analyzer"] = self._execute(
+                    "graphql_query_analyzer",
+                    (str(graphql_queries[0]),),
+                    {},
+                    {"query_evidence_count": len(graphql_queries)},
+                )
+            else:
+                results["graphql_query_analyzer"] = self._envelope(
+                    "graphql_query_analyzer",
+                    "not_applicable",
+                    error="No GraphQL query evidence was available.",
+                )
+                self._notify(
+                    "graphql_query_analyzer", results["graphql_query_analyzer"]
+                )
+        schema_evidence = crawl_output.get("graphql_schema") or crawl_output.get(
+            "introspection_json"
+        )
+        if "graphql_schema_analyzer" in selected:
+            if isinstance(schema_evidence, dict):
+                results["graphql_schema_analyzer"] = self._execute(
+                    "graphql_schema_analyzer",
+                    (schema_evidence,),
+                    {},
+                    {"schema_evidence": True},
+                )
+            else:
+                results["graphql_schema_analyzer"] = self._envelope(
+                    "graphql_schema_analyzer",
+                    "not_applicable",
+                    error="No already-obtained GraphQL schema evidence was available.",
+                )
+                self._notify(
+                    "graphql_schema_analyzer", results["graphql_schema_analyzer"]
+                )
+        if "graphql_introspection_checker" in selected:
+            endpoints = (
+                discovery.get("confirmed_endpoints", [])
+                or discovery.get("likely_endpoints", [])
+                if isinstance(discovery, dict)
+                else []
+            )
+            if endpoints:
+                results["graphql_introspection_checker"] = self._execute(
+                    "graphql_introspection_checker",
+                    (endpoints[0],),
+                    {},
+                    {"endpoint": endpoints[0].get("url")},
+                )
+            else:
+                results["graphql_introspection_checker"] = self._envelope(
+                    "graphql_introspection_checker",
+                    "not_applicable",
+                    error="No confirmed or high-confidence GraphQL endpoint was available.",
+                )
+                self._notify(
+                    "graphql_introspection_checker",
+                    results["graphql_introspection_checker"],
+                )
+        if "graphql_authz_planner" in selected:
+            results["graphql_authz_planner"] = self._envelope(
+                "graphql_authz_planner",
+                "not_applicable",
+                error="Controlled accounts and sufficient GraphQL authorization evidence were not supplied.",
+            )
+            self._notify("graphql_authz_planner", results["graphql_authz_planner"])
 
         if "authz_test_planner" in selected:
             parameter_output = results.get("parameter_analyzer", {}).get("output") or {}
@@ -443,6 +540,11 @@ class ToolRunner:
             "authz_test_planner",
             "request_replay_engine",
             "authorization_differential_tester",
+            "graphql_endpoint_discovery",
+            "graphql_query_analyzer",
+            "graphql_schema_analyzer",
+            "graphql_introspection_checker",
+            "graphql_authz_planner",
         }
         required = set(planned) - optional - reporting
         coverage_detail = {

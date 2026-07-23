@@ -283,6 +283,33 @@ def normalize_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
                 category="scanner_observation",
             )
         )
+    discovery = _tool_output(results, "graphql_endpoint_discovery")
+    for item in normalize_finding_list(discovery.get("observed_candidates"))[
+        :MAX_ITEMS
+    ]:
+        findings.append(
+            _finding(
+                "GraphQL-related application behavior was observed.",
+                "graphql_endpoint_discovery",
+                endpoint=item.get("url"),
+                evidence=[
+                    f"Endpoint confidence: {item.get('confidence', 'unknown')}; source: {item.get('source', 'unknown')}; network tested: {bool(item.get('network_checked'))}."
+                ],
+                category="graphql_surface",
+            )
+        )
+    introspection = _tool_output(results, "graphql_introspection_checker")
+    if introspection.get("introspection_status") == "introspection_available":
+        findings.append(
+            _finding(
+                "GraphQL introspection was available on the tested endpoint.",
+                "graphql_introspection_checker",
+                evidence=[
+                    "This may aid schema discovery but does not by itself establish a security vulnerability."
+                ],
+                category="graphql_surface",
+            )
+        )
     return findings
 
 
@@ -353,6 +380,27 @@ def build_evidence_package(
             ),
             "parameters": normalize_finding_list(parameter.get("findings")),
             "objects": normalize_finding_list(api.get("objects"), section="objects"),
+            "graphql": {
+                "endpoints_observed": len(
+                    _tool_output(results, "graphql_endpoint_discovery").get(
+                        "observed_candidates", []
+                    )
+                ),
+                "confirmed_endpoints": len(
+                    _tool_output(results, "graphql_endpoint_discovery").get(
+                        "confirmed_endpoints", []
+                    )
+                ),
+                "introspection_status": _tool_output(
+                    results, "graphql_introspection_checker"
+                ).get("introspection_status", "not_tested"),
+                "operations_observed": len(
+                    _tool_output(results, "graphql_query_analyzer").get("fields", [])
+                ),
+                "manual_authorization_plans": len(
+                    _tool_output(results, "graphql_authz_planner").get("plans", [])
+                ),
+            },
         },
         "observations": [f for f in findings if f["status"] == "observation"],
         "candidate_findings": [

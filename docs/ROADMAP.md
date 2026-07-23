@@ -158,3 +158,6 @@ Current Status:
 **Version 1.0 Beta**
 
 Actively developed and continuously improving.
+# v2.1 development planning
+
+Phase 1 adds the safe GraphQL Security Suite while retaining v2.0.0-beta as the canonical current release. Future phases may expand controlled evidence ingestion and report presentation; automatic authorization exploitation, mutation execution, amplification, and denial-of-service testing are out of scope.
