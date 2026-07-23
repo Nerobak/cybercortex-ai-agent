@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use CyberCortex AI Agent, please cite it using the metadata below."
+
+title: "CyberCortex AI Agent"
+type: software
+
+authors:
+  - family-names: "Zlatanovic"
+    given-names: "Nermin"
+    orcid: "https://orcid.org/0009-0007-1918-8671"
+
+version: "2.1.0-beta"
+date-released: "2026-07-23"
+
+doi: "10.5281/zenodo.21519975"
+
+repository-code: "https://github.com/Nerobak/cybercortex-ai-agent"
+url: "https://github.com/Nerobak/cybercortex-ai-agent"
+
+license: "MIT"
+
+keywords:
+  - cybersecurity
+  - artificial intelligence
+  - AI agents
+  - web application security
+  - security automation
+  - vulnerability assessment
+
+abstract: >-
+  CyberCortex AI Agent is an AI-assisted cybersecurity platform that
+  coordinates modular security tools, scope controls, evidence analysis,
+  and report generation for authorized security testing and defensive
+  research.
