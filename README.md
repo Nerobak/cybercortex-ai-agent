@@ -2,8 +2,6 @@
 
 > **A fully local AI-powered cybersecurity assistant for authorized security assessments, bug bounty research, reconnaissance, analysis, and professional reporting.**
 
-[![DOI](https://zenodo.org/badge/1281439329.svg)](https://doi.org/10.5281/zenodo.21519975)
-![GitHub release](https://img.shields.io/github/v/release/Nerobak/cybercortex-ai-agent)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.9+-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
