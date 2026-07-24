@@ -6,7 +6,7 @@
 ![Python](https://img.shields.io/badge/Python-3.9+-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![AI](https://img.shields.io/badge/LLM-DeepSeek_R1_Distill_32B-red)
-![Platform](https://img.shields.io/badge/Platform-Ollama-black)
+![Platform](https://img.shields.io/badge/Platform-Ollama-white)
 
 ---
 
