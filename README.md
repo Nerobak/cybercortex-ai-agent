@@ -328,3 +328,16 @@ CyberCortex is a growing ecosystem of AI-powered cybersecurity projects focused 
 
 CyberCortex AI Agent is the first major component of that ecosystem.
 
+## Citation
+
+CyberCortex AI Agent is permanently archived on Zenodo.
+
+**Project DOI (latest version):**
+
+https://doi.org/10.5281/zenodo.21519975
+
+**Archived release (v2.1.0-beta):**
+
+https://doi.org/10.5281/zenodo.21519976
+
+GitHub users can also use the **"Cite this repository"** button when available. 
