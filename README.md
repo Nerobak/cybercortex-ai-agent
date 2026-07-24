@@ -304,21 +304,21 @@ See the **LICENSE** file for details.
 
 ---
 
-# Author
+## 👤 Author
 
 **Nermin Zlatanovic**
 
 Founder of **CyberCortex**
 
-Cybersecurity Specialist • AI Security Researcher • NIST NICE Ambassador
+Cybersecurity Specialist • AI Security Researcher • NIST NICE Cybersecurity Career Ambassador
 
-Website:
+[![ORCID](https://img.shields.io/badge/ORCID-0009--0007--1918--8671-A6CE39?logo=orcid&logoColor=white)](https://orcid.org/0009-0007-1918-8671)
 
-https://nerminzlatanovic.com
+🌐 **Website:** https://nerminzlatanovic.com
 
-GitHub:
+💻 **GitHub:** https://github.com/Nerobak
 
-https://github.com/nerobak
+🆔 **ORCID:** https://orcid.org/0009-0007-1918-8671
 
 ---
 
