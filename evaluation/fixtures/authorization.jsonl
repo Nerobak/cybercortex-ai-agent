@@ -1,0 +1,2 @@
+{"case_id":"bola-repeatable-controlled","expected_vulnerable":true,"expected_category":"broken_access_control","expected_reproduction":true,"input":{"scenario":"bola_vulnerable"}}
+{"case_id":"bola-owner-denied","expected_vulnerable":false,"expected_category":"broken_access_control","expected_reproduction":false,"input":{"scenario":"bola_secure"}}

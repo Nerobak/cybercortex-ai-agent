@@ -9,6 +9,17 @@ tools/WhatWeb/
 
 # Local verification inputs
 verification_inputs/
+!verification_inputs/
+verification_inputs/*
+!verification_inputs/captures/
+!verification_inputs/contexts/
+!verification_inputs/temporary/
+verification_inputs/captures/*
+verification_inputs/contexts/*
+verification_inputs/temporary/*
+!verification_inputs/captures/.gitkeep
+!verification_inputs/contexts/.gitkeep
+!verification_inputs/temporary/.gitkeep
 *.burp
 *.request.txt
 *.jwt
@@ -22,3 +33,9 @@ verification_inputs/
 .ruff_cache/
 .coverage
 htmlcov/
+
+# Local adaptive-agent state
+memory/*.sqlite3
+memory/*.sqlite3-shm
+memory/*.sqlite3-wal
+memory/scan_history.json

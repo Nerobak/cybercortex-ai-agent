@@ -194,6 +194,7 @@ def test_invalid_limits():
         ("550e8400-e29b-41d4-a716-446655440000", "users", "uuid_identifier"),
         ("project-123", "projects", "opaque_identifier"),
         ("index-Dxj6cuuy.js", "assets", "asset_filename"),
+        ("me", "users", "self_reference"),
         ("en-US", "exchange-pro", "locale"),
     ],
 )

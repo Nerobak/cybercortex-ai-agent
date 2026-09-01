@@ -1,0 +1,244 @@
+{
+  "profile_name": "auth-lab-phase2",
+  "policy_version": 3,
+  "created_at": "2026-08-27T17:51:37.461813Z",
+  "updated_at": "2026-08-27T18:17:52.169352Z",
+  "policy_hash": "0f7f4f06bba9a3bb7ebdabcc7620f2c4d7d7de27c94ab783282520a6a32ce6ff",
+  "change_history": [
+    {
+      "version": 1,
+      "policy_hash": "0bf114d82e1153271213e63ac3fd2fe6fe9db46fb70660ccdd058c360c49476d",
+      "updated_at": "2026-08-27T17:51:37.461813Z",
+      "authorization_reference": "yes",
+      "snapshot": {
+        "profile_name": "auth-lab-phase2",
+        "policy_version": 1,
+        "created_at": "2026-08-27T17:51:37.461813Z",
+        "updated_at": "2026-08-27T17:51:37.461813Z",
+        "policy_hash": "0bf114d82e1153271213e63ac3fd2fe6fe9db46fb70660ccdd058c360c49476d",
+        "cloned_from": null,
+        "program_name": "CyberCortex Range Auth Lab",
+        "authorization_reference": "yes",
+        "authorization_confirmed": true,
+        "allowed_assets": [
+          {
+            "kind": "exact_host",
+            "value": "127.0.0.1",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          },
+          {
+            "kind": "wildcard_host",
+            "value": "*.no",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          },
+          {
+            "kind": "url_prefix",
+            "value": "http://127.0.0.1:8102",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          }
+        ],
+        "excluded_assets": [],
+        "allowed_methods": [
+          "DELETE",
+          "GET",
+          "POST"
+        ],
+        "prohibited_techniques": [
+          "credential_stuffing",
+          "data_exfiltration",
+          "denial_of_service",
+          "destructive_action",
+          "malware",
+          "password_spraying",
+          "persistence",
+          "phishing",
+          "social_engineering",
+          "stealth_evasion"
+        ],
+        "allowed_capabilities": [],
+        "oast_allowed": false,
+        "callback_hosts": [],
+        "testing_windows": [],
+        "requests_per_second": 5.0,
+        "max_concurrency": 1,
+        "request_budget": 100,
+        "per_host_request_budget": 100,
+        "max_response_bytes": 1048756,
+        "max_redirects": 5,
+        "credentials_allowed": true,
+        "controlled_account_ids": [],
+        "allow_bounded_rate_limit_verification": false,
+        "max_rate_limit_attempts": 0,
+        "allow_state_changes": true,
+        "require_test_owned_resources": true,
+        "require_cleanup_for_state_changes": true,
+        "verify_tls": true,
+        "resolve_dns_before_request": true
+      }
+    },
+    {
+      "version": 2,
+      "policy_hash": "94f75ec9011b9eb95a6ff9a426a7b4e29b9739cc024a01aa459aa01468bff252",
+      "updated_at": "2026-08-27T18:10:29.262632Z",
+      "authorization_reference": "yes",
+      "snapshot": {
+        "profile_name": "auth-lab-phase2",
+        "policy_version": 2,
+        "created_at": "2026-08-27T17:51:37.461813Z",
+        "updated_at": "2026-08-27T18:10:29.262632Z",
+        "policy_hash": "94f75ec9011b9eb95a6ff9a426a7b4e29b9739cc024a01aa459aa01468bff252",
+        "cloned_from": null,
+        "program_name": "CyberCortex Range Auth Lab",
+        "authorization_reference": "yes",
+        "authorization_confirmed": true,
+        "allowed_assets": [
+          {
+            "kind": "exact_host",
+            "value": "127.0.0.1",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          },
+          {
+            "kind": "wildcard_host",
+            "value": "*.no",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          },
+          {
+            "kind": "url_prefix",
+            "value": "http://127.0.0.1:8102",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          }
+        ],
+        "excluded_assets": [],
+        "allowed_methods": [
+          "DELETE",
+          "GET",
+          "POST"
+        ],
+        "prohibited_techniques": [
+          "credential_stuffing",
+          "data_exfiltration",
+          "denial_of_service",
+          "destructive_action",
+          "malware",
+          "password_spraying",
+          "persistence",
+          "phishing",
+          "social_engineering",
+          "stealth_evasion"
+        ],
+        "allowed_capabilities": [],
+        "oast_allowed": false,
+        "callback_hosts": [],
+        "testing_windows": [],
+        "requests_per_second": 5.0,
+        "max_concurrency": 1,
+        "request_budget": 100,
+        "per_host_request_budget": 100,
+        "max_response_bytes": 1048756,
+        "max_redirects": 5,
+        "credentials_allowed": true,
+        "controlled_account_ids": [],
+        "allow_bounded_rate_limit_verification": false,
+        "max_rate_limit_attempts": 0,
+        "allow_state_changes": true,
+        "require_test_owned_resources": true,
+        "require_cleanup_for_state_changes": true,
+        "verify_tls": true,
+        "resolve_dns_before_request": true
+      }
+    }
+  ],
+  "cloned_from": null,
+  "program_name": "CyberCortex Range Auth Lab",
+  "authorization_reference": "yes",
+  "authorization_confirmed": true,
+  "allowed_assets": [
+    {
+      "kind": "exact_host",
+      "value": "127.0.0.1",
+      "ports": [
+        8102
+      ],
+      "schemes": [
+        "http"
+      ]
+    },
+    {
+      "kind": "url_prefix",
+      "value": "http://127.0.0.1:8102",
+      "ports": [
+        8102
+      ],
+      "schemes": [
+        "http"
+      ]
+    }
+  ],
+  "excluded_assets": [],
+  "allowed_methods": [
+    "DELETE",
+    "GET",
+    "POST"
+  ],
+  "prohibited_techniques": [
+    "credential_stuffing",
+    "data_exfiltration",
+    "denial_of_service",
+    "destructive_action",
+    "malware",
+    "password_spraying",
+    "persistence",
+    "phishing",
+    "social_engineering",
+    "stealth_evasion"
+  ],
+  "allowed_capabilities": [],
+  "oast_allowed": false,
+  "callback_hosts": [],
+  "testing_windows": [],
+  "requests_per_second": 5.0,
+  "max_concurrency": 1,
+  "request_budget": 100,
+  "per_host_request_budget": 100,
+  "max_response_bytes": 1048756,
+  "max_redirects": 5,
+  "credentials_allowed": true,
+  "controlled_account_ids": [],
+  "allow_bounded_rate_limit_verification": true,
+  "max_rate_limit_attempts": 3,
+  "allow_state_changes": true,
+  "require_test_owned_resources": true,
+  "require_cleanup_for_state_changes": true,
+  "verify_tls": true,
+  "resolve_dns_before_request": true
+}

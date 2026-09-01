@@ -14,6 +14,10 @@ from urllib.request import urlopen
 from agent_core.version import __version__
 from tool_registry import validate_registry
 from config import (
+    API_METADATA_DISCOVERY_ENABLED,
+    API_METADATA_MAX_REQUESTS,
+    API_METADATA_MAX_RESPONSE_BYTES,
+    API_METADATA_TIMEOUT_SECONDS,
     BUSINESS_LOGIC_MAX_REQUESTS_PER_RUN,
     BUSINESS_LOGIC_MAX_RESPONSE_BYTES,
     BUSINESS_LOGIC_MAX_STEPS,
@@ -177,6 +181,28 @@ def doctor(*, quick: bool = False) -> str:
             "disabled"
             if not BUSINESS_LOGIC_REPLAY_ENABLED
             else "enabled by environment; confirm explicit authorization"
+        ),
+    )
+    api_configuration_errors = [
+        error for error in CONFIG_ERRORS if error.startswith("API_METADATA_")
+    ]
+    api_limits_valid = (
+        not api_configuration_errors
+        and 1 <= API_METADATA_MAX_REQUESTS <= 8
+        and 1 <= API_METADATA_TIMEOUT_SECONDS <= 30
+        and 1 <= API_METADATA_MAX_RESPONSE_BYTES <= 2_000_000
+    )
+    add(
+        "PASS" if api_limits_valid else "FAIL",
+        "API metadata discovery configuration",
+        (
+            "enabled with positive bounded GET-only limits"
+            if api_limits_valid and API_METADATA_DISCOVERY_ENABLED
+            else (
+                "disabled with positive bounded limits"
+                if api_limits_valid
+                else "invalid request, timeout, or response-size bound"
+            )
         ),
     )
     add(

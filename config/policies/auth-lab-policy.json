@@ -1,0 +1,256 @@
+{
+  "profile_name": "auth-lab-policy",
+  "policy_version": 4,
+  "created_at": "2026-08-24T15:43:04.003306Z",
+  "updated_at": "2026-08-27T13:45:31.447816Z",
+  "policy_hash": "abc5ea633b6b3d8466a0199078ed2783039222e8786e9fcf824eb238a1863d18",
+  "change_history": [
+    {
+      "version": 1,
+      "policy_hash": "53bdf0972660efbfc03190801ddff983a5ad4a925c0bb4a40c5cca6acf9ab316",
+      "updated_at": "2026-08-24T15:43:04.003306Z",
+      "authorization_reference": "local-cybercortex-range",
+      "snapshot": {
+        "profile_name": "auth-lab-policy",
+        "policy_version": 1,
+        "created_at": "2026-08-24T15:43:04.003306Z",
+        "updated_at": "2026-08-24T15:43:04.003306Z",
+        "policy_hash": "53bdf0972660efbfc03190801ddff983a5ad4a925c0bb4a40c5cca6acf9ab316",
+        "cloned_from": null,
+        "program_name": "CyberCortex Range",
+        "authorization_reference": "local-cybercortex-range",
+        "authorization_confirmed": true,
+        "allowed_assets": [
+          {
+            "kind": "url_prefix",
+            "value": "http://127.0.0.1:8102",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          }
+        ],
+        "excluded_assets": [],
+        "allowed_methods": [
+          "GET",
+          "POST"
+        ],
+        "prohibited_techniques": [
+          "credential_stuffing",
+          "data_exfiltration",
+          "denial_of_service",
+          "destructive_action",
+          "malware",
+          "password_spraying",
+          "persistence",
+          "phishing",
+          "social_engineering",
+          "stealth_evasion"
+        ],
+        "allowed_capabilities": [],
+        "oast_allowed": false,
+        "callback_hosts": [],
+        "testing_windows": [],
+        "requests_per_second": 5.0,
+        "max_concurrency": 2,
+        "request_budget": 100,
+        "per_host_request_budget": 50,
+        "max_response_bytes": 1000000,
+        "max_redirects": 5,
+        "credentials_allowed": true,
+        "controlled_account_ids": [],
+        "allow_state_changes": false,
+        "require_test_owned_resources": false,
+        "require_cleanup_for_state_changes": false,
+        "verify_tls": true,
+        "resolve_dns_before_request": true
+      }
+    },
+    {
+      "version": 2,
+      "policy_hash": "81c034f8779abbc9a10390d19428d3bc6808bd4d189901d47410d013e1fb628f",
+      "updated_at": "2026-08-24T15:44:59.366563Z",
+      "authorization_reference": "local-cybercortex-range",
+      "snapshot": {
+        "profile_name": "auth-lab-policy",
+        "policy_version": 2,
+        "created_at": "2026-08-24T15:43:04.003306Z",
+        "updated_at": "2026-08-24T15:44:59.366563Z",
+        "policy_hash": "81c034f8779abbc9a10390d19428d3bc6808bd4d189901d47410d013e1fb628f",
+        "cloned_from": null,
+        "program_name": "CyberCortex Range",
+        "authorization_reference": "local-cybercortex-range",
+        "authorization_confirmed": true,
+        "allowed_assets": [
+          {
+            "kind": "url_prefix",
+            "value": "http://127.0.0.1:8102",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          }
+        ],
+        "excluded_assets": [],
+        "allowed_methods": [
+          "GET",
+          "POST"
+        ],
+        "prohibited_techniques": [
+          "credential_stuffing",
+          "data_exfiltration",
+          "denial_of_service",
+          "destructive_action",
+          "malware",
+          "password_spraying",
+          "persistence",
+          "phishing",
+          "social_engineering",
+          "stealth_evasion"
+        ],
+        "allowed_capabilities": [],
+        "oast_allowed": false,
+        "callback_hosts": [],
+        "testing_windows": [],
+        "requests_per_second": 5.0,
+        "max_concurrency": 2,
+        "request_budget": 100,
+        "per_host_request_budget": 50,
+        "max_response_bytes": 1000000,
+        "max_redirects": 5,
+        "credentials_allowed": true,
+        "controlled_account_ids": [
+          "alice"
+        ],
+        "allow_state_changes": false,
+        "require_test_owned_resources": false,
+        "require_cleanup_for_state_changes": false,
+        "verify_tls": true,
+        "resolve_dns_before_request": true
+      }
+    },
+    {
+      "version": 3,
+      "policy_hash": "e441c33dd4a37810d2b25ad70aa2c0e998ae07cf9e0c0ac3dfc54ad5402c2184",
+      "updated_at": "2026-08-25T17:09:22.686450Z",
+      "authorization_reference": "local-cybercortex-range",
+      "snapshot": {
+        "profile_name": "auth-lab-policy",
+        "policy_version": 3,
+        "created_at": "2026-08-24T15:43:04.003306Z",
+        "updated_at": "2026-08-25T17:09:22.686450Z",
+        "policy_hash": "e441c33dd4a37810d2b25ad70aa2c0e998ae07cf9e0c0ac3dfc54ad5402c2184",
+        "cloned_from": null,
+        "program_name": "CyberCortex Range",
+        "authorization_reference": "local-cybercortex-range",
+        "authorization_confirmed": true,
+        "allowed_assets": [
+          {
+            "kind": "url_prefix",
+            "value": "http://127.0.0.1:8102",
+            "ports": [
+              8102
+            ],
+            "schemes": [
+              "http"
+            ]
+          }
+        ],
+        "excluded_assets": [],
+        "allowed_methods": [
+          "DELETE",
+          "GET",
+          "POST"
+        ],
+        "prohibited_techniques": [
+          "credential_stuffing",
+          "data_exfiltration",
+          "denial_of_service",
+          "destructive_action",
+          "malware",
+          "password_spraying",
+          "persistence",
+          "phishing",
+          "social_engineering",
+          "stealth_evasion"
+        ],
+        "allowed_capabilities": [],
+        "oast_allowed": false,
+        "callback_hosts": [],
+        "testing_windows": [],
+        "requests_per_second": 5.0,
+        "max_concurrency": 2,
+        "request_budget": 100,
+        "per_host_request_budget": 50,
+        "max_response_bytes": 1000000,
+        "max_redirects": 5,
+        "credentials_allowed": true,
+        "controlled_account_ids": [
+          "alice"
+        ],
+        "allow_state_changes": true,
+        "require_test_owned_resources": false,
+        "require_cleanup_for_state_changes": false,
+        "verify_tls": true,
+        "resolve_dns_before_request": true
+      }
+    }
+  ],
+  "cloned_from": null,
+  "program_name": "CyberCortex Range",
+  "authorization_reference": "local-cybercortex-range",
+  "authorization_confirmed": true,
+  "allowed_assets": [
+    {
+      "kind": "url_prefix",
+      "value": "http://127.0.0.1:8102",
+      "ports": [
+        8102
+      ],
+      "schemes": [
+        "http"
+      ]
+    }
+  ],
+  "excluded_assets": [],
+  "allowed_methods": [
+    "DELETE",
+    "GET",
+    "POST"
+  ],
+  "prohibited_techniques": [
+    "credential_stuffing",
+    "data_exfiltration",
+    "denial_of_service",
+    "destructive_action",
+    "malware",
+    "password_spraying",
+    "persistence",
+    "phishing",
+    "social_engineering",
+    "stealth_evasion"
+  ],
+  "allowed_capabilities": [],
+  "oast_allowed": false,
+  "callback_hosts": [],
+  "testing_windows": [],
+  "requests_per_second": 5.0,
+  "max_concurrency": 2,
+  "request_budget": 100,
+  "per_host_request_budget": 50,
+  "max_response_bytes": 1000000,
+  "max_redirects": 5,
+  "credentials_allowed": true,
+  "controlled_account_ids": [
+    "alice"
+  ],
+  "allow_state_changes": true,
+  "require_test_owned_resources": false,
+  "require_cleanup_for_state_changes": true,
+  "verify_tls": true,
+  "resolve_dns_before_request": true
+}

@@ -1,5 +1,22 @@
 # Roadmap
 
+## Adaptive agent foundation: implemented
+
+- Typed adaptive planning and evidence-linked verification plans.
+- Persistent, versioned SQLite surface graph and scan-memory integration.
+- Sanitized capture-first HAR, raw HTTP, OpenAPI, Postman, GraphQL, and browser
+  ingestion with controlled identities and test-owned objects.
+- Ranked bug-bounty hypotheses and deterministic verification gates.
+- Killable network-tool subprocesses, common scoped transport, local credential
+  vault, and hash-chained audit log.
+- Program policy compiler with exclusions, wildcards, URL prefixes, testing
+  windows, budgets, rate limits, account restrictions, and cleanup rules.
+- Offline evaluation lab with quality, efficiency, reproduction, and zero-tolerance
+  safety metrics.
+
+Future work should grow replayable benchmark coverage and typed verifier
+adapters before introducing multi-agent specialization.
+
 ## v2.1 development
 
 - Business Logic Analysis Engine: implemented on the feature branch with

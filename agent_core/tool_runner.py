@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import inspect
 import threading
 import time
 from datetime import datetime, timezone
@@ -14,11 +15,27 @@ from agent_core.result_normalizer import (
     normalize_url_evidence,
     redact,
 )
+from agent_core.hardened_executor import SubprocessToolExecutor
+from agent_core.policy import AssessmentPolicy, policy_from_runtime
+from agent_core.request_budget import RequestBudget
 from tool_registry import TOOLS, resolve_tool, tools_for_profile
-from config import AI_REPORT_TIMEOUT_SECONDS
+from tools.safe_http import ScopedHTTPClient
+from config import (
+    ADAPTIVE_MAX_REQUESTS,
+    AGENT_REQUEST_BUDGET,
+    AI_REPORT_TIMEOUT_SECONDS,
+    NUCLEI_SEVERITY,
+    NUCLEI_TIMEOUT_SECONDS,
+)
 
 DEFAULT_TOOL_TIMEOUT = 90
 DEFAULT_ASSESSMENT_TIMEOUT = 600
+NUCLEI_TOOL_GRACE_SECONDS = 5
+
+
+def _nuclei_runner_timeout_seconds() -> int:
+    """Allow Nuclei to enforce its own timeout before the runner gives up."""
+    return NUCLEI_TIMEOUT_SECONDS + NUCLEI_TOOL_GRACE_SECONDS
 
 
 def _now() -> str:
@@ -34,12 +51,68 @@ class ToolRunner:
         max_network_tools: int = 3,
         status_callback: Callable[[str, dict[str, Any]], None] | None = None,
         phase_callback: Callable[[str], None] | None = None,
+        isolate_network_tools: bool = False,
+        policy: AssessmentPolicy | None = None,
+        request_budget: RequestBudget | None = None,
+        http_client: ScopedHTTPClient | None = None,
     ) -> None:
         self.tool_timeout = tool_timeout
         self.assessment_timeout = assessment_timeout
         self.network_slots = threading.BoundedSemaphore(max_network_tools)
         self.status_callback = status_callback
         self.phase_callback = phase_callback
+        self.isolate_network_tools = isolate_network_tools
+        self.policy = policy
+        self.request_budget = request_budget
+        self.http_client = http_client
+        self.process_executor = (
+            SubprocessToolExecutor() if isolate_network_tools else None
+        )
+
+    def _ensure_network_runtime(self, target: str, profile: str) -> None:
+        if self.http_client is not None:
+            if self.policy is not None and self.http_client.policy is not self.policy:
+                raise ValueError("ToolRunner HTTP client uses a different policy.")
+            if (
+                self.request_budget is not None
+                and self.http_client.budget is not self.request_budget
+            ):
+                raise ValueError(
+                    "ToolRunner HTTP client uses a different request ledger."
+                )
+            self.policy = self.http_client.policy
+            self.request_budget = self.http_client.budget
+            return
+        policy = self.policy or policy_from_runtime(
+            target,
+            profile=profile,
+            authorization_confirmed=True,
+            request_budget=AGENT_REQUEST_BUDGET,
+        )
+        budget = self.request_budget or RequestBudget(
+            min(policy.request_budget, ADAPTIVE_MAX_REQUESTS),
+            per_host_limit=policy.per_host_request_budget,
+        )
+        self.policy = policy
+        self.request_budget = budget
+        self.http_client = ScopedHTTPClient(policy=policy, budget=budget)
+
+    @staticmethod
+    def _accepts_keyword(function: Callable[..., Any], name: str) -> bool:
+        try:
+            parameters = inspect.signature(function).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == name or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    @staticmethod
+    def _is_registered_implementation(
+        function: Callable[..., Any], metadata: dict[str, Any]
+    ) -> bool:
+        return getattr(function, "__module__", "") == metadata.get("module")
 
     def _phase(self, name: str) -> None:
         if self.phase_callback:
@@ -107,11 +180,61 @@ class ToolRunner:
             self._notify(name, envelope)
             return envelope
 
+        metadata = TOOLS[name]
+        call_kwargs = dict(kwargs)
+        if metadata["sends_network_traffic"]:
+            if self.http_client is None:
+                envelope = self._envelope(
+                    name,
+                    "failed",
+                    started=started,
+                    started_clock=clock,
+                    error="Shared authorized network transport is unavailable.",
+                    input_summary=input_summary,
+                )
+                self._notify(name, envelope)
+                return envelope
+            adapter = metadata.get("network_adapter") or "fail_closed"
+            if adapter == "fail_closed" and self._is_registered_implementation(
+                function, metadata
+            ):
+                envelope = self._envelope(
+                    name,
+                    "skipped",
+                    started=started,
+                    started_clock=clock,
+                    error=(
+                        "Network execution is disabled because this tool has no "
+                        "shared policy-aware transport adapter."
+                    ),
+                    input_summary=input_summary,
+                )
+                self._notify(name, envelope)
+                return envelope
+            if adapter in {"shared_http", "shared_dns"}:
+                if self._accepts_keyword(function, "http_client"):
+                    call_kwargs["http_client"] = self.http_client
+                elif self._is_registered_implementation(function, metadata):
+                    envelope = self._envelope(
+                        name,
+                        "failed",
+                        started=started,
+                        started_clock=clock,
+                        error="The registered network tool rejected the shared transport.",
+                        input_summary=input_summary,
+                    )
+                    self._notify(name, envelope)
+                    return envelope
+            elif adapter == "offline_fallback" and self._accepts_keyword(
+                function, "allow_network_analysis"
+            ):
+                call_kwargs["allow_network_analysis"] = False
+
         def invoke() -> Any:
             if TOOLS[name]["sends_network_traffic"]:
                 with self.network_slots:
-                    return function(*args, **kwargs)
-            return function(*args, **kwargs)
+                    return function(*args, **call_kwargs)
+            return function(*args, **call_kwargs)
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = executor.submit(invoke)
@@ -166,9 +289,22 @@ class ToolRunner:
         return envelope
 
     def run(
-        self, target: str, *, profile: str = "baseline", jwt_token: str | None = None
+        self,
+        target: str,
+        *,
+        profile: str = "baseline",
+        assessment_mode: str = "observe",
+        jwt_token: str | None = None,
+        selected_tools: list[str] | set[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
-        selected = set(tools_for_profile(profile))
+        self._ensure_network_runtime(target, profile)
+        eligible = set(tools_for_profile(profile))
+        selected = (
+            eligible if selected_tools is None else set(selected_tools) & eligible
+        )
+        # Reporting remains a deterministic terminal boundary for every scan.
+        if "ai_report_writer" in eligible:
+            selected.add("ai_report_writer")
         started_at, overall_clock = _now(), time.monotonic()
         results: dict[str, Any] = {}
 
@@ -185,10 +321,11 @@ class ToolRunner:
         for name in independent:
             if name in selected and not expired():
                 args = (hostname,) if name == "dns_lookup" else (target,)
+                kwargs = {"target_url": target} if name == "dns_lookup" else {}
                 results[name] = self._execute(
                     name,
                     args,
-                    {},
+                    kwargs,
                     {"target": hostname if name == "dns_lookup" else target},
                 )
 
@@ -200,9 +337,87 @@ class ToolRunner:
         # When Katana produced no usable output, the bounded Python crawler is
         # an explicit fallback and its visited pages become shared URL evidence.
         crawl_output = results.get("katana_crawl", {}).get("output") or {}
+        api_target_output: dict[str, Any] = {}
+        if "api_target_analyzer" in selected and not expired():
+            results["api_target_analyzer"] = self._execute(
+                "api_target_analyzer",
+                (
+                    target,
+                    results.get("http_probe", {}).get("output") or {},
+                    results.get("tech_fingerprint", {}).get("output") or {},
+                    crawl_output,
+                ),
+                {},
+                {"existing_evidence_only": True},
+            )
+            api_target_output = results["api_target_analyzer"].get("output") or {}
+        raw_api_decision = (
+            api_target_output.get("decision")
+            if isinstance(api_target_output, dict)
+            else {}
+        )
+        api_decision = raw_api_decision if isinstance(raw_api_decision, dict) else {}
+        should_pivot = api_decision.get("decision") == "api_metadata_discovery"
+        metadata_output: dict[str, Any] = {}
+        if "api_metadata_discovery" in selected:
+            if should_pivot and not expired():
+                self._phase("adaptive_api_discovery")
+                results["api_metadata_discovery"] = self._execute(
+                    "api_metadata_discovery",
+                    (target,),
+                    {},
+                    {
+                        "target": target,
+                        "automatic": True,
+                        "bounded": True,
+                        "reason": api_target_output.get("reason"),
+                    },
+                )
+                metadata_output = results["api_metadata_discovery"].get("output") or {}
+            else:
+                results["api_metadata_discovery"] = self._envelope(
+                    "api_metadata_discovery",
+                    "not_applicable",
+                    error=(
+                        "Adaptive API metadata criteria were not met."
+                        if not expired()
+                        else "Overall assessment timeout reached."
+                    ),
+                    input_summary={"automatic": False, "bounded": True},
+                )
+                self._notify(
+                    "api_metadata_discovery", results["api_metadata_discovery"]
+                )
+        documents = (
+            metadata_output.get("documents")
+            if isinstance(metadata_output.get("documents"), list)
+            else []
+        )
+        openapi_output: dict[str, Any] = {}
+        if "openapi_surface_analyzer" in selected:
+            if documents and not expired():
+                results["openapi_surface_analyzer"] = self._execute(
+                    "openapi_surface_analyzer",
+                    (documents,),
+                    {},
+                    {"document_count": len(documents), "network_tested": False},
+                )
+                openapi_output = results["openapi_surface_analyzer"].get("output") or {}
+            else:
+                results["openapi_surface_analyzer"] = self._envelope(
+                    "openapi_surface_analyzer",
+                    "not_applicable",
+                    error="No validated OpenAPI document was available.",
+                    input_summary={"document_count": 0, "network_tested": False},
+                )
+                self._notify(
+                    "openapi_surface_analyzer",
+                    results["openapi_surface_analyzer"],
+                )
         api_ran_as_fallback = False
         if (
             not crawl_output.get("urls")
+            and not openapi_output.get("routes")
             and "api_object_discovery" in selected
             and not expired()
         ):
@@ -232,8 +447,8 @@ class ToolRunner:
         surface = normalize_url_evidence(target, results)
         self._phase("dependent_analyzers")
         list_inputs = {
-            "endpoint_analyzer": surface["all_urls"],
-            "parameter_analyzer": surface["all_urls"],
+            "endpoint_analyzer": surface["analysis_urls"],
+            "parameter_analyzer": surface["analysis_urls"],
             "misconfiguration_detector": surface["all_urls"],
             "js_secret_scanner": surface["javascript_urls"],
         }
@@ -360,7 +575,7 @@ class ToolRunner:
             "form_actions": crawl_output.get("form_actions", []),
             "fetch_urls": crawl_output.get("fetch_urls", []),
             "javascript_strings": crawl_output.get("javascript_strings", []),
-            "openapi": crawl_output.get("openapi", {}),
+            "openapi": openapi_output,
             "graphql_schema": (
                 schema_evidence if isinstance(schema_evidence, dict) else {}
             ),
@@ -469,14 +684,26 @@ class ToolRunner:
                 {
                     "max_pages": 25,
                     "normalized_url_evidence": surface,
-                    "allow_network_crawl": profile in {"deep", "authenticated"},
+                    "allow_network_crawl": profile
+                    in {"deep", "authenticated", "intrusive"},
                 },
                 {"target": surface["effective_target"]},
             )
         self._phase("optional_tools")
         if "nuclei_scan" in selected and not expired():
+            nuclei_kwargs = {"severity": NUCLEI_SEVERITY}
+            if profile == "intrusive":
+                nuclei_kwargs["intrusive"] = True
             results["nuclei_scan"] = self._execute(
-                "nuclei_scan", (target,), {}, {"target": target}
+                "nuclei_scan",
+                (target,),
+                nuclei_kwargs,
+                {
+                    "target": target,
+                    "minimum_severity": NUCLEI_SEVERITY,
+                    "intrusive": profile == "intrusive",
+                },
+                timeout=_nuclei_runner_timeout_seconds(),
             )
 
         if "jwt_security_analyzer" in selected:
@@ -639,7 +866,13 @@ class ToolRunner:
                 results[name] = self._envelope(name, "not_applicable", error=reason)
                 self._notify(name, results[name])
 
-        for name in ("request_replay_engine", "authorization_differential_tester"):
+        for name in (
+            "request_replay_engine",
+            "authorization_differential_tester",
+            "authenticated_injection_verifier",
+            "request_mutation_engine",
+            "capture_verification_orchestrator",
+        ):
             if name in selected:
                 results[name] = self._envelope(
                     name,
@@ -654,7 +887,13 @@ class ToolRunner:
         completed_at = _now()
         self._phase("evidence_package")
         evidence = build_evidence_package(
-            target, profile, results, started_at, completed_at, surface
+            target,
+            profile,
+            results,
+            started_at,
+            completed_at,
+            surface,
+            assessment_mode,
         )
         pre_completed = [
             name for name, env in results.items() if env.get("status") == "completed"
@@ -779,6 +1018,9 @@ class ToolRunner:
             "authz_test_planner",
             "request_replay_engine",
             "authorization_differential_tester",
+            "authenticated_injection_verifier",
+            "request_mutation_engine",
+            "capture_verification_orchestrator",
             "graphql_endpoint_discovery",
             "graphql_query_analyzer",
             "graphql_schema_analyzer",
@@ -832,6 +1074,7 @@ class ToolRunner:
             "coverage": coverage,
             "target": target,
             "profile": profile,
+            "assessment_mode": assessment_mode,
             "started_at": started_at,
             "completed_at": _now(),
             "completed_steps": [

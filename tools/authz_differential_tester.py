@@ -65,6 +65,7 @@ def _build_evidence(diff_result: dict[str, Any]) -> list[str]:
 
 def _determine_candidate_status(
     diff_result: dict[str, Any],
+    object_identifier: str | None,
     ownership_confirmed: bool,
     separate_accounts_confirmed: bool,
 ) -> tuple[str, str, str]:
@@ -97,31 +98,45 @@ def _determine_candidate_status(
     )
 
     highly_similar_success = (
-        candidate_status in SUCCESS_STATUSES and body.get("similarity_ratio", 0) >= 0.95
+        baseline_status in SUCCESS_STATUSES
+        and candidate_status in SUCCESS_STATUSES
+        and body.get("candidate_length", 0) > 0
+        and body.get("similarity_ratio", 0) >= 0.95
     )
+
+    # Account A is the captured owner context and Account B is the non-owner
+    # context. If both can read the same non-empty object representation, that
+    # is the canonical horizontal IDOR/BOLA signal. Sensitive fields increase
+    # impact, but their absence does not make object-level bypass harmless.
+    owner_and_non_owner_success = highly_similar_success
 
     if denial_to_success and successful_sensitive_response:
         severity = "high"
+        confidence = "high"
+
+    elif owner_and_non_owner_success and sensitive_fields:
+        severity = "high"
+        confidence = "high"
+
+    elif owner_and_non_owner_success:
+        severity = "medium"
         confidence = "high"
 
     elif denial_to_success:
         severity = "medium"
         confidence = "medium"
 
-    elif successful_sensitive_response and highly_similar_success:
-        severity = "medium"
-        confidence = "medium"
-
-    elif highly_similar_success:
-        severity = "low"
-        confidence = "low"
-
     else:
         severity = "informational"
         confidence = "low"
 
+    # Verification requires concrete protected-data evidence. Equal success
+    # statuses or similarly shaped public bodies remain candidates even when
+    # the caller supplied otherwise valid controlled ownership context.
     if (
         severity in {"medium", "high"}
+        and successful_sensitive_response
+        and bool(object_identifier)
         and ownership_confirmed
         and separate_accounts_confirmed
     ):
@@ -158,6 +173,7 @@ def analyze_authorization_difference(
 
     severity, confidence, finding_status = _determine_candidate_status(
         diff_result=diff_result,
+        object_identifier=object_identifier,
         ownership_confirmed=ownership_confirmed,
         separate_accounts_confirmed=separate_accounts_confirmed,
     )
@@ -168,6 +184,20 @@ def analyze_authorization_difference(
         "sensitive_fields_present",
         [],
     )
+
+    body = diff_result.get("body", {})
+    status = diff_result.get("status", {})
+    owner_and_non_owner_success = (
+        status.get("baseline") in SUCCESS_STATUSES
+        and status.get("candidate") in SUCCESS_STATUSES
+        and body.get("candidate_length", 0) > 0
+        and body.get("similarity_ratio", 0) >= 0.95
+    )
+    if owner_and_non_owner_success:
+        evidence.append(
+            "The confirmed owner context and separate non-owner context both "
+            "received highly similar successful object responses."
+        )
 
     if severity == "high":
         title = "Possible horizontal authorization bypass"
@@ -234,6 +264,8 @@ def analyze_authorization_difference(
         manual_verification=manual_verification,
         metadata={
             "object_identifier": object_identifier,
+            "baseline_context": "account_a_confirmed_owner",
+            "candidate_context": "account_b_separate_non_owner",
             "ownership_confirmed": ownership_confirmed,
             "separate_accounts_confirmed": (separate_accounts_confirmed),
             "sensitive_fields": sensitive_fields,

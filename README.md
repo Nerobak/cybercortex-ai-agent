@@ -1,5 +1,27 @@
 # CyberCortex AI Agent
 
+## Adaptive agent architecture
+
+CyberCortex now includes typed hypotheses and verification plans, a deterministic
+bug-bounty policy compiler, persistent SQLite surface memory, sanitized
+HAR/OpenAPI/Postman/GraphQL/browser ingestion, controlled identity and object
+modeling, killable network-tool processes, credential references, hash-chained
+audit events, and an offline evaluation laboratory.
+
+The local model proposes and prioritizes hypotheses. It cannot approve network
+activity or promote a finding to verified. See
+[docs/ADAPTIVE_AGENT.md](docs/ADAPTIVE_AGENT.md).
+
+```text
+python policy_cli.py init-target
+python agent_cli.py --capture <authorized.har> --policy-profile <profile>
+python eval_cli.py
+```
+
+Saved, versioned authorization profiles live in `config/policies/`; reusable
+credential-free identity and ownership annotations live in `config/contexts/`.
+The legacy `--policy <file>` and `--context <file>` options remain available.
+
 ## File upload analysis
 
 The v2.1 upload engine discovers upload evidence offline, records validation,
@@ -68,6 +90,39 @@ jwt analyze
 upload analyze verification_inputs/upload-evidence.json
 upload plan verification_inputs/upload-evidence.json
 upload explain
+python campaign_cli.py --manifest verification_inputs/campaign.json
+```
+
+Capture campaigns rank parameters and produce an offline plan. Active execution
+through `campaign_cli.py --execute` is disabled for Phase 2 until that path can
+use the same selected policy and live request ledger as the primary runtime. See
+[docs/CAPTURE_CAMPAIGNS.md](docs/CAPTURE_CAMPAIGNS.md).
+
+The adaptive importer also models query, path, header, form, JSON, multipart,
+and GraphQL-variable locations. Executable state-changing plans require a
+researcher-owned test resource and cleanup.
+
+## Persistent policy profiles
+
+Create, inspect, validate, clone, edit, and delete saved authorization with
+`policy_cli.py create|list|show|validate|clone|edit|delete`. The guided
+`python policy_cli.py init-target` command can also create a matching context.
+
+`python policy_cli.py map-host app.example.com my-program` creates an exact
+host mapping for optional `agent_cli.py --auto-policy` selection. Auto-policy
+never infers authorization from capture traffic and fails if a capture host has
+no exact mapping. Context profiles are managed with
+`context_cli.py create|list|show|edit|validate`; they contain roles, tenants,
+and researcher-owned object references, never raw credentials.
+
+```bash
+python agent_cli.py \
+  --capture verification_inputs/captures/nerminzlatanovic.har \
+  --policy-profile nerminzlatanovic \
+  --context-profile public-site \
+  --profile intrusive \
+  --llm-analyst \
+  --output reports/adaptive/nerminzlatanovic-assessment.json
 ```
 
 `baseline` is the default and runs target-only checks. `deep` adds bounded,
@@ -410,6 +465,36 @@ https://github.com/nerobak
 CyberCortex is a growing ecosystem of AI-powered cybersecurity projects focused on empowering defenders, researchers, and bug bounty hunters through local AI, automation, and practical security engineering.
 
 CyberCortex AI Agent is the first major component of that ecosystem.
+
+# Phase 2 adaptive research
+
+Phase 2 converts observed routes, parameters, object references, authentication
+boundaries, GraphQL/JWT/upload/workflow metadata, captures, and response
+summaries into testable hypotheses. It ranks evidence and verification safety,
+builds minimal plans, and keeps execution behind deterministic scope, ownership,
+method, side-effect, lab-classification, and request-budget gates.
+
+```text
+scan https://authorized.example --mode observe
+scan https://authorized.example --mode plan --policy policy.json
+scan http://local-range.example --mode verify --lab --policy policy.json --context controlled-context.json --verification-input evidence-context.json
+hypotheses
+hypothesis explain <id>
+verification plan <id>
+verification run <id> --policy policy.json --context controlled-context.json --input evidence-input.json --lab
+benchmark export reports/benchmark.json
+python phase2_cli.py campaign create api-lab-phase2 --target http://127.0.0.1:8101
+python phase2_cli.py scan http://127.0.0.1:8101 --mode plan --campaign api-lab-phase2
+python phase2_cli.py campaign add-run api-lab-phase2 <run-id>
+python phase2_cli.py campaign show api-lab-phase2
+python phase2_cli.py campaign export api-lab-phase2 reports/api-lab-phase2.json
+```
+
+Credentials and tokens in an explicitly supplied controlled context are moved
+to the process-local vault and are never written to Phase 2 runs, reports, or
+benchmark exports. A run is one assessment execution; a campaign is a cumulative
+authorized effort that references multiple preserved runs for the same target.
+See [Phase 2 Architecture](docs/PHASE2.md).
 # GraphQL v2.1 Phase 1
 
 The development branch includes a modular, default-safe GraphQL suite for endpoint observations, offline query/schema analysis, opt-in bounded introspection, and controlled-account authorization planning. GraphQL behavior and introspection availability are observations, not vulnerabilities. See [docs/GRAPHQL_SUITE.md](docs/GRAPHQL_SUITE.md).

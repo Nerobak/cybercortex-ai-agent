@@ -2,7 +2,7 @@ import hashlib
 import math
 import re
 
-from tools.safe_http import scoped_get
+from tools.safe_http import ScopedHTTPClient, scoped_get
 
 ASSIGNMENT = re.compile(
     r"""(?i)\b(api[_-]?key|token|secret|password|client[_-]?secret|authorization)\b\s*[:=]\s*["']([^"']*)["']"""
@@ -78,7 +78,12 @@ def _finding(
     }
 
 
-def js_secret_scanner(urls: list[str], allowed_domain: str):
+def js_secret_scanner(
+    urls: list[str],
+    allowed_domain: str,
+    *,
+    http_client: ScopedHTTPClient | None = None,
+):
     findings, errors, seen = [], [], set()
     checked = 0
     for url in sorted(set(urls)):
@@ -91,7 +96,7 @@ def js_secret_scanner(urls: list[str], allowed_domain: str):
         ):
             continue
         try:
-            response, _ = scoped_get(url, timeout=10)
+            response, _ = scoped_get(url, timeout=10, http_client=http_client)
             checked += 1
             content = response.text
             matches = [

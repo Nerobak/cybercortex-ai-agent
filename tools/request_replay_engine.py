@@ -9,6 +9,7 @@ import requests
 from tools.authz_differential_tester import (
     analyze_authorization_difference,
 )
+from tools.safe_http import ScopedHTTPClient
 from tools.scope_guard import enforce_scope
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -146,13 +147,18 @@ def _send_request(
     started = time.perf_counter()
 
     try:
-        response = requests.request(
-            method=method,
-            url=url,
+        client = ScopedHTTPClient(
+            requester=requests.request,
+            requester_takes_method=True,
+            scope_prevalidated=True,
+        )
+        response, _ = client.request(
+            method,
+            url,
             headers=headers,
             params=query_params,
             timeout=timeout_seconds,
-            allow_redirects=False,
+            follow_redirects=False,
             verify=verify_tls,
         )
 

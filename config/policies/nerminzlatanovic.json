@@ -1,0 +1,51 @@
+{
+  "profile_name": "nerminzlatanovic",
+  "policy_version": 1,
+  "created_at": "2026-08-12T00:00:00Z",
+  "updated_at": "2026-08-12T00:00:00Z",
+  "policy_hash": "a25b425c9114add19425f1a3ff4a68bd20c91f7e4a7a3011a870382e8a52d50f",
+  "change_history": [],
+  "cloned_from": null,
+  "program_name": "nerminzlatanovic-authorized-program",
+  "authorization_reference": "Website owner authorized assessment",
+  "authorization_confirmed": true,
+  "allowed_assets": [
+    {
+      "kind": "exact_host",
+      "value": "nerminzlatanovic.com",
+      "ports": [443],
+      "schemes": ["https"]
+    }
+  ],
+  "excluded_assets": [],
+  "allowed_methods": ["GET", "HEAD", "OPTIONS"],
+  "prohibited_techniques": [
+    "credential_stuffing",
+    "data_exfiltration",
+    "denial_of_service",
+    "destructive_action",
+    "malware",
+    "password_spraying",
+    "persistence",
+    "phishing",
+    "social_engineering",
+    "stealth_evasion"
+  ],
+  "allowed_capabilities": [],
+  "oast_allowed": false,
+  "callback_hosts": [],
+  "testing_windows": [],
+  "requests_per_second": 2.0,
+  "max_concurrency": 2,
+  "request_budget": 100,
+  "per_host_request_budget": 50,
+  "max_response_bytes": 1000000,
+  "max_redirects": 5,
+  "credentials_allowed": false,
+  "controlled_account_ids": [],
+  "allow_state_changes": false,
+  "require_test_owned_resources": true,
+  "require_cleanup_for_state_changes": true,
+  "verify_tls": true,
+  "resolve_dns_before_request": true
+}

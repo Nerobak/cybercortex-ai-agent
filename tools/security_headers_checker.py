@@ -1,9 +1,9 @@
-from tools.safe_http import UnsafeRedirectError, scoped_get
+from tools.safe_http import ScopedHTTPClient, UnsafeRedirectError, scoped_get
 
 
-def security_headers_checker(url: str):
+def security_headers_checker(url: str, *, http_client: ScopedHTTPClient | None = None):
     try:
-        response, redirect_chain = scoped_get(url, timeout=10)
+        response, redirect_chain = scoped_get(url, timeout=10, http_client=http_client)
         headers = response.headers
 
         required_headers = {

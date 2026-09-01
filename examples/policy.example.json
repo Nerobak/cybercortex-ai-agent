@@ -1,0 +1,41 @@
+{
+  "program_name": "example-authorized-program",
+  "authorization_reference": "written authorization or published program rules",
+  "authorization_confirmed": false,
+  "allowed_assets": [
+    {
+      "kind": "url_prefix",
+      "value": "https://example.com/research",
+      "schemes": ["https"],
+      "ports": [443]
+    }
+  ],
+  "excluded_assets": [
+    {
+      "kind": "exact_host",
+      "value": "status.example.com",
+      "schemes": ["https"]
+    }
+  ],
+  "allowed_methods": ["GET", "HEAD", "OPTIONS"],
+  "prohibited_techniques": [
+    "denial_of_service",
+    "destructive_action",
+    "credential_stuffing",
+    "phishing",
+    "malware",
+    "persistence",
+    "data_exfiltration"
+  ],
+  "requests_per_second": 2,
+  "max_concurrency": 2,
+  "request_budget": 100,
+  "per_host_request_budget": 50,
+  "max_response_bytes": 1000000,
+  "credentials_allowed": false,
+  "allow_bounded_rate_limit_verification": false,
+  "max_rate_limit_attempts": 0,
+  "allow_state_changes": false,
+  "require_test_owned_resources": true,
+  "require_cleanup_for_state_changes": true
+}

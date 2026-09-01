@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 import requests
 
@@ -15,6 +15,7 @@ from config import (
     BUSINESS_LOGIC_TIMEOUT_SECONDS,
 )
 from tools.scope_guard import enforce_scope
+from tools.safe_http import ScopedHTTPClient
 
 SAFE_METHODS = {"GET", "HEAD"}
 BLOCKED_PATH_TERMS = {
@@ -124,35 +125,20 @@ def check_workflow_replay(
             if str(k).lower() not in SENSITIVE_HEADERS
         }
         try:
-            response = requester(
+            client = ScopedHTTPClient(
+                requester=requester,
+                requester_takes_method=True,
+                scope_prevalidated=True,
+            )
+            response, redirect_chain = client.request(
                 method,
                 url,
                 headers=headers,
                 timeout=BUSINESS_LOGIC_TIMEOUT_SECONDS,
-                allow_redirects=False,
+                follow_redirects=True,
+                max_redirects=3,
             )
-            redirects = 0
-            while (
-                getattr(response, "is_redirect", False)
-                and response.headers.get("Location")
-                and redirects < 3
-            ):
-                next_url = urljoin(url, response.headers["Location"])
-                if not enforce_scope(next_url).get("allowed"):
-                    return {
-                        **base,
-                        "status": "blocked_by_policy",
-                        "reason": "Redirect left configured scope.",
-                        "network_tested": True,
-                    }
-                response = requester(
-                    method,
-                    next_url,
-                    headers=headers,
-                    timeout=BUSINESS_LOGIC_TIMEOUT_SECONDS,
-                    allow_redirects=False,
-                )
-                redirects += 1
+            redirects = len(redirect_chain)
             content = getattr(response, "content", b"")
             if len(content) > BUSINESS_LOGIC_MAX_RESPONSE_BYTES:
                 return {

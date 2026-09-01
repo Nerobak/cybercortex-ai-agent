@@ -33,6 +33,7 @@ def _tool(
     requires_input: bool = False,
     requires_credentials: bool = False,
     network: bool = True,
+    network_adapter: str | None = None,
     profiles: tuple[str, ...] = ("baseline", "deep", "authenticated"),
     expected_input: str = "An authorized in-scope target URL.",
     evidence: tuple[str, ...] = ("structured, source-attributed observations",),
@@ -55,6 +56,8 @@ def _tool(
         "requires_explicit_input": requires_input,
         "requires_credentials": requires_credentials,
         "sends_network_traffic": network,
+        "network_adapter": (network_adapter if network else None)
+        or ("fail_closed" if network else None),
         "profiles": list(profiles),
         "purpose": description,
         "expected_input": expected_input,
@@ -75,24 +78,28 @@ TOOLS: dict[str, dict[str, Any]] = {
         "tools.dns_lookup",
         "dns_lookup",
         input_type="hostname",
+        network_adapter="shared_dns",
     ),
     "http_probe": _tool(
         "Retrieve HTTP status and server information.",
         "recon",
         "tools.http_probe",
         "http_probe",
+        network_adapter="shared_http",
     ),
     "security_headers_checker": _tool(
         "Inspect HTTP security headers.",
         "analysis",
         "tools.security_headers_checker",
         "security_headers_checker",
+        network_adapter="shared_http",
     ),
     "tech_fingerprint": _tool(
         "Identify observed web technologies.",
         "recon",
         "tools.tech_fingerprint",
         "tech_fingerprint",
+        network_adapter="shared_http",
     ),
     "katana_crawl": _tool(
         "Discover authorized endpoints with Katana.",
@@ -100,13 +107,99 @@ TOOLS: dict[str, dict[str, Any]] = {
         "tools.katana_crawl",
         "katana_crawl",
     ),
+    "api_target_analyzer": _tool(
+        "Evaluate deterministic API-target signals in existing discovery evidence.",
+        "analysis",
+        "tools.api_target_analyzer",
+        "analyze_api_target",
+        input_type="http_technology_and_crawl_evidence",
+        prerequisites=("http_probe", "tech_fingerprint", "katana_crawl"),
+        network=False,
+        expected_input="Already-obtained HTTP, technology, redirect, route, and crawl evidence.",
+        evidence=(
+            "API-likelihood level",
+            "deterministic signals",
+            "adaptive discovery decision",
+        ),
+        limitations=(
+            "API likelihood does not prove that OpenAPI metadata exists or that a vulnerability is present.",
+        ),
+        false_positives=(
+            "JSON error responses and API-like routes used by non-API applications",
+        ),
+        verification=(
+            "Require structural validation before treating a response as OpenAPI.",
+        ),
+        relevance="Decides when a bounded metadata pivot is justified after sparse crawling.",
+        example="explain api_target_analyzer",
+        safety=("Offline only; evaluates existing sanitized evidence.",),
+    ),
+    "api_metadata_discovery": _tool(
+        "Discover structurally valid OpenAPI metadata at a fixed bounded set of common paths.",
+        "discovery",
+        "tools.api_metadata_discovery",
+        "api_metadata_discovery",
+        prerequisites=("api_target_analyzer",),
+        network_adapter="shared_http",
+        expected_input="An authorized reachable target with medium/high API likelihood and insufficient crawl surface.",
+        evidence=(
+            "scope-checked metadata request log",
+            "validated OpenAPI documents",
+            "safe redirect decisions",
+        ),
+        limitations=(
+            "Only eight common metadata locations are considered; undocumented or nonstandard locations may be missed.",
+        ),
+        false_positives=(
+            "None are promoted: every OpenAPI document requires version and paths structure.",
+        ),
+        verification=(
+            "Review the documented routes against runtime behavior; documentation may be stale.",
+        ),
+        relevance="Recovers documented API attack surface when an ordinary root crawl yields little evidence.",
+        example="explain api_metadata_discovery; scan https://authorized.example --profile baseline",
+        safety=(
+            "GET only; no wordlists, recursion, mutation, fuzzing, or out-of-scope redirects; strict request, timeout, and response-size bounds.",
+        ),
+    ),
+    "openapi_surface_analyzer": _tool(
+        "Parse an already-obtained OpenAPI 2.x/3.x document into normalized attack-surface evidence.",
+        "analysis",
+        "tools.openapi_surface_analyzer",
+        "openapi_surface_analyzer",
+        input_type="validated_openapi_document",
+        prerequisites=("api_metadata_discovery",),
+        network=False,
+        expected_input="A structurally validated, already-obtained JSON or YAML OpenAPI document.",
+        evidence=(
+            "routes and methods",
+            "parameters and body fields",
+            "security requirements",
+            "object-reference candidates",
+            "schema names",
+        ),
+        limitations=(
+            "Documentation may be incomplete or stale; external references are not resolved.",
+        ),
+        false_positives=(
+            "Identifier-like field names are attack-surface observations, not authorization findings.",
+        ),
+        verification=(
+            "Confirm documented operations with authorized runtime observations before drawing security conclusions.",
+        ),
+        relevance="Feeds documented operations into endpoint, parameter, object, upload, and planning analysis.",
+        example="explain openapi_surface_analyzer",
+        safety=(
+            "Offline only; bounded local references; recursive reference loops stop; example/default values and sensitive metadata are omitted.",
+        ),
+    ),
     "endpoint_analyzer": _tool(
         "Analyze discovered endpoints.",
         "analysis",
         "tools.endpoint_analyzer",
         "endpoint_analyzer",
         input_type="normalized_urls",
-        prerequisites=("katana_crawl",),
+        prerequisites=("katana_crawl", "openapi_surface_analyzer"),
         network=False,
     ),
     "parameter_analyzer": _tool(
@@ -115,7 +208,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "tools.parameter_analyzer",
         "parameter_analyzer",
         input_type="normalized_urls",
-        prerequisites=("katana_crawl",),
+        prerequisites=("katana_crawl", "openapi_surface_analyzer"),
         network=False,
     ),
     "misconfiguration_detector": _tool(
@@ -134,6 +227,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "js_secret_scanner",
         input_type="javascript_urls",
         prerequisites=("katana_crawl",),
+        network_adapter="shared_http",
         expected_input="Authorized JavaScript URLs normalized from crawl evidence.",
         evidence=(
             "redacted samples",
@@ -163,6 +257,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "tools.api_object_discovery",
         "crawl_and_discover_ids",
         prerequisites=("katana_crawl",),
+        network_adapter="shared_http",
         expected_input="Normalized in-scope URLs, with an optional bounded crawl in deep profiles.",
         evidence=(
             "bounded path-segment classification summary",
@@ -563,6 +658,81 @@ TOOLS: dict[str, dict[str, Any]] = {
         network=False,
         profiles=("authenticated",),
     ),
+    "authenticated_injection_verifier": _tool(
+        "Run one bounded, non-extracting boolean SQL injection differential check.",
+        "authenticated",
+        "tools.authenticated_injection_verifier",
+        "verify_boolean_sql_injection",
+        input_type="controlled_raw_http_request",
+        requires_input=True,
+        requires_credentials=True,
+        profiles=("authenticated",),
+        expected_input="One captured in-scope GET request and one explicit query parameter.",
+        evidence=("response status, length, hashes, and similarity scores",),
+        limitations=(
+            "Dynamic responses can produce false positives or false negatives.",
+            "A candidate requires manual confirmation and never triggers extraction.",
+        ),
+        false_positives=("personalized, randomized, cached, or unstable responses",),
+        verification=("Repeat once and confirm behavior in controlled server logs.",),
+        relevance="Provides bounded authenticated SQL injection evidence without enumeration.",
+        example="python injection_cli.py --request verification_inputs/request.txt --parameter id --authorized",
+        safety=(
+            "Exactly three GET requests; no data extraction, writes, enumeration, or destructive payloads.",
+        ),
+    ),
+    "request_mutation_engine": _tool(
+        "Verify bounded authenticated XSS, SSTI, command, traversal, and SSRF canaries.",
+        "authenticated",
+        "tools.request_mutation_engine",
+        "verify_request_mutations",
+        input_type="controlled_raw_http_request",
+        requires_input=True,
+        requires_credentials=True,
+        profiles=("authenticated",),
+        expected_input="One captured in-scope GET request, one parameter, and explicit probe families.",
+        evidence=("bounded response fingerprints and canary proof classifications",),
+        limitations=(
+            "Reflection alone does not prove script execution; SSRF requires callback confirmation.",
+        ),
+        false_positives=("application echo, caching, and unstable dynamic content",),
+        verification=(
+            "Confirm candidates with controlled browser, callback, or server-side evidence.",
+        ),
+        relevance="Adds non-destructive proof-oriented bug bounty verification.",
+        example="python mutation_cli.py --request verification_inputs/request.txt --parameter name --families xss,ssti --authorized",
+        safety=(
+            "No persistence, extraction, state changes, system-file reads, or destructive commands.",
+        ),
+    ),
+    "capture_verification_orchestrator": _tool(
+        "Plan and execute bounded verification campaigns from authorized HTTP captures.",
+        "orchestration",
+        "agent_core.capture_verification_orchestrator",
+        "run_campaign",
+        input_type="controlled_capture_manifest",
+        requires_input=True,
+        requires_credentials=True,
+        profiles=("authenticated",),
+        expected_input="A local manifest referencing captured requests and explicit verification policy.",
+        evidence=(
+            "ranked parameter plan, bounded execution results, callback correlation, and deduplicated findings",
+        ),
+        limitations=(
+            "Only supplied GET captures are currently executed; callback observations must be supplied.",
+        ),
+        false_positives=(
+            "unstable responses and untrusted callback observation imports",
+        ),
+        verification=(
+            "Review deduplicated proof and reproduce within the authorized scope.",
+        ),
+        relevance="Turns authenticated captures into evidence-driven bug bounty verification campaigns.",
+        example="python campaign_cli.py --manifest verification_inputs/campaign.json --execute --authorized",
+        safety=(
+            "Explicit authorization, scope enforcement, request budgets, and secret-safe reports are mandatory.",
+        ),
+    ),
     "workflow_evidence_discovery": _tool(
         "Discover workflow candidates from sanitized authorized evidence.",
         "business_logic",
@@ -874,7 +1044,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         "ai_report_writer",
         input_type="evidence_package",
         prerequisites=("normalized_evidence",),
-        network=False,
+        network=True,
+        network_adapter="offline_fallback",
     ),
 }
 
@@ -885,6 +1056,7 @@ SCAN_PROFILES = {
     "baseline": tuple(TOOLS),
     "deep": tuple(TOOLS),
     "authenticated": tuple(TOOLS),
+    "intrusive": tuple(TOOLS),
 }
 
 
@@ -927,6 +1099,9 @@ def validate_registry() -> list[dict[str, Any]]:
 def tools_for_profile(profile: str) -> list[str]:
     if profile not in SCAN_PROFILES:
         raise ValueError(f"Unknown scan profile: {profile}")
+    eligibility_profile = "authenticated" if profile == "intrusive" else profile
     return [
-        name for name in SCAN_PROFILES[profile] if profile in TOOLS[name]["profiles"]
+        name
+        for name in SCAN_PROFILES[profile]
+        if eligibility_profile in TOOLS[name]["profiles"]
     ]

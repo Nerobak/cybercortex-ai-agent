@@ -5,8 +5,34 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from config import ENABLE_ACTIVE_SCANNING, REPORT_DIR
+from config import (
+    ENABLE_ACTIVE_SCANNING,
+    NUCLEI_ENABLE_OAST,
+    NUCLEI_RATE_LIMIT,
+    NUCLEI_TIMEOUT_SECONDS,
+    REPORT_DIR,
+)
 from tools.scope_guard import enforce_scope
+
+ALLOWED_SEVERITIES = ("info", "low", "medium", "high", "critical")
+SEVERITY_THRESHOLDS = {
+    "info": ALLOWED_SEVERITIES,
+    "informational": ALLOWED_SEVERITIES,
+    "low": ("low", "medium", "high", "critical"),
+    "medium": ("medium", "high", "critical"),
+    "high": ("high", "critical"),
+    "critical": ("critical",),
+}
+
+# Keep automatic scans focused on web vulnerability evidence. These are local
+# Nuclei template directories, not arbitrary user-provided template paths.
+APPROVED_TEMPLATE_PATHS = (
+    "http/cves/",
+    "http/exposures/",
+    "http/misconfiguration/",
+    "http/vulnerabilities/",
+)
+ALWAYS_EXCLUDED_TAGS = ("dos", "fuzz", "bruteforce", "destructive")
 
 
 def _result(
@@ -16,6 +42,7 @@ def _result(
     *,
     evidence_file: str | None = None,
     error: str | None = None,
+    scan_policy: dict | None = None,
 ) -> dict:
     findings = findings or []
     counts = Counter(item.get("severity", "unknown") for item in findings)
@@ -34,6 +61,7 @@ def _result(
         "timeout": status == "timed_out",
         "failure": status == "failed",
         "error": error,
+        "scan_policy": scan_policy or {},
         # Compatibility aliases for existing consumers.
         "url": target,
         "findings_count": len(findings),
@@ -76,6 +104,8 @@ def parse_nuclei_finding(raw_line: str) -> dict | None:
         return None
 
     info = data.get("info", {})
+    if not isinstance(info, dict):
+        info = {}
 
     return {
         "template_id": data.get("template-id"),
@@ -97,7 +127,56 @@ def parse_nuclei_finding(raw_line: str) -> dict | None:
     }
 
 
-def nuclei_scan(url: str, severity: str = "low") -> dict:
+def _selected_severities(minimum: str) -> tuple[str, ...]:
+    """Translate a minimum severity into an explicit Nuclei severity set."""
+    normalized = minimum.strip().lower()
+    if normalized not in SEVERITY_THRESHOLDS:
+        choices = ", ".join(SEVERITY_THRESHOLDS)
+        raise ValueError(f"Invalid minimum severity '{minimum}'. Choose: {choices}.")
+    return SEVERITY_THRESHOLDS[normalized]
+
+
+def build_nuclei_command(
+    url: str, severity: str, *, intrusive: bool = False
+) -> tuple[list[str], dict]:
+    """Build the auditable, bounded command used by automatic assessments."""
+    severities = _selected_severities(severity)
+    command = ["nuclei", "-u", url]
+    for template_path in APPROVED_TEMPLATE_PATHS:
+        command.extend(("-t", template_path))
+    excluded_tags = ALWAYS_EXCLUDED_TAGS + (() if intrusive else ("intrusive",))
+    command.extend(
+        (
+            "-severity",
+            ",".join(severities),
+            "-exclude-tags",
+            ",".join(excluded_tags),
+            "-jsonl",
+            "-silent",
+            "-disable-update-check",
+            "-retries",
+            "0",
+            "-rate-limit",
+            str(NUCLEI_RATE_LIMIT),
+            "-timeout",
+            "5",
+        )
+    )
+    if not NUCLEI_ENABLE_OAST:
+        command.append("-no-interactsh")
+    policy = {
+        "minimum_severity": severity.strip().lower(),
+        "included_severities": list(severities),
+        "template_paths": list(APPROVED_TEMPLATE_PATHS),
+        "excluded_tags": list(excluded_tags),
+        "intrusive_templates_enabled": intrusive,
+        "rate_limit_per_second": NUCLEI_RATE_LIMIT,
+        "oast_enabled": NUCLEI_ENABLE_OAST,
+    }
+    return command, policy
+
+
+def nuclei_scan(url: str, severity: str = "low", *, intrusive: bool = False) -> dict:
     """
     Run a limited Nuclei scan and return structured findings.
 
@@ -128,34 +207,26 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
 
     raw_output_file = report_directory / f"nuclei_{safe_target}_{timestamp}.jsonl"
 
-    command = [
-        "nuclei",
-        "-u",
-        url,
-        "-t",
-        "http/misconfiguration/http-missing-security-headers.yaml",
-        "-jsonl",
-        "-silent",
-        "-retries",
-        "0",
-        "-rl",
-        "3",
-        "-timeout",
-        "5",
-    ]
+    try:
+        command, scan_policy = build_nuclei_command(url, severity, intrusive=intrusive)
+    except ValueError as exc:
+        return _result(url, "failed", error=str(exc))
 
     try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=NUCLEI_TIMEOUT_SECONDS,
             check=False,
         )
 
     except subprocess.TimeoutExpired:
         return _result(
-            url, "timed_out", error="Nuclei scan timed out after 60 seconds."
+            url,
+            "timed_out",
+            error=f"Nuclei scan timed out after {NUCLEI_TIMEOUT_SECONDS} seconds.",
+            scan_policy=scan_policy,
         )
 
     except FileNotFoundError:
@@ -166,10 +237,11 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
                 "Nuclei executable was not found. "
                 "Confirm that Nuclei is installed and available in PATH."
             ),
+            scan_policy=scan_policy,
         )
 
     except Exception as exc:
-        return _result(url, "failed", error=str(exc))
+        return _result(url, "failed", error=str(exc), scan_policy=scan_policy)
 
     raw_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
@@ -195,4 +267,5 @@ def nuclei_scan(url: str, severity: str = "low") -> dict:
         findings,
         evidence_file=str(raw_output_file) if raw_lines else None,
         error=stderr or None,
+        scan_policy=scan_policy,
     )

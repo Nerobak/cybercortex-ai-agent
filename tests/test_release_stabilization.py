@@ -34,6 +34,7 @@ def test_explain_latest_before_and_after_scan():
             "assessment": {
                 "requested_target": "https://example.test",
                 "profile": "baseline",
+                "assessment_mode": "plan",
             },
             "execution_summary": {
                 "completed": ["http_probe"],
@@ -58,6 +59,7 @@ def test_explain_latest_before_and_after_scan():
     }
     text = explain_latest(result)
     assert "https://example.test" in text and "Completed tools: http_probe" in text
+    assert "Assessment mode: plan" in text
 
 
 def test_registry_descriptions_are_complete():
@@ -146,6 +148,9 @@ def test_doctor_quick_version_help_and_secret_safety(capsys):
         "explain scan",
         "explain profiles",
         "jwt analyze",
+        "agent plan",
+        "agent surface",
+        "eval run",
         "doctor",
         "help",
         "exit",
@@ -181,8 +186,10 @@ def test_fallback_report_wording_and_version(tmp_path, monkeypatch):
     )
     report = Path(result["report_file"]).read_text(encoding="utf-8")
     assert f"v{__version__}" in report
-    assert "Public contact information observed in JavaScript." in report
-    assert "No credential-like secrets were confirmed." in report
+    assert (
+        "Public contact information was observed in JavaScript. "
+        "No credential-like secret was identified."
+    ) in report
     assert "does not establish a vulnerability or direct exploit path" in report
     assert "Identified API endpoints" not in report
 

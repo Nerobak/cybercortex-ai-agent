@@ -1,0 +1,28 @@
+{
+  "identities": [
+    {
+      "captured_label": "captured-session-1",
+      "label": "account-a-owner",
+      "role": "member",
+      "tenant": "tenant-a",
+      "controlled": true
+    },
+    {
+      "captured_label": "captured-session-2",
+      "label": "account-b-non-owner",
+      "role": "member",
+      "tenant": "tenant-b",
+      "controlled": true
+    }
+  ],
+  "objects": [
+    {
+      "object_id": "researcher-owned-object-reference",
+      "object_type": "test-object",
+      "owner_identity_id": "replace-with-captured-identity-id",
+      "tenant": "tenant-a",
+      "test_owned": true,
+      "evidence_refs": []
+    }
+  ]
+}

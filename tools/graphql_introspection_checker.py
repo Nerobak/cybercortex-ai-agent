@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Callable
-from urllib.parse import urljoin
 
 import requests
 
@@ -15,6 +14,7 @@ from config import (
     GRAPHQL_TIMEOUT_SECONDS,
 )
 from tools.scope_guard import enforce_scope
+from tools.safe_http import ScopedHTTPClient
 
 INTROSPECTION_QUERY = "query CyberCortexSchemaCheck { __schema { queryType { name } mutationType { name } subscriptionType { name } } }"
 WORDING = "GraphQL introspection was available on the tested endpoint. This may aid schema discovery but does not by itself establish a security vulnerability."
@@ -44,33 +44,22 @@ def _post_scoped(
     if not enforce_scope(url).get("allowed"):
         raise PermissionError("Requested endpoint is outside configured scope.")
     call = requester or requests.post
-    current, chain = url, []
-    for _ in range(3):
-        response = call(
-            current,
-            json={"query": INTROSPECTION_QUERY},
-            headers=headers,
-            timeout=timeout,
-            allow_redirects=False,
-            stream=True,
-        )
-        if response.is_redirect or response.is_permanent_redirect:
-            destination = urljoin(current, response.headers.get("Location", ""))
-            allowed = bool(enforce_scope(destination).get("allowed"))
-            chain.append(
-                {
-                    "from": current,
-                    "to": destination,
-                    "status_code": response.status_code,
-                    "allowed": allowed,
-                }
-            )
-            if not allowed:
-                raise PermissionError(
-                    "Redirect destination is outside configured scope."
-                )
-            current = destination
-            continue
+    client = ScopedHTTPClient(
+        requester=call,
+        requester_takes_method=False,
+        scope_prevalidated=True,
+    )
+    response, chain = client.request(
+        "POST",
+        url,
+        json={"query": INTROSPECTION_QUERY},
+        headers=headers,
+        timeout=timeout,
+        follow_redirects=True,
+        max_redirects=3,
+        stream=True,
+    )
+    if response:
         raw = bytearray()
         iterator = (
             response.iter_content(chunk_size=8192)
@@ -83,7 +72,7 @@ def _post_scoped(
                 raise ValueError("GraphQL response exceeded configured size limit.")
         response._content = bytes(raw)
         return response, chain
-    raise PermissionError("GraphQL redirect limit exceeded.")
+    raise PermissionError("GraphQL request returned no response.")
 
 
 def graphql_introspection_checker(

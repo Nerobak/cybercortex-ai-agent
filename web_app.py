@@ -29,6 +29,7 @@ PUBLIC_JOB_FIELDS = {
     "id",
     "target",
     "profile",
+    "assessment_mode",
     "status",
     "assessment_status",
     "coverage",
@@ -64,6 +65,7 @@ _jobs_lock = threading.Lock()
 class ScanRequest(BaseModel):
     target: str = Field(min_length=3, max_length=2048)
     profile: str = Field(default="baseline", pattern="^(baseline|deep)$")
+    assessment_mode: str = Field(default="observe", pattern="^(observe|plan|verify)$")
     authorization_confirmed: bool = False
 
 
@@ -161,7 +163,12 @@ def _business_logic_summary(results: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None:
+def _run_assessment(
+    job_id: str,
+    target: str,
+    profile: str = "baseline",
+    assessment_mode: str = "observe",
+) -> None:
     parsed = urlparse(target)
 
     try:
@@ -188,6 +195,7 @@ def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None
             target,
             parsed.hostname or "",
             profile=profile,
+            assessment_mode=assessment_mode,
             status_callback=status_callback,
         )
         evidence = workflow["evidence_package"]
@@ -196,6 +204,7 @@ def _run_assessment(job_id: str, target: str, profile: str = "baseline") -> None
             job_id,
             status="completed",
             assessment_status=workflow.get("assessment_status", "completed"),
+            assessment_mode=workflow.get("assessment_mode", assessment_mode),
             coverage=workflow.get("coverage", {}),
             current_step=None,
             progress=100,
@@ -279,6 +288,36 @@ def _render_report(job: dict[str, Any]) -> str:
         lines.append("No informational observations were recorded.")
     for finding in observations[:20]:
         lines.extend(_report_finding(finding))
+    if any(item.get("category") == "public_contact" for item in observations):
+        lines.extend(
+            [
+                "Public contact information was observed in JavaScript. No credential-like secret was identified.",
+                "",
+            ]
+        )
+    tool_statuses = job.get("tool_statuses") or {}
+    jwt_status = (tool_statuses.get("jwt_discovery") or {}).get("status")
+    if not (job.get("jwt") or {}).get("tokens_observed") and jwt_status in {
+        "completed",
+        "completed_with_fallback",
+    }:
+        lines.extend(
+            [
+                "JWT discovery completed. No JWTs were observed in the collected evidence.",
+                "",
+            ]
+        )
+    js_status = tool_statuses.get("js_secret_scanner") or {}
+    if js_status.get("status") in {
+        "skipped",
+        "not_applicable",
+    } and "authorized JavaScript URL" in str(js_status.get("error", "")):
+        lines.extend(
+            [
+                "JavaScript secret scanning was not performed because no authorized JavaScript URLs were available.",
+                "",
+            ]
+        )
     for title, key, phrase in (
         (
             "GraphQL Surface",
@@ -315,8 +354,6 @@ def _render_report(job: dict[str, Any]) -> str:
             "",
             "## Prioritized Next Manual Tests",
             "",
-            "Manually verify only candidates supported by the evidence above, using controlled accounts and test-owned resources.",
-            "",
             "## Limitations",
             "",
             "Automated and offline analysis cannot by itself prove exploitability. Authenticated behavior requires explicit controlled input.",
@@ -327,6 +364,16 @@ def _render_report(job: dict[str, Any]) -> str:
             "",
         ]
     )
+    manual_index = lines.index("## Prioritized Next Manual Tests") + 2
+    manual_lines = (
+        [
+            f"- {item.get('title', 'Review the evidence-backed candidate.')}"
+            for item in candidates[:20]
+        ]
+        if candidates
+        else ["No evidence-supported manual test was queued."]
+    )
+    lines[manual_index:manual_index] = [*manual_lines, ""]
     return "\n".join(line for line in lines if line is not None)
 
 
@@ -404,6 +451,7 @@ def start_scan(
         "id": job_id,
         "target": target,
         "profile": request.profile,
+        "assessment_mode": request.assessment_mode,
         "status": "queued",
         "progress": 0,
         "current_step": None,
@@ -452,7 +500,13 @@ def start_scan(
             oldest = min(_jobs, key=lambda key: _jobs[key]["created_at"])
             del _jobs[oldest]
         _jobs[job_id] = job
-    background_tasks.add_task(_run_assessment, job_id, target, request.profile)
+    background_tasks.add_task(
+        _run_assessment,
+        job_id,
+        target,
+        request.profile,
+        request.assessment_mode,
+    )
     return _public_job(job)
 
 

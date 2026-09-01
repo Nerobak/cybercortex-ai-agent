@@ -52,6 +52,7 @@ def explain_profiles() -> str:
             "baseline | low-impact automatic checks | not required | quick authorized surface assessment",
             "deep | broader bounded discovery | not required | deeper evidence collection and planning",
             "authenticated | deep plus supplied context | explicit credentials/requests required | controlled auth and authorization workflows",
+            "intrusive | payload-bearing active checks | environment opt-in plus CLI selection | authorized intrusive verification; DoS and destructive actions prohibited",
             "",
             "Authenticated tools remain skipped unless explicit controlled input is supplied.",
         ]
@@ -83,6 +84,9 @@ def explain_latest(result: dict[str, Any] | None) -> str:
     jwt = surface.get("jwt") or {}
     business = surface.get("business_logic") or {}
     upload = surface.get("upload") or {}
+    phase2 = result.get("phase2") or evidence.get("phase2") or {}
+    phase2_surface = phase2.get("attack_surface") or {}
+    phase2_results = phase2.get("verification_results") or []
     partial = list(execution.get("timed_out_partial", [])) + list(
         execution.get("timed_out", [])
     )
@@ -115,6 +119,7 @@ def explain_latest(result: dict[str, Any] | None) -> str:
             "Most recent scan",
             f"Target: {assessment.get('requested_target') or result.get('target', 'unknown')}",
             f"Profile: {assessment.get('profile', 'unknown')}",
+            f"Assessment mode: {result.get('assessment_mode') or assessment.get('assessment_mode') or phase2.get('assessment_mode') or 'observe'}",
             f"Assessment status: {result.get('assessment_status') or evidence.get('assessment_status', 'unknown')}",
             f"Coverage: {coverage.get('coverage_percentage', 0)}%",
             f"Completed tools: {', '.join(completed) or 'none'}",
@@ -132,6 +137,14 @@ def explain_latest(result: dict[str, Any] | None) -> str:
             f"Observations: {len(evidence.get('observations', []))}",
             f"Candidates: {len(evidence.get('candidate_findings', []))}",
             f"Verified findings: {len(evidence.get('verified_findings', []))}",
+            (
+                "Phase 2 summary: "
+                f"routes {len(phase2_surface.get('routes') or [])}; "
+                f"objects {len(phase2_surface.get('objects') or [])}; "
+                f"hypotheses {len(phase2.get('hypotheses') or [])}; "
+                f"plans {len(phase2.get('verification_plans') or [])}; "
+                f"executed {len(phase2_results)}"
+            ),
             summary(
                 "GraphQL",
                 bool(

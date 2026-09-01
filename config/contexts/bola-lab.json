@@ -1,0 +1,23 @@
+{
+  "identities": [
+    {
+      "identity_id": null,
+      "captured_label": "alice",
+      "label": "alice",
+      "role": "user",
+      "tenant": "tenant-a",
+      "controlled": true,
+      "request_ids": []
+    },
+    {
+      "identity_id": null,
+      "captured_label": "bob",
+      "label": "bob",
+      "role": "user",
+      "tenant": "tenant-b",
+      "controlled": true,
+      "request_ids": []
+    }
+  ],
+  "objects": []
+}

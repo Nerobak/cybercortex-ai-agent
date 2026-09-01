@@ -49,7 +49,21 @@ Every registered tool declares its category, profiles, prerequisites, traffic be
 
 ## Scanning
 
-- `nuclei_scan.py` – runs approved Nuclei templates
+`scan <target> --profile intrusive` is CLI-only and requires both
+`ENABLE_ACTIVE_SCANNING=true` and `ENABLE_INTRUSIVE_SCANNING=true`. It permits
+payload-bearing Nuclei templates against the configured scope. DoS, fuzzing,
+brute-force, and destructive tags remain excluded, and callback-based OAST
+templates remain separately controlled by `NUCLEI_ENABLE_OAST`.
+
+- `nuclei_scan.py` – runs bounded, approved web CVE, exposure,
+  misconfiguration, and vulnerability templates. Active scanning and target
+  allowlisting are mandatory; DoS, fuzzing, brute-force, and intrusive tags are
+  excluded. Matches are vulnerability candidates pending evidence review.
+
+- `authenticated_injection_verifier.py` – checks one explicitly selected query
+  parameter using a three-request, non-extracting boolean differential. Only
+  controlled GET requests are accepted; raw bodies and credentials are never
+  returned in results.
 
 ## Reporting
 

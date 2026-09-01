@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Any, Callable
-from urllib.parse import urljoin
 
 import requests
 
@@ -13,6 +12,7 @@ from config import (
     JWT_TIMEOUT_SECONDS,
 )
 from tools.scope_guard import enforce_scope
+from tools.safe_http import ScopedHTTPClient
 
 SAFE_METHODS = {"GET", "HEAD"}
 SENSITIVE_HEADERS = {"authorization", "cookie", "set-cookie"}
@@ -95,34 +95,20 @@ def check_jwt_replay(
     }
     headers["Authorization"] = f"Bearer {token}"
     try:
-        response = requester(
+        client = ScopedHTTPClient(
+            requester=requester,
+            requester_takes_method=True,
+            scope_prevalidated=True,
+        )
+        response, redirect_chain = client.request(
             method,
             url,
             headers=headers,
             timeout=JWT_TIMEOUT_SECONDS,
-            allow_redirects=False,
+            follow_redirects=True,
+            max_redirects=3,
         )
-        redirects = 0
-        while (
-            getattr(response, "is_redirect", False)
-            and redirects < 3
-            and response.headers.get("Location")
-        ):
-            next_url = urljoin(url, response.headers["Location"])
-            if not enforce_scope(next_url).get("allowed"):
-                return {
-                    **base,
-                    "status": "blocked",
-                    "reason": "Redirect left configured scope.",
-                }
-            response = requester(
-                method,
-                next_url,
-                headers=headers,
-                timeout=JWT_TIMEOUT_SECONDS,
-                allow_redirects=False,
-            )
-            redirects += 1
+        redirects = len(redirect_chain)
         content = getattr(response, "content", b"")
         if len(content) > JWT_MAX_RESPONSE_BYTES:
             return {

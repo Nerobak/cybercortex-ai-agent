@@ -1,5 +1,14 @@
 # Architecture
 
+## Adaptive authorization-first layer
+
+The current agent path uses typed `AssessmentPlan`, `Hypothesis`, and
+`VerificationPlan` objects. Sanitized captures and scan observations enter a
+versioned SQLite graph. Deterministic hypotheses and optional local-LLM
+proposals are merged, but a compiled `AssessmentPolicy` independently gates
+every plan. Execution uses explicit verifier adapters; arbitrary LLM tool
+dispatch is not permitted. See `ADAPTIVE_AGENT.md`.
+
 ## File-upload extension
 
 Upload tools use the existing lazy registry and dependency-aware workflow.

@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 import requests
 
 from tools.scope_guard import enforce_scope
+from tools.safe_http import ScopedHTTPClient
 
 DEFAULT_MAX_DEPTH = 2
 DEFAULT_MAX_PAGES = 100
@@ -173,10 +174,12 @@ ASSET_EXTENSION_PATTERN = re.compile(
     r"\.(?:js|mjs|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot)(?:$|[?#])", re.I
 )
 LOCALE_PATTERN = re.compile(r"^[a-z]{2}(?:-[A-Z]{2})?$")
+SELF_REFERENCE_SEGMENTS = {"me", "self", "current"}
 RESOURCE_SLUG_PATTERNS = (
     re.compile(r"^[a-z]+(?:-[a-z]+)+$"),
     re.compile(r"^(?:privacy|tnc|terms|fees-limits|trading-rules)$"),
 )
+HYPHENATED_SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+$")
 ACTUAL_IDENTIFIER_KINDS = {
     "numeric_identifier",
     "uuid_identifier",
@@ -275,6 +278,17 @@ def _looks_like_identifier(value: str, *, after_resource: bool = False) -> bool:
     return False
 
 
+def _looks_like_readable_slug(value: str) -> bool:
+    """Recognize word-oriented slugs even when one component is numeric."""
+    lowered = value.strip().lower()
+    if not HYPHENATED_SLUG_PATTERN.fullmatch(lowered):
+        return False
+    word_components = [
+        component for component in lowered.split("-") if re.search(r"[a-z]", component)
+    ]
+    return len(word_components) >= 2
+
+
 def _identifier_type(value: str) -> str:
     text = value.strip()
 
@@ -295,6 +309,8 @@ def classify_path_segment(
     lowered = text.lower()
     if ASSET_EXTENSION_PATTERN.search(text):
         return "asset_filename"
+    if lowered in SELF_REFERENCE_SEGMENTS:
+        return "self_reference"
     if LOCALE_PATTERN.fullmatch(text):
         return "locale"
     if UUID_PATTERN.fullmatch(text):
@@ -311,6 +327,8 @@ def classify_path_segment(
             and lowered not in ROUTE_WORDS
         ):
             return "opaque_identifier"
+        return "resource_slug"
+    if _looks_like_readable_slug(text):
         return "resource_slug"
     if lowered in STATIC_ROUTE_SEGMENTS:
         return "route"
@@ -603,7 +621,10 @@ def _build_object_map(
 
     for identifier in identifiers:
         object_name = _singularize(
-            str(identifier.get("field", "object")).split(".")[-1]
+            str(
+                identifier.get("object_type")
+                or str(identifier.get("field", "object")).split(".")[-1]
+            )
         )
 
         entry = objects.setdefault(
@@ -611,6 +632,7 @@ def _build_object_map(
             {
                 "name": object_name,
                 "identifier_types": set(),
+                "identifier_names": set(),
                 "sample_identifiers": [],
                 "endpoints": set(),
                 "sources": set(),
@@ -623,6 +645,9 @@ def _build_object_map(
                 "opaque",
             )
         )
+        field = str(identifier.get("field") or "").strip()
+        if field:
+            entry["identifier_names"].add(field)
 
         value = str(identifier.get("value", ""))
 
@@ -641,6 +666,7 @@ def _build_object_map(
             {
                 "name": name,
                 "identifier_types": sorted(item["identifier_types"]),
+                "identifier_names": sorted(item["identifier_names"]),
                 "sample_identifiers": item["sample_identifiers"][:10],
                 "endpoints": sorted(item["endpoints"]),
                 "sources": sorted(item["sources"]),
@@ -661,6 +687,7 @@ def crawl_and_discover_ids(
     verify_tls: bool = True,
     normalized_url_evidence: dict[str, Any] | None = None,
     allow_network_crawl: bool = True,
+    http_client: ScopedHTTPClient | None = None,
 ) -> dict[str, Any]:
     """
     Crawl an explicitly authorized target and extract identifiers observed
@@ -718,6 +745,10 @@ def crawl_and_discover_ids(
     normalized_url_evidence = (
         normalized_url_evidence if isinstance(normalized_url_evidence, dict) else {}
     )
+    attack_surface = normalized_url_evidence.get("attack_surface")
+    attack_surface = attack_surface if isinstance(attack_surface, dict) else {}
+    surface_objects = attack_surface.get("objects")
+    surface_objects = surface_objects if isinstance(surface_objects, list) else []
     raw_katana_urls = normalized_url_evidence.get("all_urls")
     katana_urls = (
         list(raw_katana_urls) if isinstance(raw_katana_urls, (list, tuple, set)) else []
@@ -728,6 +759,25 @@ def crawl_and_discover_ids(
         if isinstance(url, str) and enforce_scope(url).get("allowed")
     ]
     offline_identifiers: list[dict[str, Any]] = []
+    for candidate in surface_objects:
+        if not isinstance(candidate, dict):
+            continue
+        identifier = str(candidate.get("identifier") or "").strip()
+        if not identifier:
+            continue
+        offline_identifiers.append(
+            {
+                "source": candidate.get("source") or "openapi",
+                "endpoint": candidate.get("path") or "/",
+                "field": identifier,
+                "object_type": candidate.get("type") or "object",
+                "value": "",
+                "identifier_type": "named",
+                "identifier_kind": "named_identifier_candidate",
+                "method": candidate.get("method"),
+                "classification": "attack_surface_observation",
+            }
+        )
     offline_segment_classifications: list[dict[str, str]] = []
     for url in allowed_katana_urls:
         offline_identifiers.extend(_extract_path_identifiers(url))
@@ -765,7 +815,15 @@ def crawl_and_discover_ids(
     discovered_urls: set[str] = set()
     errors: list[dict[str, str]] = []
 
-    session = requests.Session()
+    if http_client is None:
+        session = requests.Session()
+        scoped_client = ScopedHTTPClient(
+            requester=session.get,
+            requester_takes_method=False,
+            scope_prevalidated=True,
+        )
+    else:
+        scoped_client = http_client
 
     while allow_network_crawl and queue and len(visited) < max_pages:
         current_url, depth = queue.popleft()
@@ -793,11 +851,13 @@ def crawl_and_discover_ids(
         try:
             started = time.perf_counter()
 
-            response = session.get(
+            response, _ = scoped_client.request(
+                "GET",
                 current_url,
+                purpose="discovery",
                 headers=prepared_headers,
                 timeout=timeout_seconds,
-                allow_redirects=False,
+                follow_redirects=False,
                 verify=verify_tls,
             )
 
@@ -955,6 +1015,7 @@ def crawl_and_discover_ids(
             "route",
             "resource_slug",
             "asset_filename",
+            "self_reference",
             "locale",
             "numeric_identifier",
             "uuid_identifier",

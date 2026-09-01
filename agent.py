@@ -8,10 +8,19 @@ from urllib.parse import urlparse
 from openai import OpenAI
 
 from agent_core.workflow_manager import run_workflow
+from agent_core.adaptive_orchestrator import (
+    AdaptiveAssessmentOrchestrator,
+    write_assessment_plan,
+)
+from agent_core.policy import load_policy, policy_from_runtime
 from agent_core.doctor import doctor
+from agent_core.result_normalizer import public_result, sanitize_text
 from agent_core.tool_explainer import explain
+from agent_core.verification_capabilities import capability_metadata
 from agent_core.version import __version__
 from config import (
+    AGENT_REQUEST_BUDGET,
+    ENABLE_INTRUSIVE_SCANNING,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     OPENAI_MODEL,
@@ -65,6 +74,253 @@ Rules:
 
 LATEST_SCAN_RESULT: dict[str, Any] | None = None
 MAX_CONTROLLED_INPUT_BYTES = 64 * 1024
+NO_PHASE2_STATE_MESSAGE = (
+    "No Phase 2 assessment state is loaded. Run a plan or verify scan first."
+)
+
+
+def _latest_phase2_state() -> dict[str, Any] | None:
+    """Return the in-session Phase 2 state, falling back to the saved latest run."""
+
+    if isinstance(LATEST_SCAN_RESULT, dict):
+        phase2 = LATEST_SCAN_RESULT.get("phase2")
+        if isinstance(phase2, dict):
+            return phase2
+
+    from agent_core.phase2_store import Phase2RunStore
+
+    try:
+        return Phase2RunStore().load()
+    except FileNotFoundError:
+        return None
+
+
+def _safe_text(value: Any, default: str = "Not provided") -> str:
+    if value is None or value == "":
+        return default
+    rendered = sanitize_text(str(value))
+    if not rendered:
+        return default
+    return str(rendered)
+
+
+def _safe_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_safe_text(item) for item in value if isinstance(item, (str, int, float))]
+
+
+def _safe_route(value: Any) -> str:
+    """Render a route without URL credentials, query values, or fragments."""
+
+    if not isinstance(value, str) or not value:
+        return "Not provided"
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        return parsed.path or "/"
+    return value.split("?", 1)[0].split("#", 1)[0] or "/"
+
+
+def _target_surface_view(hypothesis: dict[str, Any]) -> dict[str, str]:
+    surface = hypothesis.get("target_surface")
+    surface = surface if isinstance(surface, dict) else {}
+    route = surface.get("path") or surface.get("url") or hypothesis.get("endpoint")
+    view = {
+        "method": _safe_text(surface.get("method") or hypothesis.get("method"), "GET"),
+        "route": _safe_route(route),
+    }
+    parameter = surface.get("parameter") or hypothesis.get("parameter")
+    location = surface.get("parameter_location") or hypothesis.get("parameter_location")
+    if parameter:
+        view["parameter"] = _safe_text(parameter)
+    if location:
+        view["parameter_location"] = _safe_text(location)
+    return view
+
+
+def _evidence_basis_view(hypothesis: dict[str, Any]) -> list[str]:
+    basis: list[str] = []
+    raw_basis = hypothesis.get("evidence_basis")
+    for item in raw_basis if isinstance(raw_basis, list) else []:
+        if isinstance(item, dict):
+            observation = item.get("observation")
+            if observation:
+                basis.append(_safe_text(observation))
+        elif isinstance(item, str):
+            basis.append(_safe_text(item))
+    if not basis and hypothesis.get("rationale"):
+        basis.append(_safe_text(hypothesis["rationale"]))
+    return basis
+
+
+def _hypothesis_list_item(hypothesis: dict[str, Any]) -> dict[str, Any]:
+    metadata = hypothesis.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    surface = _target_surface_view(hypothesis)
+    affected = " ".join(
+        item for item in (surface.get("method"), surface.get("route")) if item
+    )
+    if surface.get("parameter"):
+        affected += f" (parameter: {surface['parameter']})"
+    evidence = _evidence_basis_view(hypothesis)
+    category = _safe_text(hypothesis.get("category"), "unknown")
+    try:
+        capability = capability_metadata(category)
+    except ValueError:
+        capability = {}
+    return {
+        "id": _safe_text(hypothesis.get("hypothesis_id") or hypothesis.get("id")),
+        "category": category,
+        "capability_state": capability.get("capability_state", "unknown"),
+        "priority": metadata.get("priority", "not ranked"),
+        "score": metadata.get("priority_score", hypothesis.get("priority", 0)),
+        "confidence": _safe_text(hypothesis.get("confidence"), "low"),
+        "status": _safe_text(hypothesis.get("status"), "proposed"),
+        "affected_route_or_functionality": affected or "Not provided",
+        "evidence_basis": evidence[0] if evidence else "Not provided",
+    }
+
+
+def _hypothesis_explanation(hypothesis: dict[str, Any]) -> dict[str, Any]:
+    metadata = hypothesis.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    category = _safe_text(hypothesis.get("category"), "unknown")
+    try:
+        capability = capability_metadata(category)
+    except ValueError:
+        capability = {}
+    return {
+        "hypothesis_id": _safe_text(
+            hypothesis.get("hypothesis_id") or hypothesis.get("id")
+        ),
+        "category": category,
+        "title": _safe_text(hypothesis.get("title")),
+        "target_surface": _target_surface_view(hypothesis),
+        "evidence_basis": _evidence_basis_view(hypothesis),
+        "confidence": _safe_text(hypothesis.get("confidence"), "low"),
+        "impact_if_confirmed": _safe_text(hypothesis.get("impact_if_confirmed")),
+        "required_context": _safe_list(hypothesis.get("required_context")),
+        "safe_verification_possible": bool(
+            hypothesis.get("safe_verification_possible")
+        ),
+        "current_status": _safe_text(hypothesis.get("status"), "proposed"),
+        "limitations": _safe_list(hypothesis.get("limitations")),
+        "priority_rationale": _safe_list(metadata.get("priority_reasons")),
+        **capability,
+    }
+
+
+def _plan_prerequisites(plan: dict[str, Any]) -> list[str]:
+    prerequisites = _safe_list(plan.get("prerequisites"))
+    raw_steps = plan.get("steps")
+    for step in raw_steps if isinstance(raw_steps, list) else []:
+        if not isinstance(step, dict):
+            continue
+        for item in _safe_list(step.get("prerequisites")):
+            if item not in prerequisites:
+                prerequisites.append(item)
+    return prerequisites
+
+
+def _minimal_request_view(plan: dict[str, Any]) -> list[str]:
+    requests: list[str] = []
+    target = _safe_route(plan.get("target"))
+    raw_steps = plan.get("steps")
+    for step in raw_steps if isinstance(raw_steps, list) else []:
+        if not isinstance(step, dict):
+            continue
+        metadata = step.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        raw_requests = metadata.get("requests")
+        if isinstance(raw_requests, list) and raw_requests:
+            for request in raw_requests:
+                if not isinstance(request, dict):
+                    continue
+                method = _safe_text(request.get("method") or step.get("method"), "GET")
+                route = _safe_route(request.get("url") or target)
+                qualifiers: list[str] = []
+                if request.get("account_id"):
+                    qualifiers.append("controlled account")
+                if request.get("object_owner_account_id") or request.get(
+                    "test_owned_resource"
+                ):
+                    qualifiers.append("test-owned resource")
+                if request.get("replay"):
+                    qualifiers.append("controlled replay")
+                suffix = f" ({'; '.join(qualifiers)})" if qualifiers else ""
+                requests.append(f"{method} {route}{suffix}")
+            continue
+        method = _safe_text(step.get("method"), "GET")
+        request_cost = int(step.get("request_cost") or 0)
+        requests.append(f"{method} {target} ({request_cost} request(s))")
+    return requests
+
+
+def _verification_plan_view(plan: dict[str, Any]) -> dict[str, Any]:
+    prerequisites = _plan_prerequisites(plan)
+    requirement_text = " ".join(prerequisites).lower()
+    steps = [step for step in (plan.get("steps") or []) if isinstance(step, dict)]
+    supplied_accounts = plan.get("controlled_accounts")
+    supplied_accounts = supplied_accounts if isinstance(supplied_accounts, list) else []
+    supplied_resources = plan.get("test_owned_resources")
+    supplied_resources = (
+        supplied_resources if isinstance(supplied_resources, list) else []
+    )
+    accounts_required = bool(
+        supplied_accounts
+        or "account" in requirement_text
+        or any(step.get("requires_credentials") for step in steps)
+    )
+    resources_required = bool(
+        plan.get("test_owned_resources_required")
+        or supplied_resources
+        or "test-owned" in requirement_text
+        or "researcher-controlled" in requirement_text
+        or "confirmed ownership" in requirement_text
+        or any(step.get("test_owned_resource_required") for step in steps)
+    )
+    stop_conditions: list[str] = []
+    cleanup = _safe_list(plan.get("cleanup"))
+    for step in steps:
+        for item in _safe_list(step.get("stop_conditions")):
+            if item not in stop_conditions:
+                stop_conditions.append(item)
+        for item in _safe_list(step.get("cleanup_steps")):
+            if item not in cleanup:
+                cleanup.append(item)
+    category = _safe_text(
+        ((steps[0].get("metadata") or {}).get("category") if steps else None),
+        "unknown",
+    )
+    try:
+        capability = capability_metadata(category)
+    except ValueError:
+        capability = {}
+    return {
+        "hypothesis_id": _safe_text(plan.get("hypothesis_id")),
+        "objective": _safe_text(plan.get("objective")),
+        "prerequisites": prerequisites,
+        "controlled_accounts_required": accounts_required,
+        "test_owned_resources_required": resources_required,
+        "minimal_requests": _minimal_request_view(plan),
+        "expected_secure_behavior": _safe_list(plan.get("expected_secure_behavior")),
+        "expected_vulnerable_behavior": _safe_list(
+            plan.get("expected_vulnerable_behavior")
+        ),
+        "evidence_to_compare": _safe_list(plan.get("evidence_to_compare")),
+        "stop_conditions": stop_conditions,
+        "cleanup": cleanup,
+        "max_requests": int(plan.get("request_budget") or 0),
+        "side_effect_risk": _safe_text(plan.get("side_effect_risk"), "unknown"),
+        **capability,
+        "automatic_execution_allowed": bool(plan.get("automatic_execution_allowed")),
+        "minimum_requests": capability.get(
+            "min_requests", plan.get("minimum_requests", 0)
+        ),
+        "worst_case_requests": plan.get(
+            "worst_case_requests", capability.get("worst_case_requests", 0)
+        ),
+    }
 
 
 def _read_controlled_file(path_value: str, label: str) -> str:
@@ -184,11 +440,22 @@ def run_scan_command(command: str) -> dict[str, Any]:
     try:
         parts = shlex.split(command)
     except ValueError as exc:
-        return {"success": False, "error": f"Invalid scan command: {exc}"}
+        return public_result(
+            {"success": False, "error": f"Invalid scan command: {exc}"}
+        )
     if not parts:
-        return {"success": False, "error": "Please provide an authorized target."}
+        return public_result(
+            {"success": False, "error": "Please provide an authorized target."}
+        )
     target = normalize_target(parts[0])
     profile = "baseline"
+    mode = "observe"
+    target_class = "external"
+    lab_requested = False
+    dedicated_lab_requested = False
+    phase2_policy_path = None
+    controlled_context_path = None
+    verification_input_path = None
     jwt_token = None
     index = 1
     while index < len(parts):
@@ -202,61 +469,176 @@ def run_scan_command(command: str) -> dict[str, Any]:
             try:
                 jwt_token = path.read_text(encoding="utf-8").strip()
             except OSError as exc:
-                return {"success": False, "error": f"Unable to read JWT file: {exc}"}
+                return public_result(
+                    {"success": False, "error": f"Unable to read JWT file: {exc}"}
+                )
             index += 2
             continue
-        return {"success": False, "error": f"Unsupported scan option: {option}"}
-    if profile not in {"baseline", "deep", "authenticated"}:
-        return {"success": False, "error": f"Unknown scan profile: {profile}"}
+        if option == "--mode" and index + 1 < len(parts):
+            mode = parts[index + 1].lower()
+            index += 2
+            continue
+        if option == "--policy" and index + 1 < len(parts):
+            phase2_policy_path = parts[index + 1]
+            index += 2
+            continue
+        if option == "--context" and index + 1 < len(parts):
+            controlled_context_path = parts[index + 1]
+            index += 2
+            continue
+        if option == "--verification-input" and index + 1 < len(parts):
+            verification_input_path = parts[index + 1]
+            index += 2
+            continue
+        if option == "--lab":
+            lab_requested = True
+            index += 1
+            continue
+        if option == "--dedicated-lab":
+            dedicated_lab_requested = True
+            index += 1
+            continue
+        return public_result(
+            {"success": False, "error": f"Unsupported scan option: {option}"}
+        )
+    if profile not in {"baseline", "deep", "authenticated", "intrusive"}:
+        return public_result(
+            {"success": False, "error": f"Unknown scan profile: {profile}"}
+        )
+    if mode not in {"observe", "plan", "verify"}:
+        return public_result(
+            {"success": False, "error": f"Unknown Phase 2 mode: {mode}"}
+        )
+    from agent_core.verification_runtime import canonical_target_class
+
+    try:
+        target_class = canonical_target_class(
+            lab=lab_requested, dedicated_lab=dedicated_lab_requested
+        )
+    except ValueError as exc:
+        return public_result({"success": False, "error": str(exc)})
+    if profile == "intrusive" and not ENABLE_INTRUSIVE_SCANNING:
+        return public_result(
+            {
+                "success": False,
+                "error": (
+                    "Intrusive scanning is disabled. Set "
+                    "ENABLE_INTRUSIVE_SCANNING=true only for an explicitly "
+                    "authorized target, then select --profile intrusive again."
+                ),
+            }
+        )
     if jwt_token and profile != "authenticated":
         profile = "authenticated"
 
     if not target:
-        return {
-            "success": False,
-            "error": "Please provide an authorized target.",
-        }
+        return public_result(
+            {
+                "success": False,
+                "error": "Please provide an authorized target.",
+            }
+        )
 
     scope_result = enforce_scope(target)
 
     if not scope_result.get("allowed"):
-        return scope_result
+        return public_result(scope_result)
 
     parsed = urlparse(target)
     allowed_domain = parsed.hostname or ""
 
     if not allowed_domain:
-        return {
-            "success": False,
-            "target": target,
-            "error": "The target does not contain a valid hostname.",
-        }
+        return public_result(
+            {
+                "success": False,
+                "target": target,
+                "error": "The target does not contain a valid hostname.",
+            }
+        )
 
+    assessment_label = f"{mode}-mode"
     goal = (
-        "Perform a safe security assessment of the authorized target "
+        f"Perform an authorized {assessment_label} {profile} security assessment of the target "
         f"{target}. Stay within the configured scope, avoid leaving the "
-        "authorized URL path, collect evidence, avoid unsupported claims, "
+        "authorized URL path, collect evidence, prohibit denial of service "
+        "and destructive actions, avoid unsupported claims, "
         "and generate a security report."
     )
 
     try:
-        result = run_workflow(
-            goal,
-            target,
-            allowed_domain,
-            profile=profile,
-            jwt_token=jwt_token,
+        from agent_core.controlled_context import (
+            ControlledContext,
+            load_controlled_context,
         )
+        from agent_core.credential_vault import CredentialVault
+        from agent_core.phase2_store import Phase2RunStore
+        from agent_core.verification_runtime import (
+            create_verification_runtime,
+        )
+
+        vault = CredentialVault()
+        phase2_store = Phase2RunStore()
+        try:
+            controlled = (
+                load_controlled_context(controlled_context_path, vault)
+                if controlled_context_path
+                else ControlledContext()
+            )
+            phase2_policy = (
+                load_policy(phase2_policy_path)
+                if phase2_policy_path
+                else policy_from_runtime(
+                    target,
+                    profile=profile,
+                    authorization_confirmed=True,
+                    request_budget=AGENT_REQUEST_BUDGET,
+                )
+            )
+            verification_inputs = (
+                _read_json_file(verification_input_path, "verification input")
+                if verification_input_path
+                else {}
+            )
+            executor = None
+            if mode == "verify":
+                executor = create_verification_runtime(
+                    policy=phase2_policy,
+                    controlled_context=controlled,
+                    vault=vault,
+                    verification_inputs=verification_inputs,
+                    target=target,
+                    target_class=target_class,
+                    store=phase2_store,
+                    defer_transport=True,
+                )
+            result = run_workflow(
+                goal,
+                target,
+                allowed_domain,
+                profile=profile,
+                assessment_mode=mode,
+                jwt_token=jwt_token,
+                phase2_policy=phase2_policy,
+                target_class=target_class,
+                controlled_context=controlled,
+                phase2_executor=executor,
+                phase2_store=phase2_store,
+            )
+        finally:
+            vault.close()
         global LATEST_SCAN_RESULT
+        result = public_result(result)
         LATEST_SCAN_RESULT = result
         return result
 
     except Exception as exc:
-        return {
-            "success": False,
-            "target": target,
-            "error": f"Workflow error: {exc}",
-        }
+        return public_result(
+            {
+                "success": False,
+                "target": target,
+                "error": f"Workflow error: {exc}",
+            }
+        )
 
 
 def print_nuclei_result(tool_result: dict[str, Any]) -> None:
@@ -264,6 +646,7 @@ def print_nuclei_result(tool_result: dict[str, Any]) -> None:
     Print a concise Nuclei summary instead of dumping full findings.
     """
 
+    tool_result = public_result(tool_result)
     tool_result = tool_result.get("output") or tool_result
     print(f"Success: {tool_result.get('success')}")
     print(f"Target: {tool_result.get('target', tool_result.get('url', 'N/A'))}")
@@ -336,6 +719,7 @@ def print_report_result(tool_result: dict[str, Any]) -> None:
     Print generated report locations cleanly.
     """
 
+    tool_result = public_result(tool_result)
     print(f"Success: {tool_result.get('success')}")
 
     report_file = tool_result.get("report_file")
@@ -362,6 +746,7 @@ def print_standard_tool_result(tool_result: dict[str, Any]) -> None:
     Print a compact summary for normal tools.
     """
 
+    tool_result = public_result(tool_result)
     success = tool_result.get("success")
 
     if success is not None:
@@ -437,18 +822,30 @@ def print_standard_tool_result(tool_result: dict[str, Any]) -> None:
             print(f"- ... and {len(findings) - 10} more")
 
 
+def _print_phase2_list(label: str, values: Any) -> None:
+    items = values if isinstance(values, list) else []
+    print(f"{label}:")
+    if not items:
+        print("- None")
+        return
+    for item in items:
+        print(f"- {item}")
+
+
 def print_result(result: Any) -> None:
     """
     Print strings and workflow dictionaries cleanly.
     """
 
     if isinstance(result, str):
-        print(result)
+        print(sanitize_text(result))
         return
 
     if not isinstance(result, dict):
-        print(result)
+        print(sanitize_text(str(result)))
         return
+
+    result = public_result(result)
 
     print("\n===== CYBERCORTEX RESULT =====")
 
@@ -459,6 +856,210 @@ def print_result(result: Any) -> None:
         return
 
     print(f"Success: {result.get('success', True)}")
+
+    if result.get("category") == "recovery_state_enforcement":
+        print(f"Status: {result.get('status', 'inconclusive')}")
+        print(f"Recovery phase: {result.get('recovery_phase') or 'not started'}")
+        print(f"Comparison type: {result.get('comparison_type') or 'not selected'}")
+        print(
+            "Challenge reference: "
+            f"{result.get('challenge_reference') or 'not established'}"
+        )
+        print(
+            "Valid completion succeeded: "
+            f"{bool(result.get('valid_completion_succeeded'))}"
+        )
+        print(f"Comparison attempted: {bool(result.get('comparison_attempted'))}")
+        print(f"Comparison accepted: {bool(result.get('comparison_accepted'))}")
+        print(
+            "Independent state confirmed: "
+            f"{bool(result.get('independent_state_confirmed'))}"
+        )
+        print(f"Cleanup verified: {bool(result.get('cleanup_verified'))}")
+        print(f"Cleanup failed: {bool(result.get('cleanup_failed'))}")
+        print(
+            "External cleanup required: "
+            f"{bool(result.get('external_cleanup_required'))}"
+        )
+        print(
+            "Controlled recovery evidence required: "
+            f"{bool(result.get('recovery_evidence_required'))}"
+        )
+        return
+
+    if result.get("category") == "session_invalidation":
+        runtime_binding = result.get("runtime_binding") or {}
+        baseline = result.get("baseline") or {}
+        replay = result.get("replay") or {}
+        print(f"Status: {result.get('status', 'inconclusive')}")
+        print(
+            "Runtime binding: "
+            f"{int(runtime_binding.get('bound_accounts') or 0)}/"
+            f"{int(runtime_binding.get('required_accounts') or 0)} account(s); "
+            f"policy authorized={bool(runtime_binding.get('policy_authorized'))}"
+        )
+        print(f"Baseline status: {baseline.get('status_code', 'not established')}")
+        print(f"Replay status: {replay.get('status_code', 'not performed')}")
+        print(
+            "Protected field paths: "
+            + ", ".join(result.get("protected_field_paths") or [])
+        )
+        print(
+            "Protected evidence matched: "
+            f"{bool(result.get('protected_evidence_matched'))}"
+        )
+        print(f"Same session replayed: {bool(result.get('same_session_replayed'))}")
+        print(
+            "Termination: "
+            f"attempted={bool(result.get('termination_attempted'))}; "
+            f"succeeded={bool(result.get('termination_succeeded'))}"
+        )
+        print(f"Cleanup verified: {bool(result.get('cleanup_verified'))}")
+        return
+
+    if isinstance(result.get("owned_object_acquisition"), dict):
+        acquisition = result["owned_object_acquisition"]
+        runtime_binding = result.get("runtime_binding") or {}
+        print(f"Status: {result.get('status', 'inconclusive')}")
+        if runtime_binding:
+            print("Runtime binding:")
+            print(
+                "- Required accounts: "
+                f"{int(runtime_binding.get('required_accounts') or 0)}"
+            )
+            print(
+                "- Bound accounts: "
+                f"{int(runtime_binding.get('bound_accounts') or 0)}"
+            )
+            print(f"- Owner bound: {bool(runtime_binding.get('owner_bound'))}")
+            print(
+                "- Comparator bound: "
+                f"{bool(runtime_binding.get('comparator_bound'))}"
+            )
+            print(
+                "- Policy authorized: "
+                f"{bool(runtime_binding.get('policy_authorized'))}"
+            )
+        print("Owned object acquisition:")
+        print(f"- Attempted: {bool(acquisition.get('attempted'))}")
+        print(f"- Succeeded: {bool(acquisition.get('succeeded'))}")
+        print(f"- Owner: {_safe_text(acquisition.get('owner'), 'Not applicable')}")
+        print(
+            "- Object type: "
+            f"{_safe_text(acquisition.get('object_type'), 'Not applicable')}"
+        )
+        print(f"- Identifier present: {bool(acquisition.get('identifier_present'))}")
+        if acquisition.get("controlled_test_owned_evidence"):
+            print("- Evidence: Controlled test-owned evidence")
+        return
+
+    if isinstance(result.get("hypotheses"), list):
+        hypotheses = result["hypotheses"]
+        print(f"Hypotheses: {len(hypotheses)}")
+        for index, hypothesis in enumerate(hypotheses, 1):
+            if not isinstance(hypothesis, dict):
+                continue
+            print(f"\nHypothesis {index}")
+            print(f"ID: {hypothesis.get('id', 'Not provided')}")
+            print(f"Category: {hypothesis.get('category', 'unknown')}")
+            print(
+                "Capability state: " f"{hypothesis.get('capability_state', 'unknown')}"
+            )
+            print(f"Priority: {hypothesis.get('priority', 'not ranked')}")
+            print(f"Score: {hypothesis.get('score', 0)}")
+            print(f"Confidence: {hypothesis.get('confidence', 'low')}")
+            print(f"Status: {hypothesis.get('status', 'proposed')}")
+            print(
+                "Affected route/functionality: "
+                f"{hypothesis.get('affected_route_or_functionality', 'Not provided')}"
+            )
+            print(f"Evidence basis: {hypothesis.get('evidence_basis', 'Not provided')}")
+        return
+
+    if isinstance(result.get("hypothesis"), dict):
+        hypothesis = result["hypothesis"]
+        surface = hypothesis.get("target_surface") or {}
+        rendered_surface = " ".join(
+            item for item in (surface.get("method"), surface.get("route")) if item
+        )
+        if surface.get("parameter"):
+            rendered_surface += f" (parameter: {surface['parameter']})"
+        print(f"Hypothesis ID: {hypothesis.get('hypothesis_id', 'Not provided')}")
+        print(f"Category: {hypothesis.get('category', 'unknown')}")
+        print(f"Capability state: {hypothesis.get('capability_state', 'unknown')}")
+        print(
+            "Typed executor available: "
+            f"{hypothesis.get('typed_executor_available', False)}"
+        )
+        print(
+            "Automatic execution possible: "
+            f"{hypothesis.get('automatic_execution', False)}"
+        )
+        print("Executor version: " f"{hypothesis.get('executor_version') or 'none'}")
+        print(
+            "Request cost: "
+            f"{hypothesis.get('min_requests', 0)}–{hypothesis.get('worst_case_requests', 0)}"
+        )
+        _print_phase2_list("Major preconditions", hypothesis.get("major_preconditions"))
+        print(f"Title: {hypothesis.get('title', 'Not provided')}")
+        print(f"Target surface: {rendered_surface or 'Not provided'}")
+        _print_phase2_list("Evidence basis", hypothesis.get("evidence_basis"))
+        print(f"Confidence: {hypothesis.get('confidence', 'low')}")
+        print(
+            "Impact if confirmed: "
+            f"{hypothesis.get('impact_if_confirmed', 'Not provided')}"
+        )
+        _print_phase2_list("Required context", hypothesis.get("required_context"))
+        print(
+            "Safe verification possible: "
+            f"{hypothesis.get('safe_verification_possible', False)}"
+        )
+        print(f"Current status: {hypothesis.get('current_status', 'proposed')}")
+        _print_phase2_list("Limitations", hypothesis.get("limitations"))
+        _print_phase2_list("Priority rationale", hypothesis.get("priority_rationale"))
+        return
+
+    if isinstance(result.get("verification_plan"), dict):
+        plan = result["verification_plan"]
+        print(f"Hypothesis ID: {plan.get('hypothesis_id', 'Not provided')}")
+        print(f"Capability state: {plan.get('capability_state', 'unknown')}")
+        print(
+            "Typed executor available: "
+            f"{plan.get('typed_executor_available', False)}"
+        )
+        print(f"Executor version: {plan.get('executor_version') or 'none'}")
+        print(
+            "Request cost: "
+            f"{plan.get('minimum_requests', 0)}–{plan.get('worst_case_requests', 0)}"
+        )
+        _print_phase2_list("Major preconditions", plan.get("major_preconditions"))
+        print(f"Objective: {plan.get('objective', 'Not provided')}")
+        _print_phase2_list("Prerequisites", plan.get("prerequisites"))
+        print(
+            "Controlled accounts required: "
+            f"{plan.get('controlled_accounts_required', False)}"
+        )
+        print(
+            "Test-owned resources required: "
+            f"{plan.get('test_owned_resources_required', False)}"
+        )
+        _print_phase2_list("Minimal requests", plan.get("minimal_requests"))
+        _print_phase2_list(
+            "Expected secure behavior", plan.get("expected_secure_behavior")
+        )
+        _print_phase2_list(
+            "Expected vulnerable behavior", plan.get("expected_vulnerable_behavior")
+        )
+        _print_phase2_list("Evidence to compare", plan.get("evidence_to_compare"))
+        _print_phase2_list("Stop conditions", plan.get("stop_conditions"))
+        _print_phase2_list("Cleanup", plan.get("cleanup"))
+        print(f"Max requests: {plan.get('max_requests', 0)}")
+        print(f"Side-effect risk: {plan.get('side_effect_risk', 'unknown')}")
+        print(
+            "Automatic execution allowed: "
+            f"{plan.get('automatic_execution_allowed', False)}"
+        )
+        return
 
     assessment_status = result.get("assessment_status")
     if assessment_status:
@@ -529,7 +1130,23 @@ CyberCortex AI commands
   scan <target> --profile baseline
   scan <target> --profile deep
   scan <target> --profile authenticated
+  scan <target> --profile intrusive
+  scan <target> --mode observe
+  scan <target> --mode plan
+  scan <target> --mode verify (--lab | --dedicated-lab) --context <controlled-context.json>
+      [--verification-input <secret-free-evidence-context.json>]
       Run the security workflow against an authorized in-scope target.
+      Observe is the default. Verify still requires approved policy and
+      explicit controlled context.
+
+  hypotheses | hypothesis explain <id>
+  verification plan <id>
+  verification run <id> --policy <file> --context <file> --input <file>
+      [--lab | --dedicated-lab]
+      Inspect and run policy-gated Phase 2 verification plans.
+
+  benchmark export <path>
+      Export the latest normalized run without benchmark ground truth.
 
   list tools
       Display registered tools, prerequisites, traffic, and profiles.
@@ -553,6 +1170,15 @@ CyberCortex AI commands
   upload analyze <file> | upload plan <file>
   upload replay <file> | upload explain
       Analyze upload evidence offline. Replay is disabled by default.
+
+  agent plan --capture <file> --policy <file> [--context <file>]
+      Import sanitized capture metadata and create policy-gated typed hypotheses.
+
+  agent surface
+      Show the persistent sanitized attack-surface graph summary.
+
+  eval run [dataset]
+      Run the offline evaluation laboratory and safety metrics.
 
   doctor [--quick]
       Check local release readiness without running a live target scan.
@@ -637,8 +1263,177 @@ def process_user_input(user_input: str) -> Any:
             )
         return "\n".join(rows)
 
+    if lowered == "hypotheses":
+        try:
+            run = _latest_phase2_state()
+            if run is None:
+                return {"success": False, "error": NO_PHASE2_STATE_MESSAGE}
+            return {
+                "success": True,
+                "run_id": run.get("run_id"),
+                "hypotheses": [
+                    _hypothesis_list_item(item)
+                    for item in run.get("hypotheses", [])
+                    if isinstance(item, dict)
+                ],
+            }
+        except (OSError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    if lowered.startswith("hypothesis explain "):
+        identifier = cleaned[len("hypothesis explain ") :].strip()
+        try:
+            run = _latest_phase2_state()
+            if run is None:
+                return {"success": False, "error": NO_PHASE2_STATE_MESSAGE}
+            item = next(
+                (
+                    item
+                    for item in run.get("hypotheses", [])
+                    if isinstance(item, dict)
+                    and item.get("hypothesis_id") == identifier
+                ),
+                None,
+            )
+            if item is None:
+                return {
+                    "success": False,
+                    "error": f"Hypothesis not found: {identifier}.",
+                }
+            return {"success": True, "hypothesis": _hypothesis_explanation(item)}
+        except (OSError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    if lowered.startswith("verification plan "):
+        identifier = cleaned[len("verification plan ") :].strip()
+        try:
+            run = _latest_phase2_state()
+            if run is None:
+                return {"success": False, "error": NO_PHASE2_STATE_MESSAGE}
+            hypothesis_exists = any(
+                isinstance(item, dict) and item.get("hypothesis_id") == identifier
+                for item in run.get("hypotheses", [])
+            )
+            if not hypothesis_exists:
+                return {
+                    "success": False,
+                    "error": f"Hypothesis not found: {identifier}.",
+                }
+            item = next(
+                (
+                    item
+                    for item in run.get("verification_plans", [])
+                    if isinstance(item, dict)
+                    and item.get("hypothesis_id") == identifier
+                ),
+                None,
+            )
+            if item is None:
+                return {
+                    "success": False,
+                    "error": f"No verification plan exists for hypothesis: {identifier}.",
+                }
+            return {
+                "success": True,
+                "verification_plan": _verification_plan_view(item),
+            }
+        except (OSError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    if lowered.startswith("verification run "):
+        from phase2_cli import run_verification_command
+
+        try:
+            return run_verification_command(
+                shlex.split(cleaned[len("verification run ") :])
+            )
+        except (OSError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    if lowered.startswith("benchmark export "):
+        from agent_core.benchmark_exporter import export_benchmark
+        from agent_core.phase2_store import Phase2RunStore
+
+        output = cleaned[len("benchmark export ") :].strip()
+        try:
+            run = Phase2RunStore().load()
+            return {"success": True, "output": export_benchmark(run, output)}
+        except (OSError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
     if lowered.startswith("explain "):
         return explain(cleaned[len("explain ") :], LATEST_SCAN_RESULT)
+
+    if lowered == "agent surface":
+        from agent_core.attack_surface import AttackSurfaceGraph
+
+        return AttackSurfaceGraph().snapshot()
+
+    if lowered.startswith("agent plan "):
+        try:
+            arguments = shlex.split(cleaned[len("agent plan ") :])
+            options: dict[str, str] = {}
+            index = 0
+            while index < len(arguments):
+                option = arguments[index]
+                if option not in {
+                    "--capture",
+                    "--policy",
+                    "--context",
+                    "--format",
+                    "--base-url",
+                    "--output",
+                }:
+                    raise ValueError(f"Unsupported agent plan option: {option}")
+                if index + 1 >= len(arguments):
+                    raise ValueError(f"Missing value for {option}")
+                options[option] = arguments[index + 1]
+                index += 2
+            if "--capture" not in options or "--policy" not in options:
+                raise ValueError("agent plan requires --capture and --policy.")
+            context = (
+                _read_json_file(options["--context"], "capture context")
+                if options.get("--context")
+                else None
+            )
+            policy = load_policy(options["--policy"])
+            plan = AdaptiveAssessmentOrchestrator().plan_capture_file(
+                options["--capture"],
+                policy,
+                goal="Find evidence-supported vulnerabilities in the authorized capture surface.",
+                capture_format=options.get("--format", "auto"),
+                default_base_url=options.get("--base-url"),
+                capture_context=context,
+            )
+            output = options.get("--output", "reports/adaptive/assessment-plan.json")
+            write_assessment_plan(plan, output)
+            return {
+                "success": True,
+                "run_id": plan.run_id,
+                "hypothesis_count": len(plan.hypotheses),
+                "allowed_plan_count": sum(
+                    item.policy_decision == "allowed"
+                    for item in plan.verification_plans
+                ),
+                "selected_tools": plan.selected_tools,
+                "output": output,
+            }
+        except (OSError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+
+    if lowered == "eval run" or lowered.startswith("eval run "):
+        from evaluation.lab import EvaluationLab
+        from evaluation.replay_app import evaluate_replay_case
+
+        dataset = (
+            cleaned[len("eval run") :].strip()
+            or "evaluation/fixtures/authorization.jsonl"
+        )
+        try:
+            lab = EvaluationLab.from_jsonl(dataset)
+            return lab.run(evaluate_replay_case)
+        except (OSError, ValueError, TypeError) as exc:
+            return {"success": False, "error": str(exc)}
 
     if lowered == "doctor" or lowered == "doctor --quick":
         return doctor(quick=lowered.endswith("--quick"))
@@ -875,7 +1670,7 @@ def main() -> None:
             break
 
         except Exception as exc:
-            print(f"\nUnexpected error: {exc}\n")
+            print(f"\nUnexpected error: {sanitize_text(str(exc))}\n")
 
 
 if __name__ == "__main__":

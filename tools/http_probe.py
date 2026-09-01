@@ -1,14 +1,16 @@
-from tools.safe_http import UnsafeRedirectError, scoped_get
+from tools.safe_http import ScopedHTTPClient, UnsafeRedirectError, scoped_get
 
 
-def http_probe(url: str):
+def http_probe(url: str, *, http_client: ScopedHTTPClient | None = None):
 
     try:
 
-        response, redirect_chain = scoped_get(url, timeout=10)
+        response, redirect_chain = scoped_get(url, timeout=10, http_client=http_client)
 
         return {
             "success": True,
+            "reachable": True,
+            "root_status": response.status_code,
             "status_code": response.status_code,
             "server": response.headers.get("Server"),
             "content_type": response.headers.get("Content-Type"),

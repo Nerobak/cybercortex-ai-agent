@@ -19,6 +19,14 @@ def _positive_int(name: str, default: int) -> int:
         return default
 
 
+def _bounded_positive_int(name: str, default: int, maximum: int) -> int:
+    value = _positive_int(name, default)
+    if value > maximum:
+        CONFIG_ERRORS.append(f"{name} must not exceed {maximum}.")
+        return default
+    return value
+
+
 # ============================================================
 # LLM Configuration
 # ============================================================
@@ -47,6 +55,12 @@ ENABLE_ACTIVE_SCANNING = (
     os.getenv("ENABLE_ACTIVE_SCANNING", "false").strip().lower() == "true"
 )
 
+# Separate opt-in for payload-bearing checks. This never permits denial of
+# service, destructive actions, credential attacks, or targets outside scope.
+ENABLE_INTRUSIVE_SCANNING = (
+    os.getenv("ENABLE_INTRUSIVE_SCANNING", "false").strip().lower() == "true"
+)
+
 # ============================================================
 # Bug Bounty Configuration
 # ============================================================
@@ -70,7 +84,22 @@ BUG_BOUNTY_USER_AGENT = os.getenv("BUG_BOUNTY_USER_AGENT", "CyberCortexAI")
 MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "2"))
 
 NUCLEI_SEVERITY = os.getenv("NUCLEI_SEVERITY", "low")
+NUCLEI_RATE_LIMIT = _positive_int("NUCLEI_RATE_LIMIT", 3)
+NUCLEI_TIMEOUT_SECONDS = _positive_int("NUCLEI_TIMEOUT_SECONDS", 120)
+NUCLEI_ENABLE_OAST = os.getenv("NUCLEI_ENABLE_OAST", "false").strip().lower() == "true"
 AI_REPORT_TIMEOUT_SECONDS = int(os.getenv("AI_REPORT_TIMEOUT_SECONDS", "300"))
+AGENT_REQUEST_BUDGET = _positive_int("AGENT_REQUEST_BUDGET", 100)
+ADAPTIVE_MAX_HYPOTHESES = _bounded_positive_int("ADAPTIVE_MAX_HYPOTHESES", 20, 200)
+ADAPTIVE_MAX_VERIFICATIONS = _bounded_positive_int(
+    "ADAPTIVE_MAX_VERIFICATIONS", 10, 100
+)
+ADAPTIVE_MAX_REQUESTS = _bounded_positive_int("ADAPTIVE_MAX_REQUESTS", 50, 5000)
+ADAPTIVE_MAX_RUNTIME_SECONDS = _bounded_positive_int(
+    "ADAPTIVE_MAX_RUNTIME_SECONDS", 600, 3600
+)
+AGENT_ISOLATE_NETWORK_TOOLS = (
+    os.getenv("AGENT_ISOLATE_NETWORK_TOOLS", "true").strip().lower() == "true"
+)
 GRAPHQL_INTROSPECTION_ENABLED = (
     os.getenv("GRAPHQL_INTROSPECTION_ENABLED", "false").strip().lower() == "true"
 )
@@ -92,6 +121,16 @@ BUSINESS_LOGIC_MAX_RESPONSE_BYTES = _positive_int(
 BUSINESS_LOGIC_MAX_STEPS = _positive_int("BUSINESS_LOGIC_MAX_STEPS", 10)
 BUSINESS_LOGIC_MAX_REQUESTS_PER_RUN = _positive_int(
     "BUSINESS_LOGIC_MAX_REQUESTS_PER_RUN", 3
+)
+API_METADATA_DISCOVERY_ENABLED = (
+    os.getenv("API_METADATA_DISCOVERY_ENABLED", "true").strip().lower() == "true"
+)
+API_METADATA_MAX_REQUESTS = _bounded_positive_int("API_METADATA_MAX_REQUESTS", 8, 8)
+API_METADATA_TIMEOUT_SECONDS = _bounded_positive_int(
+    "API_METADATA_TIMEOUT_SECONDS", 10, 30
+)
+API_METADATA_MAX_RESPONSE_BYTES = _bounded_positive_int(
+    "API_METADATA_MAX_RESPONSE_BYTES", 2_000_000, 2_000_000
 )
 
 # ============================================================

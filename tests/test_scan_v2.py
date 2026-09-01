@@ -16,6 +16,7 @@ from agent_core.result_normalizer import (
 from agent_core.tool_runner import ToolRunner
 from agent_core.workflow_manager import run_workflow
 from tool_registry import TOOLS, resolve_tool, validate_registry
+from tool_registry import tools_for_profile
 from tools.safe_http import UnsafeRedirectError, scoped_get
 
 
@@ -23,6 +24,12 @@ def test_registry_names_resolve_and_parameter_analyzer_is_registered():
     assert "parameter_analyzer" in TOOLS
     assert resolve_tool("parameter_analyzer") is not None
     assert all(item["callable_exists"] for item in validate_registry())
+
+
+def test_intrusive_profile_uses_authenticated_tool_eligibility():
+    assert set(tools_for_profile("intrusive")) == set(
+        tools_for_profile("authenticated")
+    )
 
 
 def _response(url, status=200, location=None):
@@ -151,7 +158,9 @@ def test_empty_crawl_skips_list_analyzers_and_jwt_is_not_baseline(monkeypatch):
 def test_secrets_are_redacted_and_evidence_is_bounded():
     token = "aaa.bbb.ccc"
     cleaned = redact({"Authorization": "Bearer secret", "jwt": token, "safe": token})
-    assert token not in json.dumps(cleaned)
+    assert cleaned["Authorization"] == "[REDACTED]"
+    assert cleaned["jwt"] == "[REDACTED]"
+    assert cleaned["safe"] == token
     package = build_evidence_package(
         "https://example.test", "baseline", {}, "start", "end"
     )

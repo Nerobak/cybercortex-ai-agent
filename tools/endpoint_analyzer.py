@@ -63,6 +63,7 @@ UUID = re.compile(
 )
 ID_FIELD = re.compile(r"(?:^|[_-])(?:id|uuid|guid|key)$|(?:id|uuid|guid)$", re.I)
 OPAQUE_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{5,}$")
+HYPHENATED_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+$", re.I)
 STATIC_EXTENSIONS = re.compile(
     r"\.(?:js|mjs|css|map|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|webp)$", re.I
 )
@@ -99,8 +100,16 @@ def _observed_identifiers(url: str) -> list[dict[str, str]]:
     for index, value in enumerate(segments):
         parent = segments[index - 1].lower() if index else ""
         mixed = bool(re.search(r"[A-Za-z]", value) and re.search(r"\d", value))
+        readable_slug = bool(
+            HYPHENATED_SLUG.fullmatch(value)
+            and len([part for part in value.split("-") if re.search(r"[A-Za-z]", part)])
+            >= 2
+        )
         high_confidence_opaque = (
-            parent in RESOURCE_PARENTS and mixed and bool(OPAQUE_ID.fullmatch(value))
+            parent in RESOURCE_PARENTS
+            and mixed
+            and not readable_slug
+            and bool(OPAQUE_ID.fullmatch(value))
         )
         if UUID.fullmatch(value):
             kind = "uuid_identifier"
@@ -137,6 +146,12 @@ def endpoint_analyzer(
     urls: Iterable[Any] | None, allowed_domain: str
 ) -> dict[str, Any]:
     """Classify routes without presenting route names as vulnerabilities."""
+    normalized_routes = getattr(urls, "normalized_routes", [])
+    route_evidence_by_url = {
+        str(item.get("url")): item
+        for item in normalized_routes
+        if isinstance(item, dict) and item.get("url")
+    }
     try:
         urls = list(urls or [])
     except TypeError:
@@ -186,7 +201,11 @@ def endpoint_analyzer(
             matched = words & AREA_WORDS
             query = parse_qs(parsed.query, keep_blank_values=True)
             identifiers = _observed_identifiers(url)
-            if not matched and not query and not identifiers:
+            route_evidence = route_evidence_by_url.get(url)
+            documented_route = bool(
+                route_evidence and route_evidence.get("source") == "openapi"
+            )
+            if not matched and not query and not identifiers and not documented_route:
                 continue
 
             categories: set[str] = set()
@@ -225,6 +244,11 @@ def endpoint_analyzer(
                 )
             if not categories:
                 categories.add("Application route observed")
+            if route_evidence and route_evidence.get("source") == "openapi":
+                categories.add("OpenAPI-documented route observed")
+                reasons.append(
+                    "A structurally validated OpenAPI document described this operation; runtime behavior was not inferred."
+                )
 
             findings.append(
                 {
@@ -232,6 +256,14 @@ def endpoint_analyzer(
                     "path": parsed.path or "/",
                     "resource_kind": resource_kind,
                     "parameters": sorted(set(query)),
+                    "methods": (
+                        [str(route_evidence.get("method"))]
+                        if route_evidence and route_evidence.get("method")
+                        else []
+                    ),
+                    "source": (
+                        route_evidence.get("source") if route_evidence else "crawler"
+                    ),
                     "route_category": sorted(categories),
                     "observed_identifiers": identifiers,
                     "review_reasons": reasons,
