@@ -17,6 +17,35 @@
 Future work should grow replayable benchmark coverage and typed verifier
 adapters before introducing multi-agent specialization.
 
+## Phase 3: in progress
+
+- P3-1 provider foundation: implemented on `develop-v3` with strict normalized
+  contracts, model-only telemetry, configured pricing, deterministic registry,
+  and OpenAI, Anthropic, and Ollama adapters.
+- P3-2 model router: implemented with deterministic modes, exact bounded
+  fallback, cloud-provider-disabled Ollama-family routing, explicit cloud
+  allowlists, model-call ledger, strict usage deltas, and independent model
+  budgets. Endpoint locality remains an operator-verified configuration property.
+- P3-3 grounded reasoning: implemented with canonical evidence packets, strict
+  advisory decisions, capability and policy semantic validation, common
+  GPT/Claude/DeepSeek reasoning, deterministic ranking, and sanitized history.
+- P3-4 adaptive orchestration: implemented with an explicit bounded state
+  machine, deterministic execution gate, dry-run mode, result-driven pivots,
+  duplicate/cleanup barriers, and submission only through the shared Phase 2
+  verification runtime.
+- P3-5 multi-model consensus: implemented with independent canonical-evidence
+  decisions, exact structured-vote agreement, deterministic confidence
+  aggregation and conservative arbitration, bounded consensus budgets, and a
+  validated advisory mapping back to the mandatory P3-4 gate.
+- P3-6 model evaluation: implemented with strict benchmark-independent subjects,
+  cases and runs; reasoning/consensus/autonomy/usage/request metrics; repeatable
+  comparisons and Pareto views; synthetic fixtures; and public-safe external
+  aggregate imports and reports.
+- Provider inputs are limited to canonical Phase 2 public-safe evidence. Models
+  have no direct security-tool or Phase 2 executor authority.
+- Benchmark feedback, automatic tuning, and benchmark-aware routing remain out
+  of scope.
+
 ## v2.1 development
 
 - Business Logic Analysis Engine: implemented on the feature branch with
@@ -38,7 +67,10 @@ The beta milestone delivers dependency-aware profiles, normalized evidence, cons
 - Evidence-driven file-upload analysis (implemented)
 - Authenticated object-authorization workflows with controlled accounts
 
-This project is under active development. The goal is to build a fully local AI Security Agent capable of assisting security researchers and bug bounty hunters with authorized reconnaissance, analysis, and reporting.
+This project is under active development. The goal is to build a local-model-first
+AI Security Agent capable of assisting security researchers and bug bounty hunters
+with authorized reconnaissance, analysis, and reporting. Device-local inference
+depends on a verified loopback/on-device model endpoint.
 
 ---
 
@@ -149,7 +181,7 @@ Each agent will specialize in a specific task while collaborating to complete a 
 
 # Long-Term Vision
 
-The long-term goal is to build a modular, fully local AI security platform that helps security professionals:
+The long-term goal is to build a modular, local-model-first AI security platform that helps security professionals:
 
 * Perform authorized reconnaissance
 * Analyze security findings
@@ -157,7 +189,10 @@ The long-term goal is to build a modular, fully local AI security platform that 
 * Prioritize manual testing
 * Improve productivity during security assessments
 
-The project is designed to remain local-first, allowing researchers to use powerful AI workflows without relying on cloud-hosted reasoning models.
+The project is designed to remain local-model-first, allowing researchers to use
+powerful AI workflows without relying on OpenAI or Anthropic. This provider choice
+alone does not guarantee loopback, offline, or same-device processing; operators
+must verify the configured Ollama endpoint.
 
 ---
 

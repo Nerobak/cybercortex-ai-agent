@@ -55,7 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-analyst",
         action="store_true",
-        help="Let the configured local model propose additional typed hypotheses.",
+        help=(
+            "Let the configured Ollama model provider propose additional typed "
+            "hypotheses; endpoint locality follows its configured base URL."
+        ),
     )
     parser.add_argument(
         "--profile",

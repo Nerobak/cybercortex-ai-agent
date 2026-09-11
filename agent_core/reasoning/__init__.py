@@ -1,0 +1,98 @@
+"""Evidence-grounded, advisory-only multi-model reasoning contracts."""
+
+from agent_core.reasoning.engine import (
+    ClaudeReasoningAgent,
+    DeepSeekReasoningAgent,
+    GPTReasoningAgent,
+    ReasoningEngine,
+    ReasoningHistory,
+    RoutedReasoningAgent,
+)
+from agent_core.reasoning.errors import ReasoningError, ReasoningErrorCode
+from agent_core.reasoning.evidence import (
+    build_capability_catalog,
+    build_evidence_packet,
+    build_prior_verification_outcome,
+    build_reasoning_request,
+)
+from agent_core.reasoning.parser import (
+    parse_reasoning_candidate,
+    parse_reasoning_candidates,
+)
+from agent_core.reasoning.prompt_builder import (
+    PROMPT_VERSION,
+    SYSTEM_INSTRUCTIONS,
+    build_reasoning_model_request,
+)
+from agent_core.reasoning.types import (
+    AUTOMATIC_EXECUTION_ELIGIBILITY_REQUIRED,
+    PHASE2_PLAN_POLICY_AUTHORIZATION_REQUIRED,
+    REASONING_SCHEMA_VERSION,
+    CapabilityCatalog,
+    CapabilityCatalogEntry,
+    ConfidenceLevel,
+    ConsensusParticipantProvenance,
+    EvidencePacket,
+    InformationGain,
+    ModelBudgetContext,
+    PolicyReasoningConstraints,
+    PreviousReasoningDecision,
+    PriorVerificationOutcome,
+    ReasoningAction,
+    ReasoningCandidate,
+    ReasoningDecision,
+    ReasoningHistoryEntry,
+    ReasoningModelProvenance,
+    ReasoningConsensusProvenance,
+    ReasoningRequest,
+    ReasoningTaskType,
+    RequestAccountingSummary,
+)
+from agent_core.reasoning.validation import (
+    validate_reasoning_candidate,
+    validate_reasoning_request,
+)
+
+__all__ = [
+    "AUTOMATIC_EXECUTION_ELIGIBILITY_REQUIRED",
+    "CapabilityCatalog",
+    "CapabilityCatalogEntry",
+    "ClaudeReasoningAgent",
+    "ConfidenceLevel",
+    "ConsensusParticipantProvenance",
+    "DeepSeekReasoningAgent",
+    "EvidencePacket",
+    "GPTReasoningAgent",
+    "InformationGain",
+    "ModelBudgetContext",
+    "PROMPT_VERSION",
+    "PHASE2_PLAN_POLICY_AUTHORIZATION_REQUIRED",
+    "PolicyReasoningConstraints",
+    "PreviousReasoningDecision",
+    "PriorVerificationOutcome",
+    "REASONING_SCHEMA_VERSION",
+    "ReasoningAction",
+    "ReasoningCandidate",
+    "ReasoningDecision",
+    "ReasoningEngine",
+    "ReasoningError",
+    "ReasoningErrorCode",
+    "ReasoningHistory",
+    "ReasoningHistoryEntry",
+    "ReasoningModelProvenance",
+    "ReasoningConsensusProvenance",
+    "ReasoningRequest",
+    "ReasoningTaskType",
+    "RequestAccountingSummary",
+    "RoutedReasoningAgent",
+    "SYSTEM_INSTRUCTIONS",
+    "build_capability_catalog",
+    "build_evidence_packet",
+    "build_prior_verification_outcome",
+    "build_reasoning_model_request",
+    "build_reasoning_request",
+    "parse_reasoning_candidate",
+    "parse_reasoning_candidates",
+    "validate_reasoning_candidate",
+    "validate_reasoning_request",
+]

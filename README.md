@@ -1,5 +1,32 @@
 # CyberCortex AI Agent
 
+## Phase 3 model foundation
+
+P3-1 adds strict provider-neutral model requests, responses, model-call
+telemetry, pricing configuration, and isolated OpenAI, Anthropic, and Ollama
+adapters. P3-2 adds strict deterministic model routing, bounded reliability
+fallback, cloud-provider-disabled Ollama-only routing, explicit cloud allowlists,
+and a separate model-call ledger/budget. P3-3 adds strict evidence packets,
+advisory reasoning decisions, semantic capability grounding, stable hypothesis ranking, and
+sanitized reasoning history. P3-4 adds a bounded state machine and deterministic
+decision gate that can submit eligible typed recommendations only through the
+existing Phase 2 verification runtime. P3-5 adds independent multi-model
+reasoning, structured agreement classification, deterministic conservative
+arbitration, and sanitized consensus history. P3-6 adds benchmark-independent
+model, consensus, and orchestration metrics; repeatable comparison and Pareto
+views; and sanitized external aggregate imports. Models receive only evidence
+admitted through the frozen Phase 2 `public_result` boundary and never receive
+direct tool or network authority. Evaluation does not tune routing or prompts,
+and even unanimous consensus remains advisory; the P3-4 gate and Phase 2 runtime
+remain mandatory. See [docs/PHASE3.md](docs/PHASE3.md).
+
+`local_only` is a provider-family restriction: it blocks OpenAI and Anthropic and
+uses configured Ollama-family routes only. It does not enforce loopback, same-device
+inference, same-LAN inference, offline operation, or absence of network transmission.
+The default `OLLAMA_BASE_URL=http://127.0.0.1:11434` is device-local; a non-loopback
+URL may transmit sanitized model evidence over a network. Verify the configured
+endpoint before relying on device-local privacy assumptions.
+
 ## Adaptive agent architecture
 
 CyberCortex now includes typed hypotheses and verification plans, a deterministic
@@ -8,8 +35,8 @@ HAR/OpenAPI/Postman/GraphQL/browser ingestion, controlled identity and object
 modeling, killable network-tool processes, credential references, hash-chained
 audit events, and an offline evaluation laboratory.
 
-The local model proposes and prioritizes hypotheses. It cannot approve network
-activity or promote a finding to verified. See
+The configured model provider proposes and prioritizes hypotheses. It cannot
+approve network activity or promote a finding to verified. See
 [docs/ADAPTIVE_AGENT.md](docs/ADAPTIVE_AGENT.md).
 
 ```text
@@ -44,7 +71,7 @@ See [docs/BUSINESS_LOGIC_ENGINE.md](docs/BUSINESS_LOGIC_ENGINE.md).
 Version metadata is sourced only from `agent_core/version.py`. v2.1 adds the
 GraphQL Security Suite, JWT Workflow Engine, Business Logic Analysis Engine,
 and File Upload Analysis Engine to the evidence-driven, dependency-aware core.
-Tool output is normalized before it reaches the local DeepSeek analyst;
+Tool output is normalized before it reaches the configured DeepSeek/Ollama analyst;
 deterministic fallback reports remain available when the model is unavailable.
 The summary-only dashboard binds to localhost.
 
@@ -52,7 +79,7 @@ Use `explain <tool>`, `explain latest`, `explain scan`, and `explain profiles` f
 
 Authenticated tools require explicit controlled credentials or request input. Baseline scans do not automatically verify IDOR, JWT acceptance, GraphQL authorization, business logic, or upload behavior. Explicit authorization, configured scope, and program rules always apply.
 
-> **A fully local AI-powered cybersecurity assistant for authorized security assessments, bug bounty research, reconnaissance, analysis, and professional reporting.**
+> **An AI-powered cybersecurity assistant with cloud-provider-disabled Ollama routing for authorized security assessments, bug bounty research, reconnaissance, analysis, and professional reporting.**
 
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.9+-blue)
@@ -64,9 +91,9 @@ Authenticated tools require explicit controlled credentials or request input. Ba
 
 ## Overview
 
-CyberCortex AI Agent is a fully local AI-powered cybersecurity platform designed to assist security professionals and bug bounty researchers during **authorized** security assessments.
+CyberCortex AI Agent is an AI-powered cybersecurity platform designed to assist security professionals and bug bounty researchers during **authorized** security assessments. It supports device-local model inference when Ollama is configured on a verified loopback endpoint.
 
-Unlike traditional security automation scripts, CyberCortex AI Agent combines a local reasoning model (DeepSeek R1 Distill 32B running through Ollama) with custom-built cybersecurity tools to automate reconnaissance, analyze findings, prioritize manual testing, and generate professional security reports.
+Unlike traditional security automation scripts, CyberCortex AI Agent combines a configured reasoning model (such as DeepSeek R1 Distill 32B through Ollama) with custom-built cybersecurity tools to automate reconnaissance, analyze findings, prioritize manual testing, and generate professional security reports.
 
 The project is designed around a modular AI architecture that separates planning, workflow management, decision-making, security tooling, and AI-assisted reporting.
 
@@ -171,9 +198,10 @@ entered through the hidden `jwt analyze` prompt or an ignored file under
 
 # Features
 
-## Local AI
+## Ollama AI
 
-* Fully local execution
+* Cloud-provider-disabled Ollama routing
+* Device-local inference when `OLLAMA_BASE_URL` is verified as loopback
 * Ollama integration
 * DeepSeek R1 Distill 32B
 * No cloud-based LLM required
@@ -207,7 +235,7 @@ entered through the hidden `jwt analyze` prompt or an ignored file under
 
 ## Hardware Requirements
 
-CyberCortex AI Agent is designed to run entirely on local hardware using Ollama and DeepSeek R1 Distill 32B.
+CyberCortex AI Agent can run its model inference entirely on local hardware using Ollama and DeepSeek R1 Distill 32B when the configured Ollama endpoint is verified as loopback/on-device.
 
 The hardware required depends on the language model you choose.
 
