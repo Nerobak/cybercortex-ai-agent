@@ -11,7 +11,10 @@ from pydantic import Field, StrictBool, StrictStr
 
 from agent_core.models.config import ProviderConfiguration
 from agent_core.models.errors import ModelErrorCode, ModelProviderError
-from agent_core.models.pricing import ModelPricingCatalog
+from agent_core.models.pricing import (
+    ModelPricingCatalog,
+    model_response_matches_route,
+)
 from agent_core.models.telemetry import ModelCallTelemetry, ModelTelemetryRecorder
 from agent_core.models.types import ModelContract, ModelRequest, ModelResponse
 
@@ -104,7 +107,9 @@ class ModelProvider(ABC):
             )
             if (
                 normalized.provider != self.provider_name
-                or normalized.model != self.model_name
+                or not model_response_matches_route(
+                    self.provider_name, self.model_name, normalized.model
+                )
             ):
                 raise ModelProviderError(
                     ModelErrorCode.invalid_response,
@@ -182,10 +187,16 @@ class ModelProvider(ABC):
             model=self.model_name,
         )
 
-    def estimate_cost(self, input_tokens: int, output_tokens: int) -> float | None:
+    def estimate_cost(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        model: str | None = None,
+    ) -> float | None:
         return self._pricing.estimate_cost(
             self.provider_name,
-            self.model_name,
+            self.model_name if model is None else model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )

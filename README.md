@@ -20,6 +20,12 @@ direct tool or network authority. Evaluation does not tune routing or prompts,
 and even unanimous consensus remains advisory; the P3-4 gate and Phase 2 runtime
 remain mandatory. See [docs/PHASE3.md](docs/PHASE3.md).
 
+Post-freeze provider support includes OpenAI Responses API text generation and
+native strict JSON Schema output. The OpenAI route remains advisory-only: no
+tools, model-initiated execution, output repair, or malformed-output retry are
+enabled, and the existing routing, accounting, provenance, and Phase 2 authority
+boundaries remain in force.
+
 `local_only` is a provider-family restriction: it blocks OpenAI and Anthropic and
 uses configured Ollama-family routes only. It does not enforce loopback, same-device
 inference, same-LAN inference, offline operation, or absence of network transmission.

@@ -80,7 +80,7 @@ policy and asks the registry for only the explicitly declared routes.
 Supported adapters are:
 
 - `openai`: optional OpenAI SDK, environment/configuration API key, normalized
-  chat-completion output.
+  Responses API text output, and native structured JSON/JSON Schema output.
 - `anthropic`: optional Anthropic SDK, environment/configuration API key,
   normalized message output.
 - `ollama`: HTTP adapter, default loopback origin, configurable model, and
@@ -94,12 +94,23 @@ unavailable. They do not break package import or Ollama-only operation. Ollama
 connection failures occur deterministically when that provider is used; startup
 does not require a running Ollama service.
 
-The current OpenAI and Anthropic adapters do not declare provider-native support
-for the provider-neutral structured-output intent. A structured request routed to
-either adapter fails as `provider_unavailable` before SDK transport starts; an
-explicitly configured reliability fallback may then continue under the existing
-routing policy. Their normal, non-structured requests retain their prior behavior.
-This avoids claiming enforcement that these adapter contracts do not implement.
+The OpenAI adapter uses one `responses.create(...)` call. System instructions,
+user content, and canonical sanitized evidence remain separate Responses input
+fields/blocks. Schema-less structured requests use the native JSON-object format;
+schema requests pass the exact canonical provider-neutral schema through
+`text.format` with strict native enforcement. The adapter does not add tools,
+output repair, Markdown stripping, malformed-output retries, or a second call.
+It disables provider-side response storage and retains only normalized public-safe
+response fields. Anthropic still does not declare provider-native structured-output
+support and therefore fails those requests before transport as
+`provider_unavailable`.
+
+OpenAI responses preserve a returned dated model snapshot, while validating that
+it is either the configured route or that route's `YYYY-MM-DD` realization.
+Provider reservations remain keyed to the configured route and reconcile once to
+the returned snapshot and actual Responses token usage. For `gpt-5.5-pro` and its
+dated snapshots, the adapter omits the unsupported `temperature` transport field;
+the provider-neutral request and its validation are not changed or reinterpreted.
 
 ## Request and evidence safety boundary
 
@@ -234,11 +245,12 @@ call. `unknown_cost_policy=allow` is an explicit policy choice; it preserves cos
 as `None` and does not invent a number.
 
 `ModelPricingCatalog` and `ModelConfiguration.pricing` centralize provider/model
-aliases and configured per-million-token prices. Cloud pricing is unknown unless
-supplied as data, so
-unknown prices produce `estimated_cost_usd=None` while token counts remain
-available. Ollama defaults to `0.0` API cost. Phase 3 contains no speculative cloud
-price constants.
+aliases and per-million-token prices. The catalog includes standard API pricing
+for `gpt-5.5-pro` ($30/M input and $180/M output) and an exact mapping for the
+`gpt-5.5-pro-2026-04-23` snapshot. No cached-input discount applies. Other cloud
+pricing is unknown unless supplied as data, so unknown prices produce
+`estimated_cost_usd=None` while token counts remain available. Ollama defaults to
+`0.0` API cost; no subscription, Batch, Flex, Fast, or Scale Tier pricing is used.
 
 ## Configuration
 
@@ -271,10 +283,10 @@ printed, logged, persisted in model responses/telemetry, placed in prompts, or
 included in public errors. `.env.example` contains blank cloud-key placeholders
 only.
 
-OpenAI remains present in the main project requirements for legacy local
-OpenAI-compatible use. Anthropic is intentionally optional; install its SDK only
-when that provider is selected. Importing `agent_core.models` does not require
-the Anthropic SDK.
+OpenAI remains present in the main project requirements for its Phase 3 Responses
+adapter and legacy local OpenAI-compatible use. Anthropic is intentionally
+optional; install its SDK only when that provider is selected. Importing
+`agent_core.models` does not require the Anthropic SDK.
 
 ## Errors
 

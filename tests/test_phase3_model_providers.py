@@ -64,10 +64,13 @@ class CallableResult:
 
 
 def openai_client(result=None, error: BaseException | None = None):
-    create = CallableResult(result=result, error=error)
+    responses_create = CallableResult(result=result, error=error)
+    chat_create = CallableResult(error=AssertionError("Chat Completions was called"))
     return SimpleNamespace(
-        chat=SimpleNamespace(completions=create),
-        create_spy=create,
+        responses=responses_create,
+        chat=SimpleNamespace(completions=chat_create),
+        create_spy=responses_create,
+        chat_spy=chat_create,
     )
 
 
@@ -127,15 +130,25 @@ def ollama_config() -> ProviderConfiguration:
     )
 
 
-def normalized_openai_response(content: str = "analysis"):
+def normalized_openai_response(
+    content: str = "analysis",
+    *,
+    model: str = "openai-test-model",
+    response_id: str = "resp-openai-1",
+    status: str = "completed",
+    input_tokens: int = 11,
+    output_tokens: int = 7,
+):
     return SimpleNamespace(
-        id="call-openai-1",
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(content=content), finish_reason="stop"
-            )
-        ],
-        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+        id=response_id,
+        model=model,
+        output_text=content,
+        status=status,
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        ),
     )
 
 
@@ -237,12 +250,319 @@ def test_model_response_is_strict_and_rejects_raw_provider_fields():
 def test_openai_response_normalization_and_no_tools():
     client = openai_client(normalized_openai_response())
     response = OpenAIProvider(openai_config(), client=client).generate(request())
+    assert len(client.create_spy.calls) == 1
+    assert client.chat_spy.calls == []
     assert response.provider == "openai"
     assert response.model == "openai-test-model"
     assert response.content == "analysis"
-    assert response.finish_reason == "stop"
-    assert response.provider_call_id == "call-openai-1"
-    assert "tools" not in client.create_spy.calls[0]
+    assert response.finish_reason == "completed"
+    assert response.provider_call_id == "resp-openai-1"
+    call = client.create_spy.calls[0]
+    assert call["instructions"] == request().system_instructions
+    assert call["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": request().user_content},
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Sanitized evidence (JSON):\n"
+                        '{"request_count":2,"status":"inconclusive"}'
+                    ),
+                },
+            ],
+        }
+    ]
+    assert call["max_output_tokens"] == 200
+    assert call["temperature"] == 0.0
+    assert call["timeout"] == 2.0
+    assert call["store"] is False
+    assert "tools" not in call
+    assert "text" not in call
+
+
+def test_openai_response_usage_and_actual_snapshot_model_are_normalized():
+    catalog = ModelPricingCatalog(
+        (
+            ModelPrice(
+                provider="openai",
+                model="openai-test-model",
+                input_per_million_usd=2.0,
+                output_per_million_usd=8.0,
+            ),
+        ),
+        model_aliases={("openai", "openai-test-model-2026-04-23"): "openai-test-model"},
+    )
+    raw = normalized_openai_response(model="openai-test-model-2026-04-23")
+    provider = OpenAIProvider(
+        openai_config(), pricing=catalog, client=openai_client(raw)
+    )
+
+    response = provider.generate(request())
+
+    assert response.model == "openai-test-model-2026-04-23"
+    assert (response.input_tokens, response.output_tokens, response.total_tokens) == (
+        11,
+        7,
+        18,
+    )
+    assert response.estimated_cost_usd == pytest.approx(0.000078)
+    assert response.provider_call_id == "resp-openai-1"
+    assert provider.telemetry[-1].model == "openai-test-model-2026-04-23"
+
+
+def test_gpt_5_5_pro_real_usage_is_priced_from_returned_snapshot():
+    raw = normalized_openai_response(
+        model="gpt-5.5-pro-2026-04-23",
+        input_tokens=3887,
+        output_tokens=2056,
+    )
+    configuration = ProviderConfiguration(
+        model_name="gpt-5.5-pro",
+        api_key=API_KEY_SENTINEL,
+        timeout_seconds=2.0,
+        max_output_tokens=4096,
+    )
+
+    response = OpenAIProvider(configuration, client=openai_client(raw)).generate(
+        request(max_output_tokens=4096)
+    )
+
+    assert response.model == "gpt-5.5-pro-2026-04-23"
+    assert response.input_tokens == 3887
+    assert response.output_tokens == 2056
+    assert response.estimated_cost_usd == pytest.approx(0.48669)
+
+
+def test_openai_rejects_a_returned_model_outside_the_configured_alias():
+    provider = OpenAIProvider(
+        openai_config(),
+        client=openai_client(normalized_openai_response(model="different-model")),
+    )
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(request())
+
+    assert captured.value.code == ModelErrorCode.invalid_response
+
+
+def test_openai_generic_structured_output_uses_responses_json_mode_once():
+    client = openai_client(normalized_openai_response('{"result":"ok"}'))
+    provider = OpenAIProvider(openai_config(), client=client)
+
+    response = provider.generate(request(structured_output=True))
+
+    assert response.content == '{"result":"ok"}'
+    assert len(client.create_spy.calls) == 1
+    assert client.chat_spy.calls == []
+    assert client.create_spy.calls[0]["text"] == {"format": {"type": "json_object"}}
+
+
+def test_openai_schema_structured_output_is_exact_strict_and_immutable():
+    schema = {
+        "type": "object",
+        "properties": {"result": {"type": "string"}},
+        "required": ["result"],
+        "additionalProperties": False,
+    }
+    original = json.loads(json.dumps(schema))
+    model_request = request(
+        structured_output=True,
+        structured_output_schema=schema,
+    )
+    client = openai_client(normalized_openai_response('{"result":"ok"}'))
+
+    response = OpenAIProvider(openai_config(), client=client).generate(model_request)
+
+    assert response.content == '{"result":"ok"}'
+    assert len(client.create_spy.calls) == 1
+    assert client.chat_spy.calls == []
+    assert client.create_spy.calls[0]["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "cybercortex_structured_output",
+            "schema": original,
+            "strict": True,
+        }
+    }
+    assert schema == original
+    assert model_request.structured_output_schema == original
+
+
+def test_openai_schema_requires_root_properties_in_canonical_order_without_mutation():
+    schema = {
+        "type": "object",
+        "properties": {
+            "z_defaulted": {"type": "string", "default": ""},
+            "a_required": {"type": "integer", "minimum": 0},
+        },
+        "required": ["a_required"],
+        "additionalProperties": False,
+    }
+    supplied = json.loads(json.dumps(schema))
+    model_request = request(
+        structured_output=True,
+        structured_output_schema=schema,
+    )
+    canonical_before = model_request.model_dump_json()
+    client = openai_client(normalized_openai_response('{"a_required":1}'))
+
+    OpenAIProvider(openai_config(), client=client).generate(model_request)
+
+    transport = client.create_spy.calls[0]["text"]["format"]
+    transport_schema = transport["schema"]
+    assert len(client.create_spy.calls) == 1
+    assert transport["strict"] is True
+    assert transport_schema["required"] == list(transport_schema["properties"])
+    assert transport_schema["required"] == ["a_required", "z_defaulted"]
+    assert transport_schema["properties"]["a_required"]["minimum"] == 0
+    assert transport_schema["additionalProperties"] is False
+    assert schema == supplied
+    assert model_request.structured_output_schema["required"] == ["a_required"]
+    assert model_request.model_dump_json() == canonical_before
+
+
+def test_openai_schema_requires_properties_in_defs_nested_items_and_branches():
+    schema = {
+        "$defs": {
+            "Definition": {
+                "type": "object",
+                "properties": {
+                    "defaulted": {
+                        "type": "integer",
+                        "default": 0,
+                        "minimum": 0,
+                        "maximum": 10,
+                    }
+                },
+                "additionalProperties": False,
+            }
+        },
+        "type": "object",
+        "properties": {
+            "nested": {
+                "type": "object",
+                "properties": {"value": {"type": "string", "minLength": 1}},
+                "additionalProperties": False,
+            },
+            "items": {
+                "type": "array",
+                "minItems": 0,
+                "items": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer", "minimum": 0}},
+                    "additionalProperties": False,
+                },
+            },
+            "choice": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {"left": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {"right": {"type": "boolean"}},
+                                "additionalProperties": False,
+                            },
+                            {"type": "null"},
+                        ]
+                    },
+                ]
+            },
+            "defined": {"$ref": "#/$defs/Definition"},
+        },
+        "additionalProperties": False,
+    }
+    model_request = request(
+        structured_output=True,
+        structured_output_schema=schema,
+    )
+    canonical = json.loads(model_request.model_dump_json())["structured_output_schema"]
+    client = openai_client(normalized_openai_response("{}"))
+
+    OpenAIProvider(openai_config(), client=client).generate(model_request)
+
+    adapted = client.create_spy.calls[0]["text"]["format"]["schema"]
+    properties = adapted["properties"]
+    assert adapted["required"] == list(properties)
+    assert adapted["$defs"]["Definition"]["required"] == ["defaulted"]
+    assert properties["nested"]["required"] == ["value"]
+    assert properties["items"]["items"]["required"] == ["count"]
+    assert properties["choice"]["anyOf"][0]["required"] == ["left"]
+    assert properties["choice"]["anyOf"][1]["oneOf"][0]["required"] == ["right"]
+    assert adapted["$defs"]["Definition"]["properties"]["defaulted"] == {
+        "default": 0,
+        "maximum": 10,
+        "minimum": 0,
+        "type": "integer",
+    }
+    assert properties["defined"] == {"$ref": "#/$defs/Definition"}
+    assert json.loads(model_request.model_dump_json())["structured_output_schema"] == (
+        canonical
+    )
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "type": "object",
+            "properties": {"known": {"type": "string"}},
+            "required": ["unconstrained_but_required"],
+        },
+        {"type": "object", "properties": []},
+    ],
+)
+def test_openai_schema_adaptation_fails_closed_before_transport(schema):
+    client = openai_client(normalized_openai_response("{}"))
+    provider = OpenAIProvider(openai_config(), client=client)
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(
+            request(structured_output=True, structured_output_schema=schema)
+        )
+
+    assert captured.value.code == ModelErrorCode.configuration_error
+    assert client.create_spy.calls == []
+
+
+@pytest.mark.parametrize("content", [None, "", "   "])
+def test_openai_empty_output_fails_closed(content):
+    provider = OpenAIProvider(
+        openai_config(), client=openai_client(normalized_openai_response(content))
+    )
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(request())
+
+    assert captured.value.code == ModelErrorCode.invalid_response
+    assert len(provider.telemetry) == 1
+
+
+def test_gpt_5_5_pro_omits_unsupported_temperature_without_changing_request():
+    configuration = openai_config().model_copy(update={"model_name": "gpt-5.5-pro"})
+    client = openai_client(normalized_openai_response(model="gpt-5.5-pro-2026-04-23"))
+    model_request = request(temperature=0.0)
+
+    OpenAIProvider(configuration, client=client).generate(model_request)
+
+    assert "temperature" not in client.create_spy.calls[0]
+    assert model_request.temperature == 0.0
+
+
+def test_openai_output_limit_uses_the_request_and_configuration_minimum():
+    client = openai_client(normalized_openai_response())
+
+    OpenAIProvider(openai_config(), client=client).generate(
+        request(max_output_tokens=800)
+    )
+
+    assert client.create_spy.calls[0]["max_output_tokens"] == 500
 
 
 def test_anthropic_response_normalization_and_no_tools():
@@ -372,14 +692,9 @@ def test_ollama_ignores_thinking_and_keeps_message_content_authoritative():
     assert len(client.calls) == 1
 
 
-@pytest.mark.parametrize("provider_name", ["openai", "anthropic"])
-def test_unsupported_cloud_structured_output_fails_before_transport(provider_name):
-    if provider_name == "openai":
-        client = openai_client(normalized_openai_response())
-        provider = OpenAIProvider(openai_config(), client=client)
-    else:
-        client = anthropic_client(normalized_anthropic_response())
-        provider = AnthropicProvider(anthropic_config(), client=client)
+def test_unsupported_anthropic_structured_output_fails_before_transport():
+    client = anthropic_client(normalized_anthropic_response())
+    provider = AnthropicProvider(anthropic_config(), client=client)
 
     with pytest.raises(ModelProviderError) as captured:
         provider.generate(request(structured_output=True))
@@ -454,6 +769,37 @@ def test_provider_rate_limit_normalization():
     with pytest.raises(ModelProviderError) as captured:
         provider.generate(request())
     assert captured.value.code == ModelErrorCode.rate_limited
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (401, ModelErrorCode.authentication_failed),
+        (403, ModelErrorCode.provider_unavailable),
+        (404, ModelErrorCode.provider_unavailable),
+        (400, ModelErrorCode.configuration_error),
+    ],
+)
+def test_openai_http_error_normalization_is_truthful_and_public_safe(
+    status_code, expected
+):
+    provider_error = type(
+        "ProviderHTTPError",
+        (RuntimeError,),
+        {"status_code": status_code},
+    )
+    provider = OpenAIProvider(
+        openai_config(),
+        client=openai_client(error=provider_error(API_KEY_SENTINEL)),
+    )
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(request())
+
+    assert captured.value.code == expected
+    assert API_KEY_SENTINEL not in str(captured.value)
+    assert API_KEY_SENTINEL not in json.dumps(captured.value.public_dict())
+    assert API_KEY_SENTINEL not in provider.telemetry[-1].model_dump_json()
 
 
 @pytest.mark.parametrize(
@@ -553,6 +899,55 @@ def test_known_price_cost_calculation_and_alias_resolution():
     )
 
 
+def test_gpt_5_5_pro_standard_api_pricing_is_exact_and_snapshot_scoped():
+    catalog = ModelPricingCatalog()
+
+    assert catalog.estimate_cost(
+        "openai", "gpt-5.5-pro", input_tokens=1_000_000, output_tokens=0
+    ) == pytest.approx(30.0)
+    assert catalog.estimate_cost(
+        "openai",
+        "gpt-5.5-pro-2026-04-23",
+        input_tokens=0,
+        output_tokens=1_000_000,
+    ) == pytest.approx(180.0)
+    assert catalog.estimate_cost(
+        "openai",
+        "gpt-5.5-pro-2026-04-23",
+        input_tokens=3887,
+        output_tokens=2056,
+    ) == pytest.approx(0.48669)
+    assert (
+        catalog.estimate_cost(
+            "openai",
+            "gpt-5.5-pro-experimental",
+            input_tokens=3887,
+            output_tokens=2056,
+        )
+        is None
+    )
+
+
+def test_anthropic_configured_pricing_is_unchanged():
+    catalog = ModelPricingCatalog(
+        (
+            ModelPrice(
+                provider="anthropic",
+                model="anthropic-test-model",
+                input_per_million_usd=2.0,
+                output_per_million_usd=8.0,
+            ),
+        )
+    )
+
+    assert catalog.estimate_cost(
+        "anthropic",
+        "anthropic-test-model",
+        input_tokens=1_000_000,
+        output_tokens=500_000,
+    ) == pytest.approx(6.0)
+
+
 def test_unknown_price_is_none_without_losing_tokens():
     client = openai_client(normalized_openai_response())
     response = OpenAIProvider(openai_config(), client=client).generate(request())
@@ -612,13 +1007,20 @@ def test_optional_cloud_sdk_absence_isolated(
 
 
 def test_api_key_sentinel_absent_from_response_and_telemetry():
+    raw = normalized_openai_response(
+        API_KEY_SENTINEL,
+        response_id=f"resp-{API_KEY_SENTINEL}",
+    )
+    raw.metadata = {"private": API_KEY_SENTINEL}
     provider = OpenAIProvider(
         openai_config(),
-        client=openai_client(normalized_openai_response(API_KEY_SENTINEL)),
+        client=openai_client(raw),
     )
     response = provider.generate(request())
     assert API_KEY_SENTINEL not in response.model_dump_json()
     assert API_KEY_SENTINEL not in provider.telemetry[-1].model_dump_json()
+    assert response.metadata == {}
+    assert API_KEY_SENTINEL not in (response.provider_call_id or "")
 
 
 def test_api_key_sentinel_absent_from_public_error():
@@ -726,6 +1128,19 @@ def test_provider_specific_raw_response_does_not_escape_normalization():
     assert isinstance(response, ModelResponse)
     assert not hasattr(response, "provider_private_object")
     assert AUTH_SENTINEL not in response.model_dump_json()
+
+
+def test_openai_does_not_strip_or_repair_markdown_wrapped_json():
+    wrapped = '```json\n{"result":"ok"}\n```'
+    client = openai_client(normalized_openai_response(wrapped))
+
+    response = OpenAIProvider(openai_config(), client=client).generate(
+        request(structured_output=True)
+    )
+
+    assert response.content == wrapped
+    assert len(client.create_spy.calls) == 1
+    assert client.chat_spy.calls == []
 
 
 def test_latency_and_failure_telemetry_are_recorded_for_every_call():

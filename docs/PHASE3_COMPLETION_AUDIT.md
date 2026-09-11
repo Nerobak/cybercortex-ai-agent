@@ -2939,3 +2939,107 @@ validation remain post-freeze integrations rather than core freeze blockers.
 
 Final local quality gates passed: Black, Ruff, compilation, all 1,539 tests,
 and the Git whitespace check.
+
+## POST-FREEZE OPENAI PROVIDER INTEGRATION
+
+Integration date: 2026-09-11
+
+The immutable `phase3-freeze` tag remains at commit `e64af48`. This section
+records post-freeze provider work and does not revise the provider-neutral Phase
+3 architecture or any frozen safety, accounting, provenance, routing, consensus,
+evaluation, autonomy, or Phase 2 execution-authority boundary.
+
+Direct provider validation established that the configured `gpt-5.5-pro` access
+was incompatible with the prior Chat Completions production path, while a direct
+Responses API request completed successfully. The OpenAI adapter now uses one
+`client.responses.create(...)` call and normalizes `output_text`, returned model
+identity, terminal status, Responses input/output token usage, response ID, and
+existing catalog cost into the unchanged `ModelResponse` contract. No raw SDK
+response, prompt, evidence, provider exception body, reasoning trace, or hidden
+chain-of-thought is persisted.
+
+OpenAI now advertises provider-native structured-output support. Generic JSON
+uses the Responses JSON-object text format. Schema requests pass the exact
+canonical provider-neutral schema through the Responses JSON Schema text format
+with `strict=true`; the schema is neither weakened nor mutated. The existing
+strict `ReasoningCandidate` parser and semantic validator remain authoritative.
+There is no output repair, Markdown stripping, malformed-output retry, schema
+field synthesis, or second provider call.
+
+System instructions remain Responses instructions. User content and sanitized
+evidence remain separate input text blocks, and evidence still crosses the
+existing Phase 2 `public_result`/`ModelRequest` sanitizer boundary. The adapter
+sends no tools, web search, file search, function calling, provider metadata, or
+execution surface, and requests `store=false`. It remains advisory text and
+structured-output transport only.
+
+The Responses output ceiling is the smaller of the request and provider
+configuration limits. `gpt-5.5-pro` and dated snapshots omit the unsupported
+temperature transport field without changing provider-neutral request
+validation. Authentication, access/permission, rate-limit, timeout, connection,
+configuration, and invalid-response failures retain fixed public-safe errors;
+403/404 access denial maps to the existing `provider_unavailable` code rather
+than being mislabeled as credential rejection.
+
+Returned dated OpenAI snapshot IDs are validated as realizations of the selected
+alias. Provider-start reservation, failed-start retention, exact successful usage
+reconciliation, fallback/shared budgets, telemetry, reasoning provenance,
+consensus participation, autonomy, and evaluation accounting remain unchanged
+and occur exactly once. `local_only` still blocks OpenAI. Ollama and Anthropic
+adapter behavior is unchanged.
+
+This integration did not make a paid provider call. Direct Responses validation
+is previously observed evidence only. A real routed P3-3 OpenAI reasoning PASS is
+not claimed here and remains scheduled for separate manual validation.
+
+Post-integration local quality gates passed: Black, Ruff, compilation, all 1,554
+tests, and the Git whitespace check.
+
+## POST-FREEZE OPENAI STRICT-SCHEMA COMPATIBILITY
+
+Compatibility fix date: 2026-09-11
+
+Real OpenAI P3-3 structured reasoning reached Responses API schema validation,
+where the API rejected the canonical Pydantic schema before generation. OpenAI
+strict Structured Outputs require every key in an object's `properties` map to
+also appear in that object's `required` array; the canonical schema correctly
+omitted Python-defaulted fields such as `evidence_references` under normal JSON
+Schema semantics.
+
+The provider-neutral `ReasoningCandidate` contract was not weakened or changed,
+and the strict parser and semantic validator remain unchanged and authoritative.
+At the OpenAI transport boundary only, the adapter now creates a deterministic
+deep copy of the canonical schema and recursively sets each schema object's
+`required` array to its property keys in property order. This applies to the
+root, definitions, nested properties, array items, and schema-composition
+branches without mutating `ModelRequest.structured_output_schema`.
+
+Defaulted arrays, including `evidence_references` and `missing_evidence`, are
+therefore required in the OpenAI payload and must be emitted as `[]` when empty;
+they remain non-nullable JSON arrays. Nullable fields, including
+`recommended_capability` and `stop_reason`, are required to be present while
+retaining their canonical null allowance. Types, enums, bounds, descriptions,
+references, `additionalProperties`, and all other contract constraints remain
+unchanged. A schema that cannot be adapted without losing an existing required
+constraint fails closed before transport through the public-safe configuration
+error path.
+
+The request still uses `strict=true` and exactly one Responses provider call.
+No output repair, retry, or additional provider call was introduced. Ollama
+continues to receive the canonical provider-neutral schema, and Anthropic
+behavior is unchanged. No paid provider call was made while implementing or
+testing this compatibility fix.
+
+## OPENAI PRICING ACCOUNTING
+
+Post-freeze accounting support adds GPT-5.5 Pro standard API pricing at $30/M
+input tokens and $180/M output tokens, with no cached-input discount. The dated
+snapshot is mapped deterministically and exactly to its configured alias; other
+unlisted OpenAI models remain unknown.
+
+The real P3-3 model returned `gpt-5.5-pro-2026-04-23`. Previously observed real
+usage was 3,887 input tokens and 2,056 output tokens, producing an expected
+standard API estimate of approximately $0.48669. This task did not perform a new
+paid provider call.
+
+No provider, routing, or execution semantics changed.

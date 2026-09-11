@@ -26,7 +26,10 @@ from agent_core.models.errors import (
     ModelProviderError,
     ModelRoutingError,
 )
-from agent_core.models.pricing import normalize_provider_alias
+from agent_core.models.pricing import (
+    model_response_matches_route,
+    normalize_provider_alias,
+)
 from agent_core.models.registry import ProviderRegistry
 from agent_core.models.types import (
     ModelAttemptOutcome,
@@ -287,7 +290,9 @@ class ModelRouter:
                         )
                     elif (
                         candidate.provider != selected.provider
-                        or candidate.model != selected.model
+                        or not model_response_matches_route(
+                            selected.provider, selected.model, candidate.model
+                        )
                         or candidate.task_type != request.task_type
                         or candidate.run_id != request.run_id
                         or candidate.hypothesis_id != request.hypothesis_id

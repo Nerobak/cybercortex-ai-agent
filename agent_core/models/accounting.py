@@ -18,6 +18,7 @@ from pydantic import (
 )
 
 from agent_core.models.errors import ModelErrorCode
+from agent_core.models.pricing import model_response_matches_route
 from agent_core.models.types import ModelContract, ModelResponse
 
 
@@ -640,7 +641,7 @@ class ModelCallLedger:
     ) -> None:
         if (
             commit.provider != provider
-            or commit.model != model
+            or not model_response_matches_route(provider, commit.model, model)
             or commit.task_type != task_type
             or commit.run_id != run_id
             or commit.hypothesis_id != hypothesis_id

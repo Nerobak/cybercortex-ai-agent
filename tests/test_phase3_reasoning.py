@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,10 +18,14 @@ from agent_core.models import (
     ModelCallLedger,
     ModelErrorCode,
     ModelProviderError,
+    ModelPricingCatalog,
     ModelResponse,
     ModelRoute,
+    ModelRouter,
     ModelRoutingError,
     ModelRoutingPolicy,
+    OpenAIProvider,
+    ProviderConfiguration,
     RoutingMode,
 )
 from agent_core.reasoning import (
@@ -748,6 +753,117 @@ def test_reasoning_model_request_carries_reasoning_candidate_schema():
     identity = model_request.metadata["structured_output_schema_sha256"]
     assert isinstance(identity, str)
     assert len(identity) == 64
+
+
+def test_openai_responses_adapts_reasoning_schema_and_preserves_strict_parser():
+    calls = []
+    content = json.dumps(candidate())
+    canonical_request = build_reasoning_model_request(reasoning_request())
+    canonical_schema = json.loads(canonical_request.model_dump_json())[
+        "structured_output_schema"
+    ]
+    canonical_before = canonical_request.model_dump_json()
+
+    class Responses:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                id="resp-reasoning-1",
+                model="gpt-5.5-pro-2026-04-23",
+                output_text=content,
+                status="completed",
+                usage=SimpleNamespace(input_tokens=120, output_tokens=40),
+            )
+
+    provider = OpenAIProvider(
+        ProviderConfiguration(
+            model_name="gpt-5.5-pro",
+            api_key="test-openai-key",
+            max_output_tokens=4096,
+        ),
+        client=SimpleNamespace(responses=Responses()),
+    )
+
+    class Registry:
+        pricing = ModelPricingCatalog()
+
+        @staticmethod
+        def create(provider_name, *, model_name=None):
+            assert (provider_name, model_name) == ("openai", "gpt-5.5-pro")
+            return provider
+
+    router = ModelRouter(Registry())
+    decision = ReasoningEngine(router).reason(
+        reasoning_request(), policy("openai", "gpt-5.5-pro")
+    )
+
+    assert isinstance(decision, ReasoningDecision)
+    assert decision.model_provenance.provider_used == "openai"
+    assert decision.model_provenance.model_used == "gpt-5.5-pro-2026-04-23"
+    assert decision.model_provenance.model_call_id == "resp-reasoning-1"
+    assert decision.model_provenance.usage.attempted_calls == 1
+    assert decision.model_provenance.usage.input_tokens == 120
+    assert decision.model_provenance.usage.output_tokens == 40
+    assert len(calls) == 1
+    transport = calls[0]["text"]["format"]
+    transport_schema = transport["schema"]
+    assert transport["type"] == "json_schema"
+    assert transport["name"] == "cybercortex_structured_output"
+    assert transport["strict"] is True
+    assert transport_schema["required"] == list(transport_schema["properties"])
+    assert set(canonical_schema["required"]) < set(canonical_schema["properties"])
+    for field in (
+        "evidence_references",
+        "missing_evidence",
+        "recommended_capability",
+        "stop_reason",
+    ):
+        assert field in transport_schema["required"]
+        assert (
+            transport_schema["properties"][field]
+            == canonical_schema["properties"][field]
+        )
+    for field in ("evidence_references", "missing_evidence"):
+        field_schema = transport_schema["properties"][field]
+        assert field_schema["type"] == "array"
+        assert field_schema["default"] == []
+    for field in ("recommended_capability", "stop_reason"):
+        assert {"type": "null"} in transport_schema["properties"][field]["anyOf"]
+    for definition in transport_schema.get("$defs", {}).values():
+        if "properties" in definition:
+            assert definition["required"] == list(definition["properties"])
+    assert canonical_request.model_dump_json() == canonical_before
+    assert "temperature" not in calls[0]
+    assert "tools" not in calls[0]
+
+
+def test_openai_transport_adapts_actual_ranking_candidate_definition():
+    reasoning = reasoning_request(
+        hypothesis("hyp-1"),
+        hypothesis("hyp-2"),
+        task_type=ReasoningTaskType.hypothesis_ranking,
+    )
+    model_request = build_reasoning_model_request(reasoning)
+    canonical_before = model_request.model_dump_json()
+
+    transport = OpenAIProvider._structured_text_config(model_request)["format"]
+
+    schema = transport["schema"]
+    candidate_schema = schema["$defs"]["ReasoningCandidate"]
+    assert transport["strict"] is True
+    assert candidate_schema["required"] == list(candidate_schema["properties"])
+    for field in (
+        "evidence_references",
+        "missing_evidence",
+        "recommended_capability",
+        "stop_reason",
+    ):
+        assert field in candidate_schema["required"]
+    for definition in schema["$defs"].values():
+        if "properties" in definition:
+            assert definition["required"] == list(definition["properties"])
+    assert model_request.model_dump_json() == canonical_before
 
 
 def test_ranking_model_request_carries_strict_candidate_array_schema():

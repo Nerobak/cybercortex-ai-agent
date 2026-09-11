@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
+from itertools import chain
 from typing import Any, Mapping
 
 from pydantic import Field, StrictFloat, StrictStr
@@ -10,6 +12,7 @@ from pydantic import Field, StrictFloat, StrictStr
 from agent_core.models.types import ModelContract
 
 _TOKEN_PRICE_UNIT = Decimal("1000000")
+_DATED_MODEL_SNAPSHOT = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class ModelPrice(ModelContract):
@@ -19,6 +22,19 @@ class ModelPrice(ModelContract):
     model: StrictStr = Field(min_length=1, max_length=255)
     input_per_million_usd: StrictFloat = Field(ge=0.0)
     output_per_million_usd: StrictFloat = Field(ge=0.0)
+
+
+_STANDARD_API_PRICES = (
+    ModelPrice(
+        provider="openai",
+        model="gpt-5.5-pro",
+        input_per_million_usd=30.0,
+        output_per_million_usd=180.0,
+    ),
+)
+_STANDARD_MODEL_ALIASES = {
+    ("openai", "gpt-5.5-pro-2026-04-23"): "gpt-5.5-pro",
+}
 
 
 def normalize_provider_alias(provider: str) -> str:
@@ -34,8 +50,23 @@ def normalize_provider_alias(provider: str) -> str:
     return aliases.get(normalized, normalized)
 
 
+def model_response_matches_route(
+    provider: str, requested_model: str, returned_model: str
+) -> bool:
+    """Match an exact route or OpenAI's dated realization of an alias."""
+
+    if returned_model == requested_model:
+        return True
+    if normalize_provider_alias(provider) != "openai":
+        return False
+    prefix = f"{requested_model}-"
+    if not returned_model.startswith(prefix):
+        return False
+    return _DATED_MODEL_SNAPSHOT.fullmatch(returned_model[len(prefix) :]) is not None
+
+
 class ModelPricingCatalog:
-    """Configuration-backed prices; absent cloud prices remain unknown."""
+    """Standard and configured prices; absent cloud prices remain unknown."""
 
     def __init__(
         self,
@@ -44,7 +75,7 @@ class ModelPricingCatalog:
         model_aliases: Mapping[tuple[str, str], str] | None = None,
     ) -> None:
         self._prices: dict[tuple[str, str], ModelPrice] = {}
-        for price in prices:
+        for price in (*_STANDARD_API_PRICES, *prices):
             key = (
                 normalize_provider_alias(price.provider),
                 price.model.strip().casefold(),
@@ -54,7 +85,9 @@ class ModelPricingCatalog:
             self._prices[key] = price
 
         self._aliases: dict[tuple[str, str], str] = {}
-        for (provider, alias), canonical in (model_aliases or {}).items():
+        for (provider, alias), canonical in chain(
+            _STANDARD_MODEL_ALIASES.items(), (model_aliases or {}).items()
+        ):
             key = (
                 normalize_provider_alias(provider),
                 str(alias).strip().casefold(),

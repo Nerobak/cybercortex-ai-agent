@@ -164,6 +164,22 @@ def test_preferred_provider_success():
     assert response.model_calls_attempted == 1
 
 
+def test_openai_snapshot_model_preserves_routing_accounting_and_provenance():
+    snapshot = "openai-model-2026-04-23"
+    provider = MockProvider("openai", "openai-model", success("openai", snapshot))
+    router = ModelRouter(MockRegistry({("openai", "openai-model"): provider}))
+
+    response = router.route(model_request(), preferred_policy())
+
+    assert response.model == snapshot
+    assert response.requested_model == "openai-model"
+    assert response.fallback_used is False
+    assert response.model_calls_attempted == 1
+    assert len(router.ledger.records) == 1
+    assert router.ledger.records[0].model == snapshot
+    assert router.ledger.usage_for_run("run-router-1").successful_calls == 1
+
+
 def test_fallback_uses_exact_declared_order():
     openai = MockProvider(
         "openai",
@@ -465,6 +481,22 @@ def test_unknown_price_under_strict_cost_budget_fails_closed():
         ModelRouter(registry).route(model_request(), policy)
     assert captured.value.code == ModelErrorCode.unknown_cost
     assert not provider.requests
+
+
+def test_unknown_price_allow_policy_preserves_unknown_cost():
+    provider = MockProvider("openai", "openai-model", success("openai", "openai-model"))
+    registry = MockRegistry({("openai", "openai-model"): provider})
+    policy = preferred_policy(
+        budget=ModelBudgetLimits(
+            max_estimated_cost_usd=10.0,
+            unknown_cost_policy="allow",
+        )
+    )
+
+    response = ModelRouter(registry).route(model_request(), policy)
+
+    assert response.estimated_cost_usd is None
+    assert len(provider.requests) == 1
 
 
 def test_usage_ledger_records_successful_call():
@@ -769,6 +801,34 @@ def test_ollama_zero_api_cost_is_preserved_in_response_and_ledger():
     response = router.route(model_request(), preferred_policy("ollama", "local-model"))
     assert response.estimated_cost_usd == 0.0
     assert router.ledger.records[0].estimated_cost_usd == 0.0
+
+
+def test_gpt_5_5_pro_snapshot_cost_is_accounted_exactly_once():
+    expected_cost = 0.48669
+    provider = MockProvider(
+        "openai",
+        "gpt-5.5-pro",
+        success(
+            "openai",
+            "gpt-5.5-pro-2026-04-23",
+            input_tokens=3887,
+            output_tokens=2056,
+            cost=expected_cost,
+        ),
+    )
+    router = ModelRouter(MockRegistry({("openai", "gpt-5.5-pro"): provider}))
+
+    response = router.route(
+        model_request(max_output_tokens=2056),
+        preferred_policy("openai", "gpt-5.5-pro"),
+    )
+    usage = router.ledger.usage_for_run("run-router-1")
+
+    assert response.model == "gpt-5.5-pro-2026-04-23"
+    assert len(router.ledger.records) == 1
+    assert usage.attempted_calls == 1
+    assert usage.estimated_cost_usd == pytest.approx(expected_cost)
+    assert usage.budget_estimated_cost_usd == pytest.approx(expected_cost)
 
 
 def test_local_only_never_contacts_any_cloud_provider():
