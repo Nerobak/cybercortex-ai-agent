@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -152,12 +153,24 @@ def normalized_openai_response(
     )
 
 
-def normalized_anthropic_response(content: str = "analysis"):
+def normalized_anthropic_response(
+    content: Any = "analysis",
+    *,
+    model: str | None = None,
+    response_id: str = "call-anthropic-1",
+    stop_reason: str = "end_turn",
+    input_tokens: int = 13,
+    output_tokens: int = 5,
+):
     return SimpleNamespace(
-        id="call-anthropic-1",
+        id=response_id,
+        model=model,
         content=[SimpleNamespace(type="text", text=content)],
-        stop_reason="end_turn",
-        usage=SimpleNamespace(input_tokens=13, output_tokens=5),
+        stop_reason=stop_reason,
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        ),
     )
 
 
@@ -333,6 +346,37 @@ def test_gpt_5_5_pro_real_usage_is_priced_from_returned_snapshot():
     assert response.input_tokens == 3887
     assert response.output_tokens == 2056
     assert response.estimated_cost_usd == pytest.approx(0.48669)
+
+
+def test_claude_sonnet_4_6_real_usage_is_priced_without_rewriting_provenance():
+    raw = normalized_anthropic_response(
+        "{}",
+        model="claude-sonnet-4-6",
+        input_tokens=5439,
+        output_tokens=219,
+    )
+    configuration = ProviderConfiguration(
+        model_name="claude-sonnet-4-6",
+        api_key=API_KEY_SENTINEL,
+        timeout_seconds=2.0,
+        max_output_tokens=4096,
+    )
+    provider = AnthropicProvider(
+        configuration,
+        client=anthropic_client(raw),
+    )
+
+    response = provider.generate(
+        request(structured_output=True, max_output_tokens=4096)
+    )
+
+    assert response.model == "claude-sonnet-4-6"
+    assert response.input_tokens == 5439
+    assert response.output_tokens == 219
+    assert response.total_tokens == 5658
+    assert response.estimated_cost_usd == pytest.approx(0.019602)
+    assert provider.telemetry[-1].model == "claude-sonnet-4-6"
+    assert provider.telemetry[-1].estimated_cost_usd == pytest.approx(0.019602)
 
 
 def test_openai_rejects_a_returned_model_outside_the_configured_alias():
@@ -568,11 +612,25 @@ def test_openai_output_limit_uses_the_request_and_configuration_minimum():
 def test_anthropic_response_normalization_and_no_tools():
     client = anthropic_client(normalized_anthropic_response())
     response = AnthropicProvider(anthropic_config(), client=client).generate(request())
+    assert len(client.create_spy.calls) == 1
     assert response.provider == "anthropic"
+    assert response.model == "anthropic-test-model"
     assert response.content == "analysis"
     assert response.finish_reason == "end_turn"
     assert response.provider_call_id == "call-anthropic-1"
-    assert "tools" not in client.create_spy.calls[0]
+    call = client.create_spy.calls[0]
+    assert call["model"] == "anthropic-test-model"
+    assert call["system"] == request().system_instructions
+    assert call["messages"] == [
+        {"role": "user", "content": AnthropicProvider.user_prompt(request())}
+    ]
+    assert call["max_tokens"] == 200
+    assert call["temperature"] == 0.0
+    assert call["timeout"] == 2.0
+    assert "output_config" not in call
+    assert "tools" not in call
+    assert "tool_choice" not in call
+    assert "thinking" not in call
 
 
 def test_ollama_response_normalization_and_no_tools():
@@ -692,19 +750,235 @@ def test_ollama_ignores_thinking_and_keeps_message_content_authoritative():
     assert len(client.calls) == 1
 
 
-def test_unsupported_anthropic_structured_output_fails_before_transport():
-    client = anthropic_client(normalized_anthropic_response())
+def test_anthropic_generic_structured_output_uses_native_format_once():
+    client = anthropic_client(normalized_anthropic_response("{}"))
+    provider = AnthropicProvider(anthropic_config(), client=client)
+
+    response = provider.generate(request(structured_output=True))
+
+    assert response.content == "{}"
+    assert len(client.create_spy.calls) == 1
+    call = client.create_spy.calls[0]
+    assert call["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        }
+    }
+    assert "temperature" not in call
+    assert "tools" not in call
+    assert "tool_choice" not in call
+    assert "thinking" not in call
+    event = provider.telemetry[-1]
+    assert event.attempt_state == "provider_call_succeeded"
+    assert event.usage_known is True
+    assert event.total_tokens == 18
+
+
+def test_anthropic_schema_transport_is_compatible_strict_and_immutable():
+    schema = {
+        "type": "object",
+        "properties": {
+            "result": {
+                "type": "string",
+                "description": "Bounded result.",
+                "minLength": 1,
+                "maxLength": 20,
+            },
+            "score": {"type": "integer", "minimum": 0, "maximum": 100},
+            "status": {"type": "string", "enum": ["ok", "blocked"]},
+            "detail": {
+                "anyOf": [
+                    {"type": "string", "maxLength": 50},
+                    {"type": "null"},
+                ]
+            },
+            "references": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 3,
+            },
+        },
+        "required": ["result", "score", "status", "detail", "references"],
+        "additionalProperties": False,
+    }
+    supplied = json.loads(json.dumps(schema))
+    model_request = request(
+        structured_output=True,
+        structured_output_schema=schema,
+        max_output_tokens=800,
+    )
+    canonical_before = model_request.model_dump_json()
+    canonical_schema = json.loads(canonical_before)["structured_output_schema"]
+    content = json.dumps(
+        {
+            "result": "complete",
+            "score": 100,
+            "status": "ok",
+            "detail": None,
+            "references": ["ev-1", "ev-2"],
+        }
+    )
+    client = anthropic_client(
+        normalized_anthropic_response(content, model="anthropic-test-model")
+    )
+
+    response = AnthropicProvider(anthropic_config(), client=client).generate(
+        model_request
+    )
+
+    assert response.content == content
+    assert len(client.create_spy.calls) == 1
+    call = client.create_spy.calls[0]
+    assert call["max_tokens"] == 500
+    assert "temperature" not in call
+    assert "tools" not in call
+    assert "tool_choice" not in call
+    assert "thinking" not in call
+    output_format = call["output_config"]["format"]
+    assert set(output_format) == {"type", "schema"}
+    assert output_format["type"] == "json_schema"
+    transport = output_format["schema"]
+    assert list(transport["properties"]) == list(canonical_schema["properties"])
+    assert transport["required"] == canonical_schema["required"]
+    assert transport["additionalProperties"] is False
+    assert transport["properties"]["status"] == canonical_schema["properties"]["status"]
+    assert transport["properties"]["detail"]["anyOf"][1] == {"type": "null"}
+    assert "minLength" not in transport["properties"]["result"]
+    assert "maxLength" not in transport["properties"]["result"]
+    assert '"maxLength":20' in transport["properties"]["result"]["description"]
+    assert '"minLength":1' in transport["properties"]["result"]["description"]
+    assert "minimum" not in transport["properties"]["score"]
+    assert "maximum" not in transport["properties"]["score"]
+    assert '"maximum":100' in transport["properties"]["score"]["description"]
+    assert '"minimum":0' in transport["properties"]["score"]["description"]
+    references = transport["properties"]["references"]
+    assert "minItems" not in references
+    assert "maxItems" not in references
+    assert '"maxItems":3' in references["description"]
+    assert '"minItems":2' in references["description"]
+    assert schema == supplied
+    assert model_request.structured_output_schema == supplied
+    assert model_request.model_dump_json() == canonical_before
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, "", "   ", "not-json", "```json\n{}\n```", "{} trailing", "NaN"],
+)
+def test_anthropic_invalid_structured_output_fails_closed_once_without_repair(
+    content,
+):
+    client = anthropic_client(normalized_anthropic_response(content))
     provider = AnthropicProvider(anthropic_config(), client=client)
 
     with pytest.raises(ModelProviderError) as captured:
         provider.generate(request(structured_output=True))
 
-    assert captured.value.code == ModelErrorCode.provider_unavailable
+    assert captured.value.code == ModelErrorCode.invalid_response
+    assert len(client.create_spy.calls) == 1
+    assert len(provider.telemetry) == 1
+    assert provider.telemetry[0].success is False
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(
+            id="call-empty",
+            content=[],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        ),
+        SimpleNamespace(
+            id="call-multiple",
+            content=[
+                SimpleNamespace(type="text", text="{}"),
+                SimpleNamespace(type="text", text="{}"),
+            ],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        ),
+        SimpleNamespace(
+            id="call-thinking",
+            content=[
+                SimpleNamespace(type="thinking", thinking="private reasoning"),
+                SimpleNamespace(type="text", text="{}"),
+            ],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        ),
+        normalized_anthropic_response("{}", stop_reason="max_tokens"),
+        normalized_anthropic_response("{}", stop_reason="refusal"),
+    ],
+)
+def test_anthropic_structured_output_rejects_undocumented_or_incomplete_shapes(
+    response,
+):
+    client = anthropic_client(response)
+    provider = AnthropicProvider(anthropic_config(), client=client)
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(request(structured_output=True))
+
+    assert captured.value.code == ModelErrorCode.invalid_response
+    assert len(client.create_spy.calls) == 1
+    assert "private reasoning" not in provider.telemetry[0].model_dump_json()
+
+
+def test_anthropic_incompatible_schema_fails_closed_before_transport():
+    client = anthropic_client(normalized_anthropic_response("{}"))
+    provider = AnthropicProvider(anthropic_config(), client=client)
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(
+            request(
+                structured_output=True,
+                structured_output_schema={
+                    "type": "object",
+                    "properties": {"result": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+            )
+        )
+
+    assert captured.value.code == ModelErrorCode.configuration_error
     assert client.create_spy.calls == []
-    event = provider.telemetry[-1]
-    assert event.attempt_state == "blocked_before_provider_call"
-    assert event.usage_known is True
-    assert event.total_tokens == 0
+
+
+def test_anthropic_structured_response_preserves_usage_model_and_safe_provenance():
+    content = json.dumps({"result": API_KEY_SENTINEL})
+    raw = normalized_anthropic_response(
+        content,
+        model="claude-sonnet-4-6",
+        response_id=f"call-{API_KEY_SENTINEL}",
+        input_tokens=21,
+        output_tokens=8,
+    )
+    configuration = anthropic_config().model_copy(
+        update={"model_name": "claude-sonnet-4-6"}
+    )
+    provider = AnthropicProvider(configuration, client=anthropic_client(raw))
+
+    response = provider.generate(request(structured_output=True))
+
+    assert response.model == "claude-sonnet-4-6"
+    assert (response.input_tokens, response.output_tokens, response.total_tokens) == (
+        21,
+        8,
+        29,
+    )
+    assert len(provider.telemetry) == 1
+    assert provider.telemetry[0].total_tokens == 29
+    serialized = response.model_dump_json()
+    assert API_KEY_SENTINEL not in serialized
+    assert API_KEY_SENTINEL not in provider.telemetry[0].model_dump_json()
+    assert response.metadata == {}
 
 
 def test_missing_openai_key_marks_only_that_provider_unavailable():
@@ -795,6 +1069,38 @@ def test_openai_http_error_normalization_is_truthful_and_public_safe(
 
     with pytest.raises(ModelProviderError) as captured:
         provider.generate(request())
+
+    assert captured.value.code == expected
+    assert API_KEY_SENTINEL not in str(captured.value)
+    assert API_KEY_SENTINEL not in json.dumps(captured.value.public_dict())
+    assert API_KEY_SENTINEL not in provider.telemetry[-1].model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (401, ModelErrorCode.authentication_failed),
+        (403, ModelErrorCode.provider_unavailable),
+        (404, ModelErrorCode.provider_unavailable),
+        (400, ModelErrorCode.configuration_error),
+        (422, ModelErrorCode.configuration_error),
+    ],
+)
+def test_anthropic_http_error_normalization_is_truthful_and_public_safe(
+    status_code, expected
+):
+    provider_error = type(
+        "ProviderHTTPError",
+        (RuntimeError,),
+        {"status_code": status_code},
+    )
+    provider = AnthropicProvider(
+        anthropic_config(),
+        client=anthropic_client(error=provider_error(API_KEY_SENTINEL)),
+    )
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(request(structured_output=True))
 
     assert captured.value.code == expected
     assert API_KEY_SENTINEL not in str(captured.value)
@@ -925,6 +1231,60 @@ def test_gpt_5_5_pro_standard_api_pricing_is_exact_and_snapshot_scoped():
             output_tokens=2056,
         )
         is None
+    )
+
+
+def test_claude_sonnet_4_6_standard_global_pricing_is_exact_and_model_scoped():
+    catalog = ModelPricingCatalog()
+    prices = catalog.fingerprint_configuration()["prices"]
+
+    assert {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "input_per_million_usd": 3.0,
+        "output_per_million_usd": 15.0,
+    } in prices
+    assert catalog.estimate_cost(
+        "anthropic",
+        "claude-sonnet-4-6",
+        input_tokens=1_000_000,
+        output_tokens=0,
+    ) == pytest.approx(3.0)
+    assert catalog.estimate_cost(
+        "anthropic",
+        "claude-sonnet-4-6",
+        input_tokens=0,
+        output_tokens=1_000_000,
+    ) == pytest.approx(15.0)
+    assert catalog.estimate_cost(
+        "anthropic",
+        "claude-sonnet-4-6",
+        input_tokens=5439,
+        output_tokens=219,
+    ) == pytest.approx(0.019602)
+    assert (
+        catalog.estimate_cost(
+            "anthropic",
+            "claude-sonnet-4-6-experimental",
+            input_tokens=5439,
+            output_tokens=219,
+        )
+        is None
+    )
+    assert catalog.estimate_cost(
+        "openai",
+        "gpt-5.5-pro",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+    ) == pytest.approx(210.0)
+    assert (
+        catalog.estimate_cost(
+            "ollama",
+            "claude-sonnet-4-6",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+        )
+        == 0.0
     )
 
 

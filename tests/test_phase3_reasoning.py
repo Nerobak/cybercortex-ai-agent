@@ -14,6 +14,7 @@ from pydantic import ValidationError
 import agent_core.reasoning.engine as reasoning_engine_module
 import agent_core.reasoning.validation as reasoning_validation_module
 from agent_core.models import (
+    AnthropicProvider,
     ModelAttemptOutcome,
     ModelCallLedger,
     ModelErrorCode,
@@ -836,6 +837,101 @@ def test_openai_responses_adapts_reasoning_schema_and_preserves_strict_parser():
     assert canonical_request.model_dump_json() == canonical_before
     assert "temperature" not in calls[0]
     assert "tools" not in calls[0]
+
+
+def test_anthropic_native_structured_reasoning_preserves_p3_3_boundaries():
+    calls = []
+    content = json.dumps(candidate())
+    canonical_request = build_reasoning_model_request(reasoning_request())
+    canonical_schema = json.loads(canonical_request.model_dump_json())[
+        "structured_output_schema"
+    ]
+    canonical_before = canonical_request.model_dump_json()
+
+    class Messages:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                id="msg-reasoning-anthropic-1",
+                model="claude-sonnet-4-6",
+                content=[SimpleNamespace(type="text", text=content)],
+                stop_reason="end_turn",
+                usage=SimpleNamespace(input_tokens=130, output_tokens=45),
+            )
+
+    provider = AnthropicProvider(
+        ProviderConfiguration(
+            model_name="claude-sonnet-4-6",
+            api_key="test-anthropic-key",
+            max_output_tokens=4096,
+        ),
+        client=SimpleNamespace(messages=Messages()),
+    )
+
+    class Registry:
+        pricing = ModelPricingCatalog()
+
+        @staticmethod
+        def create(provider_name, *, model_name=None):
+            assert (provider_name, model_name) == (
+                "anthropic",
+                "claude-sonnet-4-6",
+            )
+            return provider
+
+    routing_policy = ModelRoutingPolicy(
+        mode=RoutingMode.cloud_only,
+        preferred=ModelRoute(
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        ),
+        allowed_cloud_providers=("anthropic",),
+    )
+    router = ModelRouter(Registry())
+
+    decision = ReasoningEngine(router).reason(reasoning_request(), routing_policy)
+
+    assert isinstance(decision, ReasoningDecision)
+    assert decision.model_provenance.provider_requested == "anthropic"
+    assert decision.model_provenance.requested_model == "claude-sonnet-4-6"
+    assert decision.model_provenance.provider_used == "anthropic"
+    assert decision.model_provenance.model_used == "claude-sonnet-4-6"
+    assert decision.model_provenance.model_call_id == "msg-reasoning-anthropic-1"
+    assert decision.model_provenance.fallback_used is False
+    assert decision.model_provenance.usage.attempted_calls == 1
+    assert decision.model_provenance.usage.successful_calls == 1
+    assert decision.model_provenance.usage.input_tokens == 130
+    assert decision.model_provenance.usage.output_tokens == 45
+    assert len(router.ledger.records) == 1
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["model"] == "claude-sonnet-4-6"
+    assert call["max_tokens"] == 4096
+    assert "temperature" not in call
+    assert "tools" not in call
+    assert "tool_choice" not in call
+    assert "thinking" not in call
+    transport = call["output_config"]["format"]
+    assert set(transport) == {"type", "schema"}
+    assert transport["type"] == "json_schema"
+    transport_schema = transport["schema"]
+    assert transport_schema["required"] == canonical_schema["required"]
+    assert transport_schema["additionalProperties"] is False
+    assert (
+        transport_schema["properties"]["action"]
+        == canonical_schema["properties"]["action"]
+    )
+    recommended = transport_schema["properties"]["recommended_capability"]
+    assert [branch["type"] for branch in recommended["anyOf"]] == ["string", "null"]
+    assert "maxLength" not in recommended["anyOf"][0]
+    assert '"maxLength":100' in recommended["anyOf"][0]["description"]
+    assert "minimum" not in transport_schema["properties"]["priority"]
+    assert "maximum" not in transport_schema["properties"]["priority"]
+    assert '"maximum":100' in transport_schema["properties"]["priority"]["description"]
+    assert '"minimum":0' in transport_schema["properties"]["priority"]["description"]
+    assert canonical_request.model_dump_json() == canonical_before
+    assert parse_reasoning_candidate(content).model_dump(mode="json") == candidate()
 
 
 def test_openai_transport_adapts_actual_ranking_candidate_definition():

@@ -3043,3 +3043,76 @@ standard API estimate of approximately $0.48669. This task did not perform a new
 paid provider call.
 
 No provider, routing, or execution semantics changed.
+
+## POST-FREEZE ANTHROPIC STRUCTURED OUTPUT INTEGRATION
+
+Integration date: 2026-09-12
+
+The immutable `phase3-freeze` tag remains at commit `e64af48`. This is post-freeze
+provider transport work and does not revise Phase 3 core, Phase 2 authority, model
+routing, accounting, consensus, evaluation, autonomy, credential, or provenance
+boundaries.
+
+Previously observed live validation recorded a direct Claude Sonnet 4.6 API smoke
+test **PASS**, a CyberCortex `AnthropicProvider` smoke test **PASS**, and a
+CyberCortex `ModelRouter` `cloud_only` Anthropic smoke test **PASS**. The observed
+provider route was `anthropic` / `claude-sonnet-4-6`, with `end_turn`, normalized
+input/output usage, a provider call ID, and no fallback. Real Anthropic P3-3
+structured reasoning has now also passed with Claude Sonnet 4.6.
+
+`AnthropicProvider` now advertises structured-output support and uses exactly one
+`client.messages.create(...)` call with native
+`output_config.format.type="json_schema"`. Plain requests preserve the prior
+Messages payload and text-block behavior. Structured requests omit the unsupported
+Anthropic sampling `temperature` field while leaving the provider-neutral
+`ModelRequest` unchanged. The effective output ceiling remains the smaller of the
+request and provider configuration limits. Thinking is omitted, no tools or
+function calling are supplied, and no execution authority exists.
+
+The provider-neutral `structured_output_schema` remains authoritative and
+immutable. At the Anthropic transport boundary only, the provider makes a deep copy.
+Anthropic-supported field names, types, enums, nullability, required fields, array
+item semantics, object closure, references, defaults, and descriptions are
+preserved. Numeric, string-length, and unsupported array bounds from the canonical
+reasoning schema are represented exactly in transport-only descriptions because the
+Anthropic grammar does not accept those keywords. The original bounds remain in the
+unchanged canonical schema and are enforced by the unchanged strict
+`ReasoningCandidate` parser and semantic validator. Incompatible object, reference,
+enum, or composition semantics fail closed before provider transport rather than
+being weakened.
+
+Native structured output is accepted only from the documented single text content
+block with `stop_reason="end_turn"` and valid JSON. Only that sanitized advisory JSON
+string enters `ModelResponse.content`. Empty, malformed, fenced, incomplete,
+refusal, multi-block, or thinking-bearing responses fail closed. There is no output
+repair, Markdown stripping, schema-field reconstruction, malformed-output retry, or
+second provider call, and no raw block, private prompt, evidence, provider exception,
+hidden reasoning, or chain-of-thought is persisted.
+
+Returned Anthropic model identity is preferred when present, with the configured
+model retained as the compatibility fallback. Provider, task, run, hypothesis,
+response ID, fallback state, and normalized token usage continue through existing
+public-safe provenance. Provider-start reservation, failed-start retention,
+successful reconciliation, one ledger record per call, and fallback/consensus/
+autonomy/evaluation shared-budget rules are unchanged. `local_only` still blocks
+Anthropic; `cloud_only` still requires the explicit Anthropic allowlist; fallback and
+maximum-attempt controls are unchanged. OpenAI and Ollama behavior are unchanged.
+
+The existing advisory consensus engine can include this structured Anthropic route
+under its shared model budgets and one-record-per-call accounting. Anthropic advice
+has no execution authority, and consensus output remains subject to the mandatory
+P3-4 decision gate and Phase 2 verification runtime.
+
+## ANTHROPIC PRICING ACCOUNTING
+
+Post-freeze accounting support adds Claude Sonnet 4.6 standard global API pricing
+at $3/M input tokens and $15/M output tokens. Batch, US-only inference,
+prompt-cache write, and cache-hit pricing are not applied because the existing
+request and accounting models report only aggregate input and output tokens.
+
+The real P3-3 model returned `claude-sonnet-4-6`. Observed real usage was 5,439
+input tokens and 219 output tokens, producing an expected standard API estimate of
+$0.019602. Real Anthropic P3-3 structured reasoning is **PASS**.
+
+No routing, execution, or accounting semantics changed. The immutable
+`phase3-freeze` tag remains unchanged at commit `e64af48`.

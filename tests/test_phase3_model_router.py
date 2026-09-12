@@ -831,6 +831,87 @@ def test_gpt_5_5_pro_snapshot_cost_is_accounted_exactly_once():
     assert usage.budget_estimated_cost_usd == pytest.approx(expected_cost)
 
 
+def test_claude_sonnet_4_6_cost_is_accounted_exactly_once():
+    expected_cost = 0.019602
+    provider = MockProvider(
+        "anthropic",
+        "claude-sonnet-4-6",
+        success(
+            "anthropic",
+            "claude-sonnet-4-6",
+            input_tokens=5439,
+            output_tokens=219,
+            cost=expected_cost,
+        ),
+    )
+    router = ModelRouter(MockRegistry({("anthropic", "claude-sonnet-4-6"): provider}))
+
+    response = router.route(
+        model_request(max_output_tokens=4096),
+        preferred_policy("anthropic", "claude-sonnet-4-6"),
+    )
+    usage = router.ledger.usage_for_run("run-router-1")
+
+    assert response.model == "claude-sonnet-4-6"
+    assert len(provider.requests) == 1
+    assert len(router.ledger.records) == 1
+    assert usage.attempted_calls == usage.successful_calls == 1
+    assert usage.estimated_cost_usd == pytest.approx(expected_cost)
+    assert usage.budget_estimated_cost_usd == pytest.approx(expected_cost)
+
+
+def test_unknown_anthropic_price_allow_policy_preserves_unknown_cost():
+    provider = MockProvider(
+        "anthropic",
+        "claude-unknown-model",
+        success("anthropic", "claude-unknown-model"),
+    )
+    router = ModelRouter(
+        MockRegistry({("anthropic", "claude-unknown-model"): provider})
+    )
+    policy = preferred_policy(
+        "anthropic",
+        "claude-unknown-model",
+        budget=ModelBudgetLimits(
+            max_estimated_cost_usd=10.0,
+            unknown_cost_policy="allow",
+        ),
+    )
+
+    response = router.route(model_request(), policy)
+
+    assert response.estimated_cost_usd is None
+    assert len(provider.requests) == 1
+    assert len(router.ledger.records) == 1
+    assert router.ledger.usage_for_run("run-router-1").estimated_cost_usd is None
+
+
+def test_unknown_anthropic_price_deny_policy_still_fails_before_provider_call():
+    provider = MockProvider(
+        "anthropic",
+        "claude-unknown-model",
+        success("anthropic", "claude-unknown-model"),
+    )
+    router = ModelRouter(
+        MockRegistry({("anthropic", "claude-unknown-model"): provider})
+    )
+    policy = preferred_policy(
+        "anthropic",
+        "claude-unknown-model",
+        budget=ModelBudgetLimits(
+            max_estimated_cost_usd=10.0,
+            unknown_cost_policy="deny",
+        ),
+    )
+
+    with pytest.raises(ModelRoutingError) as captured:
+        router.route(model_request(), policy)
+
+    assert captured.value.code == ModelErrorCode.unknown_cost
+    assert provider.requests == []
+    assert router.ledger.records == ()
+
+
 def test_local_only_never_contacts_any_cloud_provider():
     ollama = MockProvider(
         "ollama", "local-model", success("ollama", "local-model", cost=0.0)

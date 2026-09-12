@@ -82,7 +82,7 @@ Supported adapters are:
 - `openai`: optional OpenAI SDK, environment/configuration API key, normalized
   Responses API text output, and native structured JSON/JSON Schema output.
 - `anthropic`: optional Anthropic SDK, environment/configuration API key,
-  normalized message output.
+  normalized Messages API text output, and native structured JSON Schema output.
 - `ollama`: HTTP adapter, default loopback origin, configurable model, and
   support for DeepSeek or any other Ollama chat model. When a request explicitly
   requires structured output, the adapter sends either Ollama's native top-level
@@ -101,9 +101,29 @@ schema requests pass the exact canonical provider-neutral schema through
 `text.format` with strict native enforcement. The adapter does not add tools,
 output repair, Markdown stripping, malformed-output retries, or a second call.
 It disables provider-side response storage and retains only normalized public-safe
-response fields. Anthropic still does not declare provider-native structured-output
-support and therefore fails those requests before transport as
-`provider_unavailable`.
+response fields.
+
+The Anthropic adapter uses one `messages.create(...)` call. Plain requests retain
+their existing Messages payload and text-block normalization. Structured requests
+use `output_config.format` with `type: "json_schema"`; a supplied canonical schema
+is deep-copied before any transport-only compatibility adaptation and is never
+mutated. Anthropic does not natively support the numeric, string-length, and most
+array bounds present in the strict `ReasoningCandidate` schema, so those constraints
+are removed only from the provider transport copy and recorded exactly in transport
+descriptions. The unchanged canonical schema and strict reasoning parser remain
+authoritative downstream. Schema objects must remain closed with
+`additionalProperties: false`; an incompatible schema fails closed before provider
+transport. Schema-less structured requests use a closed empty-object schema, the
+only generic object contract exposed by this adapter.
+
+Anthropic structured responses accept only one documented text content block, a
+normal `end_turn`, and valid JSON. Empty, incomplete, refusal, multi-block, thinking,
+or malformed output fails closed without Markdown stripping, repair, retry, field
+synthesis, or another provider call. Structured mode deterministically omits the
+unsupported `temperature` provider parameter without changing the provider-neutral
+request. Thinking remains omitted, and the adapter sends no tools or tool choice.
+Returned model identity, response ID, input/output usage, and correlation fields are
+normalized into the existing public-safe response and accounting paths.
 
 OpenAI responses preserve a returned dated model snapshot, while validating that
 it is either the configured route or that route's `YYYY-MM-DD` realization.

@@ -26,6 +26,12 @@ class ModelPrice(ModelContract):
 
 _STANDARD_API_PRICES = (
     ModelPrice(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_per_million_usd=3.0,
+        output_per_million_usd=15.0,
+    ),
+    ModelPrice(
         provider="openai",
         model="gpt-5.5-pro",
         input_per_million_usd=30.0,
