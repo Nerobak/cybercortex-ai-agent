@@ -239,6 +239,115 @@ class ScriptedReasoningEngine:
         return outcome
 
 
+def routed_advice(decision_id: str) -> dict[str, Any]:
+    return {
+        "decision_id": decision_id,
+        "hypothesis_id": "hyp-1",
+        "action": "recommend_verification",
+        "recommended_capability": "bola",
+        "priority": 80,
+        "confidence": "high",
+        "rationale": "The supplied evidence supports bounded verification.",
+        "evidence_references": ["ev-hyp-1"],
+        "missing_evidence": [],
+        "expected_information_gain": "high",
+        "estimated_request_cost": 2,
+        "stop_reason": None,
+    }
+
+
+class RoutedConsensusProvider:
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        *outcomes: Any,
+        actual_model: str | None = None,
+        input_tokens: int = 4,
+        output_tokens: int = 1,
+        cost: float | None = None,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.actual_model = actual_model or model
+        self.outcomes = outcomes
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cost = cost
+        self.calls = 0
+
+    def generate(self, request):
+        outcome = self.outcomes[self.calls]
+        self.calls += 1
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return ModelResponse(
+            provider=self.provider,
+            model=self.actual_model,
+            content=json.dumps(outcome),
+            finish_reason="stop",
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            total_tokens=self.input_tokens + self.output_tokens,
+            estimated_cost_usd=self.cost,
+            latency_seconds=0.01,
+            task_type=request.task_type,
+            run_id=request.run_id,
+            hypothesis_id=request.hypothesis_id,
+        )
+
+
+class RoutedConsensusRegistry:
+    def __init__(
+        self,
+        providers: dict[tuple[str, str], RoutedConsensusProvider],
+    ) -> None:
+        self.providers = providers
+        self.pricing = ModelPricingCatalog()
+
+    def create(self, provider: str, *, model_name: str | None = None):
+        return self.providers[(provider, str(model_name))]
+
+
+def isolated_participant(
+    participant_id: str,
+    provider: str,
+    model: str,
+    budget: ModelBudgetLimits,
+    *,
+    fallbacks: tuple[tuple[str, str], ...] = (),
+) -> ConsensusParticipant:
+    routes = ((provider, model), *fallbacks)
+    cloud = tuple(
+        dict.fromkeys(
+            item_provider for item_provider, _ in routes if item_provider != "ollama"
+        )
+    )
+    return ConsensusParticipant(
+        participant_id=participant_id,
+        routing_policy=ModelRoutingPolicy(
+            mode=(
+                RoutingMode.fallback_chain
+                if fallbacks
+                else (
+                    RoutingMode.local_only
+                    if provider == "ollama"
+                    else RoutingMode.preferred
+                )
+            ),
+            preferred=ModelRoute(provider=provider, model=model),
+            fallbacks=tuple(
+                ModelRoute(provider=item_provider, model=item_model)
+                for item_provider, item_model in fallbacks
+            ),
+            fallback_allowed=bool(fallbacks),
+            max_provider_attempts=len(routes),
+            allowed_cloud_providers=cloud,
+            budget=budget,
+        ),
+    )
+
+
 def consensus_request(
     participants: tuple[ConsensusParticipant, ...] = (GPT, CLAUDE, LOCAL),
     *,
@@ -564,6 +673,176 @@ def test_actual_fallback_provider_provenance_is_preserved():
     assert gpt.decision.model_provenance.fallback_used is True
 
 
+def test_exact_configured_actual_model_provenance_is_accepted():
+    exact = participant("openai-exact", "openai", "gpt-5.5-pro")
+    request = consensus_request((exact,))
+    result, _, _ = evaluate(
+        {("openai", "gpt-5.5-pro"): model_decision(exact)},
+        request=request,
+    )
+
+    outcome = result.participants[0]
+    assert outcome.status is ParticipantStatus.valid
+    assert outcome.configured_model == "gpt-5.5-pro"
+    assert outcome.actual_model == "gpt-5.5-pro"
+
+
+def test_openai_dated_snapshot_is_accepted_and_actual_provenance_is_preserved():
+    openai = participant("openai-snapshot", "openai", "gpt-5.5-pro")
+    snapshot = "gpt-5.5-pro-2026-04-23"
+    request = consensus_request((openai,))
+    result, _, _ = evaluate(
+        {
+            ("openai", "gpt-5.5-pro"): model_decision(
+                openai,
+                actual_model=snapshot,
+            )
+        },
+        request=request,
+    )
+
+    outcome = result.participants[0]
+    assert outcome.status is ParticipantStatus.valid
+    assert outcome.configured_model == "gpt-5.5-pro"
+    assert outcome.actual_model == snapshot
+    assert outcome.decision.model_provenance.model_used == snapshot
+
+
+@pytest.mark.parametrize(
+    "actual_model",
+    [
+        "gpt-5.5",
+        "gpt-5.5-mini",
+        "gpt-5.5-pro-unrelated",
+        "gpt-5.6-sol",
+        "gpt-6-astra",
+        "anthropic/claude-sonnet-4-6",
+        "ollama/deepseek-r1:32b",
+    ],
+)
+def test_openai_unrelated_or_similar_model_provenance_is_rejected(actual_model):
+    openai = participant("openai-invalid-model", "openai", "gpt-5.5-pro")
+    request = consensus_request((openai,))
+    result, _, _ = evaluate(
+        {
+            ("openai", "gpt-5.5-pro"): model_decision(
+                openai,
+                actual_model=actual_model,
+            )
+        },
+        request=request,
+    )
+
+    assert result.participants[0].status is ParticipantStatus.invalid
+    assert result.participants[0].failure is ParticipantFailure.invalid_decision
+
+
+def test_cross_provider_model_provenance_is_rejected():
+    openai = participant("openai-wrong-provider", "openai", "gpt-5.5-pro")
+    request = consensus_request((openai,))
+    result, _, _ = evaluate(
+        {
+            ("openai", "gpt-5.5-pro"): model_decision(
+                openai,
+                actual_provider="anthropic",
+                actual_model="gpt-5.5-pro-2026-04-23",
+            )
+        },
+        request=request,
+    )
+
+    assert result.participants[0].status is ParticipantStatus.invalid
+    assert result.participants[0].failure is ParticipantFailure.invalid_decision
+
+
+def test_authorized_openai_fallback_snapshot_is_accepted():
+    fallback = ConsensusParticipant(
+        participant_id="openai-snapshot-fallback",
+        routing_policy=ModelRoutingPolicy(
+            mode=RoutingMode.fallback_chain,
+            preferred=ModelRoute(provider="anthropic", model="claude-sonnet-4-6"),
+            fallbacks=(ModelRoute(provider="openai", model="gpt-5.5-pro"),),
+            fallback_allowed=True,
+            max_provider_attempts=2,
+            allowed_cloud_providers=("anthropic", "openai"),
+            budget=ModelBudgetLimits(max_model_calls=20),
+        ),
+    )
+    snapshot = "gpt-5.5-pro-2026-04-23"
+    request = consensus_request((fallback,))
+    result, _, _ = evaluate(
+        {
+            ("anthropic", "claude-sonnet-4-6"): model_decision(
+                fallback,
+                actual_provider="openai",
+                actual_model=snapshot,
+                fallback=True,
+            )
+        },
+        request=request,
+    )
+
+    outcome = result.participants[0]
+    assert outcome.status is ParticipantStatus.valid
+    assert outcome.configured_model == "claude-sonnet-4-6"
+    assert (outcome.actual_provider, outcome.actual_model) == ("openai", snapshot)
+
+
+def test_unconfigured_fallback_model_provenance_is_rejected():
+    request = consensus_request((FALLBACK_GPT,))
+    result, _, _ = evaluate(
+        {
+            ("openai", "gpt-test"): model_decision(
+                FALLBACK_GPT,
+                actual_provider="anthropic",
+                actual_model="claude-sonnet-4-6",
+                fallback=True,
+            )
+        },
+        request=request,
+    )
+
+    assert result.participants[0].status is ParticipantStatus.invalid
+    assert result.participants[0].failure is ParticipantFailure.invalid_decision
+
+
+def test_real_three_provider_model_provenance_fixture_is_admitted():
+    real_participants = (
+        participant("real-ollama", "ollama", "deepseek-r1:32b"),
+        participant("real-openai", "openai", "gpt-5.5-pro"),
+        participant("real-anthropic", "anthropic", "claude-sonnet-4-6"),
+    )
+    actual_models = {
+        "real-ollama": "deepseek-r1:32b",
+        "real-openai": "gpt-5.5-pro-2026-04-23",
+        "real-anthropic": "claude-sonnet-4-6",
+    }
+    outcomes = {
+        (
+            item.routing_policy.preferred.provider,
+            item.routing_policy.preferred.model,
+        ): model_decision(item, actual_model=actual_models[item.participant_id])
+        for item in real_participants
+    }
+    result, _, _ = evaluate(
+        outcomes,
+        request=consensus_request(real_participants),
+    )
+
+    assert all(item.status is ParticipantStatus.valid for item in result.participants)
+    assert {
+        item.participant_id: (item.configured_model, item.actual_model)
+        for item in result.participants
+    } == {
+        "real-ollama": ("deepseek-r1:32b", "deepseek-r1:32b"),
+        "real-openai": ("gpt-5.5-pro", "gpt-5.5-pro-2026-04-23"),
+        "real-anthropic": ("claude-sonnet-4-6", "claude-sonnet-4-6"),
+    }
+    assert result.decision.agreement_type is AgreementType.unanimous
+    assert result.decision.model_usage.total_tokens == 45
+    assert not hasattr(result.decision, "execute")
+
+
 def test_model_usage_is_aggregated():
     result, _, _ = evaluate(unanimous_outcomes())
     assert result.decision.model_usage.attempted_calls == 3
@@ -582,6 +861,316 @@ def test_tokens_are_aggregated():
         result.decision.model_usage.output_tokens,
         result.decision.model_usage.total_tokens,
     ) == (30, 15, 45)
+
+
+def test_real_three_participant_budgets_are_isolated_with_shared_run_ledger():
+    reasoning_request = canonical_reasoning_request()
+    model_request = build_reasoning_model_request(
+        reasoning_request, max_output_tokens=1
+    )
+    input_estimate = ModelRouter._conservative_input_token_estimate(model_request)
+    pricing = ModelPricingCatalog()
+    routes = (
+        ("anthropic", "claude-sonnet-4-6", "claude-sonnet-4-6"),
+        ("ollama", "deepseek-r1:32b", "deepseek-r1:32b"),
+        ("openai", "gpt-5.5-pro", "gpt-5.5-pro-2026-04-23"),
+    )
+    participants = []
+    providers = {}
+    for provider, model, actual_model in routes:
+        predicted_cost = pricing.estimate_cost(
+            provider,
+            model,
+            input_tokens=input_estimate,
+            output_tokens=1,
+        )
+        assert predicted_cost is not None
+        participants.append(
+            isolated_participant(
+                provider,
+                provider,
+                model,
+                ModelBudgetLimits(
+                    max_model_calls=1,
+                    max_input_tokens=input_estimate,
+                    max_output_tokens=1,
+                    max_total_tokens=input_estimate + 1,
+                    max_estimated_cost_usd=predicted_cost,
+                    max_per_call_cost_usd=predicted_cost,
+                ),
+            )
+        )
+        providers[(provider, model)] = RoutedConsensusProvider(
+            provider,
+            model,
+            routed_advice(f"decision-{provider}"),
+            actual_model=actual_model,
+            input_tokens=input_estimate,
+            output_tokens=1,
+            cost=predicted_cost,
+        )
+    request = consensus_request(
+        tuple(participants),
+        reasoning_request=reasoning_request,
+        consensus_policy=ConsensusPolicy(
+            minimum_participants=3,
+            minimum_valid_participants=3,
+            require_unanimity=True,
+        ),
+        budget=ConsensusBudget(
+            max_model_calls=3,
+            max_input_tokens=input_estimate * 3,
+            max_output_tokens=3,
+            max_total_tokens=(input_estimate + 1) * 3,
+            max_estimated_cost_usd=2.0,
+            unknown_cost_policy="allow",
+        ),
+    )
+    router = ModelRouter(RoutedConsensusRegistry(providers))  # type: ignore[arg-type]
+
+    result = ConsensusEngine(ReasoningEngine(router, max_output_tokens=1)).evaluate(
+        request
+    )
+
+    ledger_usage = router.ledger.usage_for_run(request.run_id)
+    assert all(item.status is ParticipantStatus.valid for item in result.participants)
+    assert all(
+        item.usage.attempted_calls == item.usage.successful_calls == 1
+        for item in result.participants
+    )
+    assert all(
+        (
+            item.usage.input_tokens,
+            item.usage.output_tokens,
+            item.usage.total_tokens,
+        )
+        == (input_estimate, 1, input_estimate + 1)
+        for item in result.participants
+    )
+    assert ledger_usage.attempted_calls == ledger_usage.successful_calls == 3
+    assert ledger_usage.total_tokens == (input_estimate + 1) * 3
+    assert result.decision.model_usage == ledger_usage
+    assert (
+        next(
+            item for item in result.participants if item.participant_id == "openai"
+        ).actual_model
+        == "gpt-5.5-pro-2026-04-23"
+    )
+
+
+def test_participant_fallback_is_local_and_does_not_consume_next_budget():
+    participant_a = isolated_participant(
+        "participant-a",
+        "openai",
+        "gpt-5.5-pro",
+        ModelBudgetLimits(max_model_calls=2),
+        fallbacks=(("anthropic", "claude-sonnet-4-6"),),
+    )
+    participant_b = isolated_participant(
+        "participant-b",
+        "openai",
+        "gpt-5.5-pro",
+        ModelBudgetLimits(max_model_calls=1),
+    )
+    providers = {
+        ("openai", "gpt-5.5-pro"): RoutedConsensusProvider(
+            "openai",
+            "gpt-5.5-pro",
+            ModelProviderError(
+                ModelErrorCode.timeout,
+                provider="openai",
+                model="gpt-5.5-pro",
+            ),
+            routed_advice("decision-participant-b"),
+        ),
+        ("anthropic", "claude-sonnet-4-6"): RoutedConsensusProvider(
+            "anthropic",
+            "claude-sonnet-4-6",
+            routed_advice("decision-participant-a"),
+        ),
+    }
+    router = ModelRouter(RoutedConsensusRegistry(providers))  # type: ignore[arg-type]
+    request = consensus_request(
+        (participant_a, participant_b),
+        budget=ConsensusBudget(max_model_calls=3),
+    )
+
+    result = ConsensusEngine(ReasoningEngine(router, max_output_tokens=1)).evaluate(
+        request
+    )
+
+    outcomes = {item.participant_id: item for item in result.participants}
+    assert outcomes["participant-a"].status is ParticipantStatus.valid
+    assert outcomes["participant-a"].actual_provider == "anthropic"
+    assert outcomes["participant-a"].usage.attempted_calls == 2
+    assert outcomes["participant-a"].usage.successful_calls == 1
+    assert outcomes["participant-a"].usage.failed_calls == 1
+    assert outcomes["participant-b"].status is ParticipantStatus.valid
+    assert outcomes["participant-b"].usage.attempted_calls == 1
+    assert outcomes["participant-b"].usage.successful_calls == 1
+    ledger_usage = router.ledger.usage_for_run(request.run_id)
+    assert ledger_usage.attempted_calls == 3
+    assert ledger_usage.successful_calls == 2
+    assert ledger_usage.failed_calls == 1
+    assert router.ledger.records[0].attempt_state == "provider_call_failed_after_start"
+    assert router.ledger.records[0].budget_total_tokens > 0
+
+
+def test_prior_unknown_cost_does_not_block_next_known_cost_participant():
+    reasoning_request = canonical_reasoning_request()
+    model_request = build_reasoning_model_request(
+        reasoning_request, max_output_tokens=1
+    )
+    input_estimate = ModelRouter._conservative_input_token_estimate(model_request)
+    pricing = ModelPricingCatalog()
+    known_cost = pricing.estimate_cost(
+        "openai",
+        "gpt-5.5-pro",
+        input_tokens=input_estimate,
+        output_tokens=1,
+    )
+    assert known_cost is not None
+    unknown = isolated_participant(
+        "participant-unknown",
+        "anthropic",
+        "claude-unpriced",
+        ModelBudgetLimits(
+            max_model_calls=1,
+            max_estimated_cost_usd=1.0,
+            unknown_cost_policy="allow",
+        ),
+    )
+    known = isolated_participant(
+        "participant-known",
+        "openai",
+        "gpt-5.5-pro",
+        ModelBudgetLimits(
+            max_model_calls=1,
+            max_estimated_cost_usd=known_cost,
+            max_per_call_cost_usd=known_cost,
+            unknown_cost_policy="deny",
+        ),
+    )
+    providers = {
+        ("anthropic", "claude-unpriced"): RoutedConsensusProvider(
+            "anthropic",
+            "claude-unpriced",
+            routed_advice("decision-unknown"),
+            cost=None,
+        ),
+        ("openai", "gpt-5.5-pro"): RoutedConsensusProvider(
+            "openai",
+            "gpt-5.5-pro",
+            routed_advice("decision-known"),
+            input_tokens=input_estimate,
+            cost=known_cost,
+        ),
+    }
+    request = consensus_request(
+        (unknown, known),
+        reasoning_request=reasoning_request,
+        budget=ConsensusBudget(
+            max_model_calls=2,
+            max_estimated_cost_usd=1.0,
+            unknown_cost_policy="allow",
+        ),
+    )
+    router = ModelRouter(RoutedConsensusRegistry(providers))  # type: ignore[arg-type]
+
+    result = ConsensusEngine(ReasoningEngine(router, max_output_tokens=1)).evaluate(
+        request
+    )
+
+    outcomes = {item.participant_id: item for item in result.participants}
+    assert outcomes["participant-unknown"].status is ParticipantStatus.valid
+    assert outcomes["participant-unknown"].usage.estimated_cost_usd is None
+    assert outcomes["participant-known"].status is ParticipantStatus.valid
+    assert outcomes["participant-known"].usage.estimated_cost_usd == pytest.approx(
+        known_cost
+    )
+    assert router.ledger.usage_for_run(request.run_id).attempted_calls == 2
+    assert router.ledger.usage_for_run(request.run_id).estimated_cost_usd is None
+
+
+def test_participant_unknown_cost_deny_still_blocks_before_transport():
+    denied = isolated_participant(
+        "participant-denied",
+        "anthropic",
+        "claude-unpriced",
+        ModelBudgetLimits(
+            max_model_calls=1,
+            max_estimated_cost_usd=1.0,
+            unknown_cost_policy="deny",
+        ),
+    )
+    provider = RoutedConsensusProvider(
+        "anthropic",
+        "claude-unpriced",
+        routed_advice("decision-denied"),
+    )
+    router = ModelRouter(
+        RoutedConsensusRegistry({("anthropic", "claude-unpriced"): provider})
+    )  # type: ignore[arg-type]
+    request = consensus_request((denied,))
+
+    result = ConsensusEngine(ReasoningEngine(router, max_output_tokens=1)).evaluate(
+        request
+    )
+
+    assert result.participants[0].status is ParticipantStatus.budget_blocked
+    assert result.participants[0].failure is ParticipantFailure.model_budget_exhausted
+    assert result.participants[0].usage.attempted_calls == 0
+    assert provider.calls == 0
+    assert router.ledger.usage_for_run(request.run_id).attempted_calls == 0
+
+
+def test_consensus_aggregate_call_budget_still_limits_isolated_participants():
+    participants = (
+        isolated_participant(
+            "participant-a",
+            "ollama",
+            "local-a",
+            ModelBudgetLimits(max_model_calls=1),
+        ),
+        isolated_participant(
+            "participant-b",
+            "ollama",
+            "local-b",
+            ModelBudgetLimits(max_model_calls=1),
+        ),
+        isolated_participant(
+            "participant-c",
+            "ollama",
+            "local-c",
+            ModelBudgetLimits(max_model_calls=1),
+        ),
+    )
+    providers = {
+        ("ollama", f"local-{suffix}"): RoutedConsensusProvider(
+            "ollama",
+            f"local-{suffix}",
+            routed_advice(f"decision-{suffix}"),
+            cost=0.0,
+        )
+        for suffix in ("a", "b", "c")
+    }
+    router = ModelRouter(RoutedConsensusRegistry(providers))  # type: ignore[arg-type]
+    request = consensus_request(
+        participants,
+        budget=ConsensusBudget(max_model_calls=2),
+    )
+
+    result = ConsensusEngine(ReasoningEngine(router, max_output_tokens=1)).evaluate(
+        request
+    )
+
+    assert [item.status for item in result.participants].count(
+        ParticipantStatus.valid
+    ) == 2
+    assert [item.status for item in result.participants].count(
+        ParticipantStatus.budget_blocked
+    ) == 1
+    assert router.ledger.usage_for_run(request.run_id).attempted_calls == 2
 
 
 def test_request_delta_is_unchanged():

@@ -417,6 +417,99 @@ def test_model_call_budget_preflight_blocks_next_provider_call():
     assert len(provider.requests) == 1
 
 
+def test_routing_operation_budget_scope_excludes_prior_run_usage():
+    provider = MockProvider(
+        "ollama", "local-model", success("ollama", "local-model", cost=0.0)
+    )
+    router = ModelRouter(MockRegistry({("ollama", "local-model"): provider}))
+    request = model_request()
+    policy = preferred_policy(
+        "ollama", "local-model", budget=ModelBudgetLimits(max_model_calls=1)
+    )
+
+    for _ in range(2):
+        with router.routing_operation_budget_scope():
+            router.route(request, policy)
+
+    usage = router.ledger.usage_for_run(request.run_id)
+    assert len(provider.requests) == 2
+    assert usage.attempted_calls == usage.successful_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("budget_field", "ceiling"),
+    (
+        ("max_input_tokens", "input"),
+        ("max_output_tokens", "output"),
+        ("max_total_tokens", "total"),
+    ),
+)
+def test_routing_operation_budget_scope_isolates_token_ceiling(budget_field, ceiling):
+    request = model_request(max_output_tokens=2)
+    input_estimate = ModelRouter._conservative_input_token_estimate(request)
+    values = {
+        "input": input_estimate,
+        "output": request.max_output_tokens,
+        "total": input_estimate + request.max_output_tokens,
+    }
+    provider = MockProvider(
+        "ollama",
+        "local-model",
+        success("ollama", "local-model", output_tokens=2, cost=0.0),
+    )
+    router = ModelRouter(MockRegistry({("ollama", "local-model"): provider}))
+    router.route(request, preferred_policy("ollama", "local-model"))
+    scoped_policy = preferred_policy(
+        "ollama",
+        "local-model",
+        budget=ModelBudgetLimits(**{budget_field: values[ceiling]}),
+    )
+
+    with router.routing_operation_budget_scope():
+        router.route(request, scoped_policy)
+
+    usage = router.ledger.usage_for_run(request.run_id)
+    assert usage.attempted_calls == usage.successful_calls == 2
+    assert len(provider.requests) == 2
+
+
+def test_routing_operation_budget_scope_isolates_cost_ceiling():
+    request = model_request(max_output_tokens=2)
+    pricing = ModelPricingCatalog()
+    input_estimate = ModelRouter._conservative_input_token_estimate(request)
+    predicted_cost = pricing.estimate_cost(
+        "openai",
+        "gpt-5.5-pro",
+        input_tokens=input_estimate,
+        output_tokens=request.max_output_tokens,
+    )
+    assert predicted_cost is not None
+    provider = MockProvider(
+        "openai",
+        "gpt-5.5-pro",
+        success("openai", "gpt-5.5-pro", output_tokens=2, cost=predicted_cost),
+    )
+    router = ModelRouter(
+        MockRegistry({("openai", "gpt-5.5-pro"): provider}, pricing=pricing)
+    )
+    router.route(request, preferred_policy("openai", "gpt-5.5-pro"))
+    scoped_policy = preferred_policy(
+        "openai",
+        "gpt-5.5-pro",
+        budget=ModelBudgetLimits(
+            max_estimated_cost_usd=predicted_cost,
+            max_per_call_cost_usd=predicted_cost,
+        ),
+    )
+
+    with router.routing_operation_budget_scope():
+        router.route(request, scoped_policy)
+
+    usage = router.ledger.usage_for_run(request.run_id)
+    assert usage.attempted_calls == usage.successful_calls == 2
+    assert usage.estimated_cost_usd == pytest.approx(predicted_cost * 2)
+
+
 def test_token_budget_blocks_attempt_before_provider_call():
     provider = MockProvider(
         "ollama", "local-model", success("ollama", "local-model", cost=0.0)

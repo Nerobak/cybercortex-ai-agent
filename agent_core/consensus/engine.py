@@ -24,6 +24,7 @@ from agent_core.models import (
     ModelProviderError,
     ModelUsageDelta,
 )
+from agent_core.models.pricing import model_response_matches_route
 from agent_core.reasoning import (
     ReasoningDecision,
     ReasoningCandidate,
@@ -69,8 +70,9 @@ class ConsensusEngine:
             )
             ledger_before = self._ledger_snapshot(request.run_id)
             try:
-                decision = self.reasoning_engine.reason(
-                    independent_request, participant.routing_policy
+                decision = self._reason_participant(
+                    independent_request,
+                    participant,
                 )
                 if not isinstance(decision, ReasoningDecision):
                     raise ReasoningError(ReasoningErrorCode.invalid_model_output)
@@ -79,14 +81,15 @@ class ConsensusEngine:
                     != participant.routing_policy.preferred.provider
                     or decision.model_provenance.task_type
                     != independent_request.task_type
-                    or (
-                        decision.model_provenance.provider_used,
-                        decision.model_provenance.model_used,
-                    )
-                    not in {
-                        (route.provider, route.model)
+                    or not any(
+                        decision.model_provenance.provider_used == route.provider
+                        and model_response_matches_route(
+                            route.provider,
+                            route.model,
+                            decision.model_provenance.model_used,
+                        )
                         for route in participant.routing_policy.ordered_routes()
-                    }
+                    )
                 ):
                     raise ReasoningError(ReasoningErrorCode.invalid_model_output)
                 candidate_fields = {
@@ -196,6 +199,18 @@ class ConsensusEngine:
         decision = arbitrate_consensus(request, materialized, assessment)
         self.history.record(decision)
         return ConsensusResult(decision=decision, participants=materialized)
+
+    def _reason_participant(
+        self,
+        request: ReasoningRequest,
+        participant: ConsensusParticipant,
+    ) -> Any:
+        router = getattr(self.reasoning_engine, "router", None)
+        budget_scope = getattr(router, "routing_operation_budget_scope", None)
+        if not callable(budget_scope):
+            return self.reasoning_engine.reason(request, participant.routing_policy)
+        with budget_scope():
+            return self.reasoning_engine.reason(request, participant.routing_policy)
 
     def _budget_allows(
         self,

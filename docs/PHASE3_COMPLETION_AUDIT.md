@@ -3116,3 +3116,59 @@ $0.019602. Real Anthropic P3-3 structured reasoning is **PASS**.
 
 No routing, execution, or accounting semantics changed. The immutable
 `phase3-freeze` tag remains unchanged at commit `e64af48`.
+
+## POST-FREEZE CONSENSUS MODEL PROVENANCE COMPATIBILITY
+
+Pre-live consensus inspection identified an exact-string model provenance
+incompatibility between authorized configured aliases and legitimate dated model
+snapshots returned by a provider. The real OpenAI route is configured as
+`gpt-5.5-pro`, while the real returned model snapshot is
+`gpt-5.5-pro-2026-04-23`.
+
+Consensus provenance validation now reuses the existing deterministic model-route
+matcher from the models layer. Provider identity remains strict, and each actual
+model must be either the exact configured model of an authorized route or the
+provider-aware dated snapshot equivalent permitted by that matcher. Unrelated
+models, cross-provider substitution, forged provenance, unconfigured fallbacks,
+and routing-policy bypass remain rejected. Explicitly authorized fallback routes
+retain the same strict validation and may use a deterministically equivalent
+snapshot where applicable.
+
+Participant outcomes and reasoning provenance continue to preserve the actual
+returned snapshot alongside the configured alias. Consensus remains advisory.
+No execution route, provider call, target request, accounting change, pricing
+change, or other execution/accounting semantic change was introduced. No paid
+provider call was performed.
+
+## POST-FREEZE CONSENSUS PARTICIPANT BUDGET ISOLATION
+
+Two real three-provider consensus attempts reached only Claude. DeepSeek and
+OpenAI were budget-blocked before provider transport. A local diagnostic showed
+that `ConsensusEngine._budget_allows()` returned `allowed=True` for all three
+participants before any call and again after the real Claude usage, confirming
+that the outer `ConsensusBudget` was not the blocker.
+
+The root cause was the participant routing policies evaluating their budgets
+against aggregate state for the shared consensus `run_id`. The first participant
+wrote usage to the authoritative shared `ModelCallLedger`, so later participants
+treated that earlier usage as their own policy consumption.
+
+Consensus participant routing now opens an explicit routing-operation budget
+scope. `ModelRouter` captures the run ledger baseline when that routing operation
+starts and uses `ledger.delta(...)` for participant-policy preflight and success
+reconciliation. Provider attempts in the same fallback chain remain cumulative
+within that participant scope. Calls, token reservations, failures, and costs from
+earlier participants are excluded from the next participant's local routing
+budget.
+
+The shared `ModelCallLedger` remains the aggregate authoritative record for the
+entire consensus run, including every attempt, success, failure, token, cost,
+latency, and reservation. `ConsensusBudget` remains the independent aggregate
+ceiling enforced by `ConsensusEngine`. Direct standalone router calls retain
+their existing run-level cumulative budget semantics unless an authorized caller
+explicitly opens the routing-operation scope.
+
+Consensus remains advisory. No Phase 2 or P3-4 authority changed, and no
+execution route, target transport, tool call, function call, shell path, or
+credential exposure was introduced. No paid provider calls were made during this
+fix. Three-model live consensus has not yet been declared PASS.

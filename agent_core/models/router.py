@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
-from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import (
@@ -19,7 +21,12 @@ from pydantic import (
     model_validator,
 )
 
-from agent_core.models.accounting import ModelBudgetReservation, ModelCallLedger
+from agent_core.models.accounting import (
+    ModelBudgetReservation,
+    ModelCallLedger,
+    ModelLedgerSnapshot,
+    ModelUsageDelta,
+)
 from agent_core.models.base import ProviderAvailability
 from agent_core.models.errors import (
     ModelErrorCode,
@@ -209,6 +216,20 @@ class ModelRouter:
     ) -> None:
         self.registry = registry
         self.ledger = ledger or ModelCallLedger()
+        self._operation_budget_scope: ContextVar[bool] = ContextVar(
+            f"model_router_operation_budget_scope_{id(self)}",
+            default=False,
+        )
+
+    @contextmanager
+    def routing_operation_budget_scope(self) -> Iterator[None]:
+        """Evaluate policy budgets from the start of each routing operation."""
+
+        token = self._operation_budget_scope.set(True)
+        try:
+            yield
+        finally:
+            self._operation_budget_scope.reset(token)
 
     def route(self, request: ModelRequest, policy: ModelRoutingPolicy) -> ModelResponse:
         if not isinstance(request, ModelRequest) or not isinstance(
@@ -218,9 +239,17 @@ class ModelRouter:
         routes = policy.ordered_routes()
         outcomes: list[ModelAttemptOutcome] = []
         with self.ledger.routing_transaction():
+            budget_baseline = (
+                self.ledger.snapshot(run_id=request.run_id)
+                if self._operation_budget_scope.get()
+                else None
+            )
             for fallback_depth, selected in enumerate(routes):
                 attempt_request, reservation = self._preflight(
-                    request, selected, policy.budget
+                    request,
+                    selected,
+                    policy.budget,
+                    budget_baseline=budget_baseline,
                 )
                 pre_call_started = time.monotonic()
                 try:
@@ -366,7 +395,12 @@ class ModelRouter:
                     fallback_depth=fallback_depth,
                     reservation=committed,
                 )
-                self._reconcile_budget(request.run_id, response, policy.budget)
+                self._reconcile_budget(
+                    request.run_id,
+                    response,
+                    policy.budget,
+                    budget_baseline=budget_baseline,
+                )
                 return self._with_provenance(
                     response,
                     policy=policy,
@@ -381,8 +415,10 @@ class ModelRouter:
         request: ModelRequest,
         selected: ModelRoute,
         limits: ModelBudgetLimits,
+        *,
+        budget_baseline: ModelLedgerSnapshot | None,
     ) -> tuple[ModelRequest, ModelBudgetReservation]:
-        usage = self.ledger.usage_for_run(request.run_id)
+        usage = self._budget_usage(request.run_id, budget_baseline)
         if usage.attempted_calls >= limits.max_model_calls:
             raise self._budget_error(selected, ModelErrorCode.model_budget_exceeded)
 
@@ -459,8 +495,10 @@ class ModelRouter:
         run_id: str | None,
         response: ModelResponse,
         limits: ModelBudgetLimits,
+        *,
+        budget_baseline: ModelLedgerSnapshot | None,
     ) -> None:
-        usage = self.ledger.usage_for_run(run_id)
+        usage = self._budget_usage(run_id, budget_baseline)
         over_tokens = any(
             (
                 ceiling is not None and actual > ceiling
@@ -503,6 +541,18 @@ class ModelRouter:
                     ModelRoute(provider=response.provider, model=response.model),
                     ModelErrorCode.model_budget_exceeded,
                 )
+
+    def _budget_usage(
+        self,
+        run_id: str | None,
+        baseline: ModelLedgerSnapshot | None,
+    ) -> ModelUsageDelta:
+        if baseline is None:
+            return self.ledger.usage_for_run(run_id)
+        return self.ledger.delta(
+            baseline,
+            self.ledger.snapshot(run_id=run_id),
+        )
 
     @staticmethod
     def _provider_call(
