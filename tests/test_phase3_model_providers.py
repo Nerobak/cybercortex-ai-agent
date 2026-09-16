@@ -391,6 +391,31 @@ def test_openai_rejects_a_returned_model_outside_the_configured_alias():
     assert captured.value.code == ModelErrorCode.invalid_response
 
 
+@pytest.mark.parametrize(
+    ("configured_model", "returned_model"),
+    [
+        ("gpt-5.5-pro", "gpt-5.5-pro-2026-99-99"),
+        (
+            "gpt-5.5-pro-2026-04-23",
+            "gpt-5.5-pro-2026-04-23-2026-05-01",
+        ),
+    ],
+)
+def test_openai_rejects_malformed_or_broadened_snapshot_provenance(
+    configured_model, returned_model
+):
+    configuration = openai_config().model_copy(update={"model_name": configured_model})
+    provider = OpenAIProvider(
+        configuration,
+        client=openai_client(normalized_openai_response(model=returned_model)),
+    )
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(request())
+
+    assert captured.value.code == ModelErrorCode.invalid_response
+
+
 def test_openai_generic_structured_output_uses_responses_json_mode_once():
     client = openai_client(normalized_openai_response('{"result":"ok"}'))
     provider = OpenAIProvider(openai_config(), client=client)
@@ -586,6 +611,19 @@ def test_openai_empty_output_fails_closed(content):
 
     assert captured.value.code == ModelErrorCode.invalid_response
     assert len(provider.telemetry) == 1
+
+
+@pytest.mark.parametrize("status", ["cancelled", "failed", "incomplete"])
+def test_openai_noncompleted_response_fails_closed_with_valid_content(status):
+    client = openai_client(normalized_openai_response("{}", status=status))
+    provider = OpenAIProvider(openai_config(), client=client)
+
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(request(structured_output=True))
+
+    assert captured.value.code == ModelErrorCode.invalid_response
+    assert len(client.create_spy.calls) == 1
+    assert provider.telemetry[-1].success is False
 
 
 def test_gpt_5_5_pro_omits_unsupported_temperature_without_changing_request():
@@ -1197,6 +1235,10 @@ def test_known_price_cost_calculation_and_alias_resolution():
         "openai",
         "canonical-model",
     )
+    assert catalog.resolve_routing_model("open-ai", "friendly-model") == (
+        "openai",
+        "canonical-model",
+    )
     assert (
         catalog.estimate_cost(
             "open-ai", "friendly-model", input_tokens=1_000_000, output_tokens=500_000
@@ -1336,6 +1378,24 @@ def test_provider_registry_lookup_and_supported_enumeration():
         ),
         OllamaProvider,
     )
+
+
+def test_provider_registry_preserves_an_explicit_openai_snapshot_route():
+    snapshot = "gpt-5.5-pro-2026-04-23"
+    client = openai_client(normalized_openai_response(model=snapshot))
+    registry = ProviderRegistry(
+        ModelConfiguration(
+            openai=ProviderConfiguration(model_name=snapshot, api_key=API_KEY_SENTINEL)
+        )
+    )
+
+    provider = registry.create("openai", client=client)
+    response = provider.generate(request())
+
+    assert provider.model_name == snapshot
+    assert client.create_spy.calls[0]["model"] == snapshot
+    assert response.model == snapshot
+    assert response.estimated_cost_usd == pytest.approx(0.00159)
 
 
 def test_unknown_provider_rejection():

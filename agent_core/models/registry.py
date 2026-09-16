@@ -57,7 +57,9 @@ class ProviderRegistry:
         configured = self.configuration.provider_configuration(normalized)
         requested_model = model_name or configured.model_name
         if requested_model:
-            _, requested_model = self.pricing.resolve_model(normalized, requested_model)
+            _, requested_model = self.pricing.resolve_routing_model(
+                normalized, requested_model
+            )
         provider_configuration = ProviderConfiguration(
             model_name=requested_model,
             timeout_seconds=configured.timeout_seconds,

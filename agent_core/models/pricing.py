@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from decimal import Decimal
 from itertools import chain
 from typing import Any, Mapping
@@ -65,10 +66,24 @@ def model_response_matches_route(
         return True
     if normalize_provider_alias(provider) != "openai":
         return False
+    if _valid_dated_snapshot_suffix(requested_model) is not None:
+        return False
     prefix = f"{requested_model}-"
     if not returned_model.startswith(prefix):
         return False
-    return _DATED_MODEL_SNAPSHOT.fullmatch(returned_model[len(prefix) :]) is not None
+    return _valid_dated_snapshot_suffix(returned_model, prefix=prefix) is not None
+
+
+def _valid_dated_snapshot_suffix(model: str, *, prefix: str = "") -> str | None:
+    suffix = model[len(prefix) :] if prefix else model.rsplit("-", 3)[-3:]
+    rendered = "-".join(suffix) if isinstance(suffix, list) else suffix
+    if not _DATED_MODEL_SNAPSHOT.fullmatch(rendered):
+        return None
+    try:
+        parsed = date.fromisoformat(rendered)
+    except ValueError:
+        return None
+    return rendered if parsed.isoformat() == rendered else None
 
 
 class ModelPricingCatalog:
@@ -91,6 +106,7 @@ class ModelPricingCatalog:
             self._prices[key] = price
 
         self._aliases: dict[tuple[str, str], str] = {}
+        self._routing_aliases: dict[tuple[str, str], str] = {}
         for (provider, alias), canonical in chain(
             _STANDARD_MODEL_ALIASES.items(), (model_aliases or {}).items()
         ):
@@ -101,11 +117,27 @@ class ModelPricingCatalog:
             if key in self._aliases and self._aliases[key] != canonical:
                 raise ValueError("Conflicting provider/model alias")
             self._aliases[key] = str(canonical).strip()
+        for (provider, alias), canonical in (model_aliases or {}).items():
+            key = (
+                normalize_provider_alias(provider),
+                str(alias).strip().casefold(),
+            )
+            self._routing_aliases[key] = str(canonical).strip()
 
     def resolve_model(self, provider: str, model: str) -> tuple[str, str]:
         canonical_provider = normalize_provider_alias(provider)
         requested_model = str(model).strip()
         canonical_model = self._aliases.get(
+            (canonical_provider, requested_model.casefold()), requested_model
+        )
+        return canonical_provider, canonical_model
+
+    def resolve_routing_model(self, provider: str, model: str) -> tuple[str, str]:
+        """Resolve configured transport aliases without applying pricing-only aliases."""
+
+        canonical_provider = normalize_provider_alias(provider)
+        requested_model = str(model).strip()
+        canonical_model = self._routing_aliases.get(
             (canonical_provider, requested_model.casefold()), requested_model
         )
         return canonical_provider, canonical_model

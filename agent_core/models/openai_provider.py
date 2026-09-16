@@ -150,8 +150,6 @@ class OpenAIProvider(ModelProvider):
     provider_name = "openai"
     supports_structured_output = True
 
-    _TERMINAL_STATUSES = frozenset({"cancelled", "completed", "failed", "incomplete"})
-
     def __init__(
         self,
         configuration: ProviderConfiguration,
@@ -226,11 +224,7 @@ class OpenAIProvider(ModelProvider):
         response = self._client.responses.create(**kwargs)
         content = self.read_value(response, "output_text")
         status = self.read_value(response, "status")
-        if (
-            not isinstance(content, str)
-            or not content.strip()
-            or status not in self._TERMINAL_STATUSES
-        ):
+        if not isinstance(content, str) or not content.strip() or status != "completed":
             raise InvalidProviderResponseError(
                 provider=self.provider_name, model=self.model_name
             )
