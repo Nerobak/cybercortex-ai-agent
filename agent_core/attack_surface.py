@@ -700,3 +700,62 @@ class AttackSurfaceGraph:
             "data": json.loads(row["data_json"]),
             "last_run_id": row["last_run_id"],
         }
+
+    def research_snapshot(
+        self, *, max_nodes: int = 500, max_edges: int = 1_000
+    ) -> dict[str, Any]:
+        """Return a bounded, read-only adapter view for Phase 4 import code."""
+
+        if (
+            not isinstance(max_nodes, int)
+            or isinstance(max_nodes, bool)
+            or max_nodes < 1
+            or max_nodes > 5_000
+        ):
+            raise ValueError(
+                "research adapter node limit is outside the supported bound"
+            )
+        if (
+            not isinstance(max_edges, int)
+            or isinstance(max_edges, bool)
+            or max_edges < 1
+            or max_edges > 10_000
+        ):
+            raise ValueError(
+                "research adapter edge limit is outside the supported bound"
+            )
+        with self.connect() as connection:
+            nodes = connection.execute(
+                "SELECT node_id,kind,canonical_key,data_json,last_run_id "
+                "FROM nodes ORDER BY node_id LIMIT ?",
+                (max_nodes,),
+            ).fetchall()
+            edges = connection.execute(
+                "SELECT edge_id,source_node_id,relation,target_node_id,data_json,last_run_id "
+                "FROM edges ORDER BY edge_id LIMIT ?",
+                (max_edges,),
+            ).fetchall()
+        return {
+            "adapter_schema_version": 1,
+            "nodes": [
+                {
+                    "node_id": row["node_id"],
+                    "kind": row["kind"],
+                    "canonical_key": row["canonical_key"],
+                    "metadata": json.loads(row["data_json"]),
+                    "last_run_id": row["last_run_id"],
+                }
+                for row in nodes
+            ],
+            "edges": [
+                {
+                    "edge_id": row["edge_id"],
+                    "source_node_id": row["source_node_id"],
+                    "relation": row["relation"],
+                    "target_node_id": row["target_node_id"],
+                    "metadata": json.loads(row["data_json"]),
+                    "last_run_id": row["last_run_id"],
+                }
+                for row in edges
+            ],
+        }
