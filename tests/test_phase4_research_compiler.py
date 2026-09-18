@@ -494,11 +494,22 @@ def test_unknown_template_and_execution_unavailable_fail_closed(
         research_state,
         CompilerContext(current_time=NOW),
     )
+    execution_context = compiler_context.model_copy(
+        update={
+            "execution_ready": True,
+            "safe_headers": (
+                RegisteredSafeHeader(
+                    header_definition_id="safe-header-1",
+                    normalized_name="X-Research-Canary",
+                ),
+            ),
+        }
+    )
     assert_error(
         CompilerErrorCode.primitive_not_execution_available,
-        object_proposal(),
+        header_proposal(),
         research_state,
-        compiler_context.model_copy(update={"execution_ready": True}),
+        execution_context,
     )
 
 

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import hmac
+import json
+import secrets
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, StrictBool, StrictInt, model_validator
 
@@ -380,27 +384,307 @@ class SecurityExperiment(ResearchContract):
         return self
 
 
+_AUTHORIZATION_ISSUER = object()
+_AUTHORIZATION_KEY = secrets.token_bytes(32)
+
+
+def _authorization_plain(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, tuple):
+        return [_authorization_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _authorization_plain(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    return value
+
+
 class AuthorizedExperiment:
-    """Reserved P4-0D boundary for sealed runtime authority.
+    """One immutable, process-local authorization issued by the research gate."""
 
-    P4-0C intentionally exposes no constructor or sealing function.  P4-0D will
-    add the policy decision, controlled bindings, reservations, executor route,
-    sealed digest, authorization expiry, and runtime binding listed below.
-    """
+    __slots__ = (
+        "__authorization_digest",
+        "__authorization_nonce",
+        "__authorization_timestamp",
+        "__cleanup_reservation",
+        "__controlled_identity_bindings",
+        "__dry_run",
+        "__executor_routes",
+        "__experiment",
+        "__expiry",
+        "__issuer",
+        "__owned_object_bindings",
+        "__policy_decision_id",
+        "__policy_hash",
+        "__policy_reference",
+        "__request_budget_reservation",
+        "__runtime_binding_reference",
+        "__scope_reference",
+        "__target_fingerprint",
+    )
 
-    __slots__ = ()
-    experiment: SecurityExperiment
-    policy_decision_id: str
-    policy_hash: str
-    target_fingerprint: str
-    controlled_identity_bindings: object
-    owned_object_bindings: object
-    request_budget_reservation: object
-    cleanup_reservation: object
-    executor_route_version: str
-    sealed_experiment_digest: str
-    authorization_expiry: str
-    runtime_binding_reference: str
+    def __init__(
+        self,
+        *_args: object,
+        _issuer: object | None = None,
+        experiment: SecurityExperiment | None = None,
+        policy_decision_id: str = "",
+        policy_hash: str = "",
+        policy_reference: str = "",
+        target_fingerprint: str = "",
+        scope_reference: str = "",
+        controlled_identity_bindings: tuple[object, ...] = (),
+        owned_object_bindings: tuple[object, ...] = (),
+        request_budget_reservation: object | None = None,
+        cleanup_reservation: object | None = None,
+        executor_routes: tuple[object, ...] = (),
+        authorization_timestamp: str = "",
+        expiry: str = "",
+        runtime_binding_reference: str = "",
+        dry_run: bool = False,
+    ) -> None:
+        if _issuer is not _AUTHORIZATION_ISSUER or experiment is None or _args:
+            raise TypeError("AuthorizedExperiment sealing is reserved for P4-0D")
+        object.__setattr__(self, "_AuthorizedExperiment__issuer", _issuer)
+        object.__setattr__(self, "_AuthorizedExperiment__experiment", experiment)
+        object.__setattr__(
+            self, "_AuthorizedExperiment__policy_decision_id", policy_decision_id
+        )
+        object.__setattr__(self, "_AuthorizedExperiment__policy_hash", policy_hash)
+        object.__setattr__(
+            self, "_AuthorizedExperiment__policy_reference", policy_reference
+        )
+        object.__setattr__(
+            self, "_AuthorizedExperiment__target_fingerprint", target_fingerprint
+        )
+        object.__setattr__(
+            self, "_AuthorizedExperiment__scope_reference", scope_reference
+        )
+        object.__setattr__(
+            self,
+            "_AuthorizedExperiment__controlled_identity_bindings",
+            controlled_identity_bindings,
+        )
+        object.__setattr__(
+            self,
+            "_AuthorizedExperiment__owned_object_bindings",
+            owned_object_bindings,
+        )
+        object.__setattr__(
+            self,
+            "_AuthorizedExperiment__request_budget_reservation",
+            request_budget_reservation,
+        )
+        object.__setattr__(
+            self, "_AuthorizedExperiment__cleanup_reservation", cleanup_reservation
+        )
+        object.__setattr__(
+            self, "_AuthorizedExperiment__executor_routes", executor_routes
+        )
+        object.__setattr__(
+            self,
+            "_AuthorizedExperiment__authorization_timestamp",
+            authorization_timestamp,
+        )
+        object.__setattr__(self, "_AuthorizedExperiment__expiry", expiry)
+        object.__setattr__(
+            self,
+            "_AuthorizedExperiment__runtime_binding_reference",
+            runtime_binding_reference,
+        )
+        object.__setattr__(self, "_AuthorizedExperiment__dry_run", dry_run)
+        object.__setattr__(
+            self,
+            "_AuthorizedExperiment__authorization_nonce",
+            secrets.token_hex(16),
+        )
+        digest = hmac.new(
+            _AUTHORIZATION_KEY,
+            self._seal_material(),
+            hashlib.sha256,
+        ).hexdigest()
+        object.__setattr__(
+            self,
+            "_AuthorizedExperiment__authorization_digest",
+            f"sha256:{digest}",
+        )
 
-    def __new__(cls, *_args: object, **_kwargs: object) -> "AuthorizedExperiment":
-        raise TypeError("AuthorizedExperiment sealing is reserved for P4-0D")
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise TypeError("AuthorizedExperiment cannot be subclassed")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise TypeError("AuthorizedExperiment is immutable")
+
+    @property
+    def experiment(self) -> SecurityExperiment:
+        return self.__experiment
+
+    @property
+    def experiment_id(self) -> str:
+        return self.__experiment.experiment_id
+
+    @property
+    def experiment_fingerprint(self) -> str:
+        return self.__experiment.fingerprint
+
+    @property
+    def research_id(self) -> str:
+        return self.__experiment.research_id
+
+    @property
+    def state_revision(self) -> int:
+        return self.__experiment.state_revision
+
+    @property
+    def policy_decision_id(self) -> str:
+        return self.__policy_decision_id
+
+    @property
+    def policy_hash(self) -> str:
+        return self.__policy_hash
+
+    @property
+    def policy_reference(self) -> str:
+        return self.__policy_reference
+
+    @property
+    def target_fingerprint(self) -> str:
+        return self.__target_fingerprint
+
+    @property
+    def scope_reference(self) -> str:
+        return self.__scope_reference
+
+    @property
+    def controlled_identity_bindings(self) -> tuple[object, ...]:
+        return self.__controlled_identity_bindings
+
+    @property
+    def owned_object_bindings(self) -> tuple[object, ...]:
+        return self.__owned_object_bindings
+
+    @property
+    def request_budget_reservation(self) -> object:
+        return self.__request_budget_reservation
+
+    @property
+    def cleanup_reservation(self) -> object:
+        return self.__cleanup_reservation
+
+    @property
+    def executor_routes(self) -> tuple[object, ...]:
+        return self.__executor_routes
+
+    @property
+    def executor_route_version(self) -> str:
+        return ",".join(
+            str(getattr(route, "route_reference", route))
+            for route in self.__executor_routes
+        )
+
+    @property
+    def authorization_timestamp(self) -> str:
+        return self.__authorization_timestamp
+
+    @property
+    def expiry(self) -> str:
+        return self.__expiry
+
+    @property
+    def authorization_expiry(self) -> str:
+        return self.__expiry
+
+    @property
+    def sealed_authorization_digest(self) -> str:
+        return self.__authorization_digest
+
+    @property
+    def sealed_experiment_digest(self) -> str:
+        return self.__authorization_digest
+
+    @property
+    def authorization_reference(self) -> str:
+        return self.__authorization_digest
+
+    @property
+    def runtime_binding_reference(self) -> str:
+        return self.__runtime_binding_reference
+
+    @property
+    def dry_run(self) -> bool:
+        return self.__dry_run
+
+    def _seal_payload(self) -> dict[str, Any]:
+        return {
+            "authorization_nonce": self.__authorization_nonce,
+            "authorization_timestamp": self.__authorization_timestamp,
+            "cleanup_reservation": _authorization_plain(self.__cleanup_reservation),
+            "controlled_identity_bindings": _authorization_plain(
+                self.__controlled_identity_bindings
+            ),
+            "dry_run": self.__dry_run,
+            "executor_routes": _authorization_plain(self.__executor_routes),
+            "experiment_fingerprint": self.__experiment.fingerprint,
+            "experiment_id": self.__experiment.experiment_id,
+            "expiry": self.__expiry,
+            "owned_object_bindings": _authorization_plain(self.__owned_object_bindings),
+            "policy_decision_id": self.__policy_decision_id,
+            "policy_hash": self.__policy_hash,
+            "policy_reference": self.__policy_reference,
+            "request_budget_reservation": _authorization_plain(
+                self.__request_budget_reservation
+            ),
+            "research_id": self.__experiment.research_id,
+            "runtime_binding_reference": self.__runtime_binding_reference,
+            "scope_reference": self.__scope_reference,
+            "state_revision": self.__experiment.state_revision,
+            "target_fingerprint": self.__target_fingerprint,
+        }
+
+    def _seal_material(self) -> bytes:
+        return json.dumps(
+            self._seal_payload(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+
+    def _seal_is_valid(self) -> bool:
+        try:
+            expected = (
+                "sha256:"
+                + hmac.new(
+                    _AUTHORIZATION_KEY,
+                    self._seal_material(),
+                    hashlib.sha256,
+                ).hexdigest()
+            )
+            return self.__issuer is _AUTHORIZATION_ISSUER and hmac.compare_digest(
+                expected, self.__authorization_digest
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def __copy__(self) -> None:
+        raise TypeError("AuthorizedExperiment cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> None:
+        raise TypeError("AuthorizedExperiment cannot be copied")
+
+    def __reduce__(self) -> None:
+        raise TypeError("AuthorizedExperiment cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> None:
+        raise TypeError("AuthorizedExperiment cannot be serialized")
+
+
+def _seal_authorized_experiment(**fields: Any) -> AuthorizedExperiment:
+    """Private issuer used only by ``ResearchExecutionGate``."""
+
+    return AuthorizedExperiment(_issuer=_AUTHORIZATION_ISSUER, **fields)
+
+
+def _is_gate_authorized(value: object) -> bool:
+    return type(value) is AuthorizedExperiment and value._seal_is_valid()

@@ -51,10 +51,18 @@ def test_initial_registry_inventory_and_capability_states_are_explicit():
         "workflow_reorder",
         "upload_variant",
     }
-    assert not any(
-        item.capability_state is PrimitiveCapabilityState.execution_available
+    assert {
+        item.name
         for item in DEFAULT_EXPERIMENT_REGISTRY.definitions
-    )
+        if item.capability_state is PrimitiveCapabilityState.execution_available
+    } == {
+        "request_replay",
+        "identity_switch",
+        "parameter_mutation",
+        "object_substitution",
+        "response_differential",
+        "state_differential",
+    }
     assert all(
         DEFAULT_EXPERIMENT_REGISTRY.resolve(name).capability_state
         is PrimitiveCapabilityState.compile_only
