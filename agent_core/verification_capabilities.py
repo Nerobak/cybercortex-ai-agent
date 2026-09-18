@@ -41,6 +41,12 @@ class CompatibilityStatus(str, Enum):
     legacy_broad_category = "legacy_broad_category"
 
 
+class ResearchExperimentAdapterState(str, Enum):
+    """P4-0C exposes metadata only; runtime binding belongs to P4-0D."""
+
+    metadata_only = "metadata_only"
+
+
 class VerificationCapability(StrictModel):
     """One immutable, strict declaration of implemented category behavior."""
 
@@ -840,3 +846,143 @@ def render_capability_markdown_table() -> str:
             + " |"
         )
     return "\n".join(rows)
+
+
+class ResearchExperimentCapabilityAdapter(StrictModel):
+    """Read-only Phase 4 compiler metadata for an existing Phase 2 capability."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    category: StrictStr
+    capability_version: StrictStr
+    primitive_names: tuple[StrictStr, ...]
+    adapter_state: ResearchExperimentAdapterState = (
+        ResearchExperimentAdapterState.metadata_only
+    )
+    phase2_capability_state: CapabilityState
+    typed_phase2_executor_available: StrictBool
+    min_requests: StrictInt = Field(ge=0, le=100)
+    worst_case_requests: StrictInt = Field(ge=0, le=100)
+    requires_credentials: StrictBool
+    required_account_count: StrictInt = Field(ge=0, le=2)
+    requires_test_owned_resource: StrictBool
+    state_changing: StrictBool
+    cleanup_required: StrictBool
+    supported_methods: tuple[StrictStr, ...] = ()
+    supported_parameter_locations: tuple[StrictStr, ...] = ()
+    allowed_target_classes: tuple[StrictStr, ...]
+    metadata_reference: StrictStr
+
+
+_RESEARCH_PRIMITIVE_ADAPTERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "bola": (
+            "identity_switch",
+            "object_substitution",
+            "response_differential",
+        ),
+        "authentication_enforcement": (
+            "request_replay",
+            "cookie_mutation",
+            "response_differential",
+        ),
+        "session_invalidation": (
+            "request_replay",
+            "cookie_mutation",
+            "state_differential",
+        ),
+        "tenant_isolation": (
+            "identity_switch",
+            "object_substitution",
+            "response_differential",
+        ),
+        "vertical_authorization": (
+            "identity_switch",
+            "request_replay",
+            "response_differential",
+        ),
+        "mass_assignment": (
+            "parameter_mutation",
+            "state_differential",
+        ),
+        "rate_limit_enforcement": (
+            "request_replay",
+            "response_differential",
+        ),
+        "recovery_state_enforcement": (
+            "workflow_step_replay",
+            "state_differential",
+        ),
+        "graphql_object_authorization": (
+            "graphql_operation",
+            "graphql_variable_mutation",
+            "object_substitution",
+            "response_differential",
+        ),
+        "graphql_field_authorization": (
+            "graphql_operation",
+            "response_differential",
+        ),
+        "graphql_mutation_authorization": (
+            "graphql_operation",
+            "graphql_variable_mutation",
+            "state_differential",
+        ),
+        "jwt_enforcement": (
+            "token_mutation",
+            "response_differential",
+        ),
+        "upload_ownership": (
+            "identity_switch",
+            "upload_variant",
+            "response_differential",
+        ),
+        "file_upload_validation": (
+            "upload_variant",
+            "response_differential",
+        ),
+    }
+)
+
+
+def _research_adapter(category: str) -> ResearchExperimentCapabilityAdapter:
+    capability = get_verification_capability(category)
+    return ResearchExperimentCapabilityAdapter(
+        category=category,
+        capability_version=capability.executor_version or "phase2-plan-v1",
+        primitive_names=_RESEARCH_PRIMITIVE_ADAPTERS[category],
+        phase2_capability_state=capability.capability_state,
+        typed_phase2_executor_available=(
+            capability.capability_state is CapabilityState.typed_verification
+            and capability.executor_available
+        ),
+        min_requests=capability.min_requests,
+        worst_case_requests=capability.worst_case_requests,
+        requires_credentials=capability.requires_credentials,
+        required_account_count=capability.required_account_count,
+        requires_test_owned_resource=capability.requires_test_owned_resource,
+        state_changing=capability.state_changing,
+        cleanup_required=capability.cleanup_required,
+        supported_methods=capability.supported_methods,
+        supported_parameter_locations=capability.supported_parameter_locations,
+        allowed_target_classes=capability.allowed_target_classes,
+        metadata_reference=f"phase2-capability:{category}",
+    )
+
+
+RESEARCH_EXPERIMENT_CAPABILITY_ADAPTERS: Mapping[
+    str, ResearchExperimentCapabilityAdapter
+] = MappingProxyType(
+    {category: _research_adapter(category) for category in _RESEARCH_PRIMITIVE_ADAPTERS}
+)
+
+
+def get_research_experiment_capability_adapter(
+    category: str,
+) -> ResearchExperimentCapabilityAdapter:
+    """Return compile metadata without resolving or invoking an executor."""
+
+    try:
+        return RESEARCH_EXPERIMENT_CAPABILITY_ADAPTERS[category]
+    except KeyError as exc:
+        raise ValueError("unknown research experiment capability") from exc
