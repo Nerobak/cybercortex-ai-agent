@@ -50,6 +50,7 @@ from agent_core.research.types import (
     RelationshipStatus,
     ResearchConfidence,
     ResearchContract,
+    ResearchExperimentStatus,
     ResearchId,
     ResearchObjectId,
     ResearchPredicate,
@@ -503,6 +504,12 @@ class HypothesisRecord(ResearchContract):
     pivot_count: StrictInt = Field(default=0, ge=0, le=100)
     experiment_references: tuple[ExperimentId, ...] = Field(default=(), max_length=100)
     limitations: tuple[ShortPublicText, ...] = Field(default=(), max_length=50)
+    derivation_type: DerivationType = DerivationType.deterministic
+    basis_fact_ids: tuple[FactId, ...] = Field(default=(), max_length=100)
+    basis_relationship_ids: tuple[RelationshipId, ...] = Field(
+        default=(), max_length=100
+    )
+    semantic_fingerprint: Sha256Digest | None = None
     provenance_id: ProvenanceRecordId
 
     @model_validator(mode="after")
@@ -523,6 +530,22 @@ class HypothesisRecord(ResearchContract):
             _canonical_references(self.experiment_references, "experiment_references"),
         )
         object.__setattr__(self, "limitations", tuple(sorted(self.limitations)))
+        object.__setattr__(
+            self,
+            "basis_fact_ids",
+            _canonical_references(self.basis_fact_ids, "basis_fact_ids"),
+        )
+        object.__setattr__(
+            self,
+            "basis_relationship_ids",
+            _canonical_references(
+                self.basis_relationship_ids, "basis_relationship_ids"
+            ),
+        )
+        if self.derivation_type is DerivationType.model_proposed and (
+            self.status is not HypothesisResearchStatus.proposed
+        ):
+            raise ValueError("a model-proposed hypothesis must remain proposed")
         if self.pivot_count > self.attempt_count:
             raise ValueError("pivot_count cannot exceed attempt_count")
         if self.attempt_count < len(self.experiment_references):
@@ -716,6 +739,25 @@ class SurfaceBudgetUsage(ResearchContract):
     experiment_count: StrictInt = Field(ge=0, le=10_000)
 
 
+class ResearchExperimentRecord(ResearchContract):
+    """Secret-free experiment history retained across process restarts."""
+
+    experiment_id: ExperimentId
+    proposal_id: OpaqueIdentifier
+    hypothesis_id: HypothesisRecordId
+    surface_id: SurfaceId | None = None
+    fingerprint: Sha256Digest
+    material_fingerprint: Sha256Digest
+    status: ResearchExperimentStatus
+    result_classification: OpaqueIdentifier | None = None
+    relevant_state_revision: StrictInt = Field(ge=0, le=1_000_000_000)
+    policy_reference: OpaqueIdentifier | None = None
+    policy_fingerprint: Sha256Digest | None = None
+    request_cost: StrictInt = Field(default=0, ge=0, le=10_000)
+    state_changing: StrictBool = False
+    occurred_at: Timestamp
+
+
 class RequestBudgetSnapshot(ResearchContract):
     ledger_reference: OpaqueIdentifier
     limit: StrictInt = Field(ge=0, le=10_000_000)
@@ -758,6 +800,8 @@ class BudgetState(ResearchContract):
     state_changes_consumed: StrictInt = Field(ge=0, le=100_000)
     cleanup_request_reserve: StrictInt = Field(ge=0, le=100_000)
     cleanup_status: CleanupStatus
+    consecutive_service_instability: StrictInt = Field(default=0, ge=0, le=100)
+    cleanup_barrier_reference: OpaqueIdentifier | None = None
 
     @model_validator(mode="after")
     def validate_budget(self) -> "BudgetState":
@@ -816,6 +860,9 @@ class ResearchState(ResearchContract):
     experiment_outcomes: tuple[ExperimentOutcome, ...] = Field(
         default=(), max_length=10_000
     )
+    experiment_history: tuple[ResearchExperimentRecord, ...] = Field(
+        default=(), max_length=10_000
+    )
     findings: tuple[FindingRecord, ...] = Field(default=(), max_length=2_000)
     attack_chains: tuple[AttackChain, ...] = Field(default=(), max_length=500)
     budgets: tuple[BudgetState, ...] = Field(default=(), max_length=20)
@@ -841,6 +888,7 @@ class ResearchState(ResearchContract):
             ("relationships", "relationship_id"),
             ("hypotheses", "hypothesis_id"),
             ("experiment_outcomes", "outcome_id"),
+            ("experiment_history", "experiment_id"),
             ("findings", "finding_id"),
             ("attack_chains", "attack_chain_id"),
             ("budgets", "budget_reference"),
@@ -1009,6 +1057,12 @@ class ResearchState(ResearchContract):
             _require_reference(
                 item.provenance_id, provenance_ids, "hypothesis provenance"
             )
+            _require_references(item.basis_fact_ids, fact_ids, "hypothesis basis facts")
+            _require_references(
+                item.basis_relationship_ids,
+                relationship_ids,
+                "hypothesis basis relationships",
+            )
         for item in self.experiment_outcomes:
             _require_references(
                 item.evidence_references, evidence_ids, "outcome evidence"
@@ -1021,6 +1075,13 @@ class ResearchState(ResearchContract):
                 item.candidate_finding_ids, finding_ids, "outcome findings"
             )
             _require_reference(item.provenance_id, provenance_ids, "outcome provenance")
+        for item in self.experiment_history:
+            _require_reference(
+                item.hypothesis_id, hypothesis_ids, "experiment history hypothesis"
+            )
+            _require_optional_reference(
+                item.surface_id, surface_ids, "experiment history surface"
+            )
         for item in self.findings:
             _require_reference(
                 item.source_hypothesis_id, hypothesis_ids, "finding hypothesis"

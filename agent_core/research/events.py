@@ -42,6 +42,7 @@ class ResearchEventType(str, Enum):
     hypothesis_created = "hypothesis_created"
     hypothesis_status_changed = "hypothesis_status_changed"
     experiment_outcome_recorded = "experiment_outcome_recorded"
+    research_evaluation_recorded = "research_evaluation_recorded"
     finding_status_changed = "finding_status_changed"
     budget_updated = "budget_updated"
     research_state_transitioned = "research_state_transitioned"
@@ -103,6 +104,12 @@ class HypothesisStatusChangedPayload(ResearchContract):
 
 class ExperimentOutcomeRecordedPayload(ResearchContract):
     event_type: Literal["experiment_outcome_recorded"] = "experiment_outcome_recorded"
+    outcome_id: ExperimentOutcomeId
+
+
+class ResearchEvaluationRecordedPayload(ResearchContract):
+    event_type: Literal["research_evaluation_recorded"] = "research_evaluation_recorded"
+    evaluation_id: OpaqueIdentifier
     outcome_id: ExperimentOutcomeId
 
 
@@ -175,6 +182,7 @@ ResearchEventPayload: TypeAlias = Annotated[
     | HypothesisCreatedPayload
     | HypothesisStatusChangedPayload
     | ExperimentOutcomeRecordedPayload
+    | ResearchEvaluationRecordedPayload
     | FindingStatusChangedPayload
     | BudgetUpdatedPayload
     | ResearchStateTransitionedPayload

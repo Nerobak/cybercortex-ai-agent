@@ -279,6 +279,16 @@ class ExperimentRuntimeStatus(str, Enum):
     cleanup_pending = "cleanup_pending"
 
 
+class ResearchExperimentStatus(str, Enum):
+    """Durable disposition used by autonomous selection and deduplication."""
+
+    completed = "completed"
+    policy_blocked = "policy_blocked"
+    duplicate_blocked = "duplicate_blocked"
+    runtime_failed = "runtime_failed"
+    cleanup_failed = "cleanup_failed"
+
+
 class CleanupStatus(str, Enum):
     not_required = "not_required"
     reserved = "reserved"
