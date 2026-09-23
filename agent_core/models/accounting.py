@@ -332,8 +332,30 @@ class ModelCallLedger:
     def __init__(self) -> None:
         self._records: list[ModelCallRecord] = []
         self._pending: dict[int, ModelReservationCommit] = {}
+        self._restored_usage: dict[str | None, ModelUsageDelta] = {}
         self._next_sequence = 0
         self._lock = RLock()
+
+    def restore_run_usage(self, run_id: str, usage: ModelUsageDelta) -> None:
+        """Restore one persisted aggregate before routing resumes.
+
+        Restored usage participates in budget preflight and snapshots, but is not
+        represented as newly emitted call records.  This keeps process restarts
+        from either refunding prior calls or fabricating provider activity.
+        """
+
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("restored model usage requires a run_id")
+        if not isinstance(usage, ModelUsageDelta):
+            raise TypeError("restored model usage must be a ModelUsageDelta")
+        with self._lock:
+            if run_id in self._restored_usage:
+                raise ValueError("model usage was already restored for this run")
+            if any(item.run_id == run_id for item in self._records) or any(
+                item.run_id == run_id for item in self._pending.values()
+            ):
+                raise ValueError("model usage must be restored before routing")
+            self._restored_usage[run_id] = usage
 
     @contextmanager
     def routing_transaction(self) -> Iterator[None]:
@@ -562,14 +584,22 @@ class ModelCallLedger:
             pending = tuple(
                 item for item in self._pending.values() if item.run_id == run_id
             )
-        return _aggregate(selected, pending)
+            restored = self._restored_usage.get(run_id, ModelUsageDelta())
+        return add_model_usage_deltas(restored, _aggregate(selected, pending))
 
     def snapshot(self, *, run_id: str | None) -> ModelLedgerSnapshot:
         with self._lock:
             position = self._next_sequence
-            usage = _aggregate(
-                tuple(record for record in self._records if record.run_id == run_id),
-                tuple(item for item in self._pending.values() if item.run_id == run_id),
+            usage = add_model_usage_deltas(
+                self._restored_usage.get(run_id, ModelUsageDelta()),
+                _aggregate(
+                    tuple(
+                        record for record in self._records if record.run_id == run_id
+                    ),
+                    tuple(
+                        item for item in self._pending.values() if item.run_id == run_id
+                    ),
+                ),
             )
         return ModelLedgerSnapshot(position=position, run_id=run_id, usage=usage)
 
