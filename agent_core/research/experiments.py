@@ -129,7 +129,9 @@ class ExperimentProposal(ResearchContract):
     )
     provenance_id: OpaqueIdentifier
     model_decision_id: OpaqueIdentifier | None = None
-    expires_at: Timestamp
+    # The model may omit expiry. The deterministic compiler is the authority
+    # that supplies and bounds the experiment deadline.
+    expires_at: Timestamp | None = None
 
     @model_validator(mode="after")
     def enforce_advisory_boundary(self) -> "ExperimentProposal":

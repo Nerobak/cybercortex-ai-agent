@@ -582,9 +582,9 @@ class ExperimentCompiler:
             _fail(CompilerErrorCode.research_mismatch)
         if proposal.state_revision != state.revision:
             _fail(CompilerErrorCode.stale_state_revision)
-        if _parse_timestamp(proposal.expires_at) <= _parse_timestamp(
-            context.current_time
-        ):
+        if proposal.expires_at is not None and _parse_timestamp(
+            proposal.expires_at
+        ) <= _parse_timestamp(context.current_time):
             _fail(CompilerErrorCode.expired_proposal)
 
     @staticmethod
@@ -1469,11 +1469,17 @@ def _parse_timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _derive_expiry(proposal_expiry: str, context: ExperimentCompilerContext) -> str:
+def _derive_expiry(
+    proposal_expiry: str | None, context: ExperimentCompilerContext
+) -> str:
     deadline = _parse_timestamp(context.current_time) + timedelta(
         seconds=context.experiment_ttl_seconds
     )
-    expiry = min(_parse_timestamp(proposal_expiry), deadline)
+    expiry = (
+        deadline
+        if proposal_expiry is None
+        else min(_parse_timestamp(proposal_expiry), deadline)
+    )
     return expiry.isoformat()
 
 

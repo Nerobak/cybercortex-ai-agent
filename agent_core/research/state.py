@@ -200,6 +200,66 @@ class Parameter(ResearchContract):
         return self
 
 
+class RequestIdentityRequirement(ResearchContract):
+    """Structural authentication metadata without credential material."""
+
+    required: StrictBool = False
+    mechanisms: tuple[Literal["authorization_header", "cookie"], ...] = Field(
+        default=(), max_length=2
+    )
+    role_reference: OpaqueIdentifier | None = None
+    tenant_bound: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_mechanisms(self) -> "RequestIdentityRequirement":
+        object.__setattr__(
+            self,
+            "mechanisms",
+            _canonical_references(self.mechanisms, "identity mechanisms"),
+        )
+        if self.mechanisms and not self.required:
+            raise ValueError("identity mechanisms require an identity")
+        return self
+
+
+class ResearchRequestTemplate(ResearchContract):
+    """Persistent, secret-free structural request registration."""
+
+    template_id: OpaqueIdentifier
+    target_id: TargetAssetId
+    surface_id: SurfaceId
+    endpoint_id: EndpointId
+    method: HttpMethod
+    route_reference: PublicText
+    parameter_ids: tuple[ParameterId, ...] = Field(default=(), max_length=100)
+    body_shape_reference: OpaqueIdentifier | None = None
+    content_type: OpaqueIdentifier | None = None
+    identity_requirement: RequestIdentityRequirement = Field(
+        default_factory=RequestIdentityRequirement
+    )
+    source_capture_references: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=100
+    )
+    evidence_references: tuple[EvidenceArtifactId, ...] = Field(
+        min_length=1, max_length=100
+    )
+    provenance_id: ProvenanceRecordId
+
+    @model_validator(mode="after")
+    def validate_collections(self) -> "ResearchRequestTemplate":
+        for field_name in (
+            "parameter_ids",
+            "source_capture_references",
+            "evidence_references",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _canonical_references(getattr(self, field_name), field_name),
+            )
+        return self
+
+
 class Identity(ResearchContract):
     identity_id: IdentityId
     account_reference: OpaqueIdentifier
@@ -739,6 +799,34 @@ class SurfaceBudgetUsage(ResearchContract):
     experiment_count: StrictInt = Field(ge=0, le=10_000)
 
 
+class ResearchBootstrapProgress(ResearchContract):
+    """Durable bootstrap checkpoint backed by authoritative ledger deltas."""
+
+    bootstrap_id: OpaqueIdentifier
+    target_id: TargetAssetId
+    discovery_plan_reference: OpaqueIdentifier | None = None
+    discovery_completed: StrictBool = False
+    modeling_completed: StrictBool = False
+    hypothesizing_completed: StrictBool = False
+    request_delta: RequestDelta = Field(default_factory=RequestDelta)
+    model_usage_delta: ModelUsageDelta = Field(default_factory=ModelUsageDelta)
+    started_at: Timestamp
+    updated_at: Timestamp
+    limitations: tuple[ShortPublicText, ...] = Field(default=(), max_length=100)
+    provenance_id: ProvenanceRecordId
+
+    @model_validator(mode="after")
+    def validate_progress(self) -> "ResearchBootstrapProgress":
+        if self.hypothesizing_completed and not self.modeling_completed:
+            raise ValueError("hypothesizing completion requires modeling completion")
+        if self.modeling_completed and not self.discovery_completed:
+            raise ValueError("modeling completion requires discovery completion")
+        if _as_datetime(self.updated_at) < _as_datetime(self.started_at):
+            raise ValueError("bootstrap update cannot precede its start")
+        object.__setattr__(self, "limitations", tuple(sorted(set(self.limitations))))
+        return self
+
+
 class ResearchExperimentRecord(ResearchContract):
     """Secret-free experiment history retained across process restarts."""
 
@@ -843,6 +931,9 @@ class ResearchState(ResearchContract):
     surfaces: tuple[Surface, ...] = Field(default=(), max_length=2_000)
     endpoints: tuple[Endpoint, ...] = Field(default=(), max_length=5_000)
     parameters: tuple[Parameter, ...] = Field(default=(), max_length=10_000)
+    request_templates: tuple[ResearchRequestTemplate, ...] = Field(
+        default=(), max_length=5_000
+    )
     identities: tuple[Identity, ...] = Field(default=(), max_length=200)
     session_refs: tuple[SessionRef, ...] = Field(default=(), max_length=1_000)
     token_refs: tuple[TokenRef, ...] = Field(default=(), max_length=1_000)
@@ -866,6 +957,9 @@ class ResearchState(ResearchContract):
     findings: tuple[FindingRecord, ...] = Field(default=(), max_length=2_000)
     attack_chains: tuple[AttackChain, ...] = Field(default=(), max_length=500)
     budgets: tuple[BudgetState, ...] = Field(default=(), max_length=20)
+    bootstrap_progress: tuple[ResearchBootstrapProgress, ...] = Field(
+        default=(), max_length=64
+    )
     provenance: tuple[ProvenanceRecord, ...] = Field(default=(), max_length=20_000)
 
     @model_validator(mode="after")
@@ -875,6 +969,7 @@ class ResearchState(ResearchContract):
             ("surfaces", "surface_id"),
             ("endpoints", "endpoint_id"),
             ("parameters", "parameter_id"),
+            ("request_templates", "template_id"),
             ("identities", "identity_id"),
             ("session_refs", "session_ref_id"),
             ("token_refs", "token_ref_id"),
@@ -892,6 +987,7 @@ class ResearchState(ResearchContract):
             ("findings", "finding_id"),
             ("attack_chains", "attack_chain_id"),
             ("budgets", "budget_reference"),
+            ("bootstrap_progress", "bootstrap_id"),
             ("provenance", "provenance_id"),
         )
         for field_name, id_field in collections:
@@ -916,6 +1012,7 @@ class ResearchState(ResearchContract):
         parameter_ids = {item.parameter_id for item in self.parameters}
         identity_ids = {item.identity_id for item in self.identities}
         evidence_ids = {item.evidence_id for item in self.evidence}
+        evidence_source_references = {item.source_reference for item in self.evidence}
         fact_ids = {item.fact_id for item in self.facts}
         relationship_ids = {item.relationship_id for item in self.relationships}
         hypothesis_ids = {item.hypothesis_id for item in self.hypotheses}
@@ -956,6 +1053,45 @@ class ResearchState(ResearchContract):
             )
             _require_references(
                 item.evidence_references, evidence_ids, "parameter evidence"
+            )
+        for item in self.request_templates:
+            _require_reference(item.target_id, target_ids, "request template target")
+            _require_reference(item.surface_id, surface_ids, "request template surface")
+            _require_reference(
+                item.endpoint_id, endpoint_ids, "request template endpoint"
+            )
+            endpoint = next(
+                value
+                for value in self.endpoints
+                if value.endpoint_id == item.endpoint_id
+            )
+            if (
+                endpoint.target_id != item.target_id
+                or endpoint.surface_id != item.surface_id
+                or endpoint.method is not item.method
+                or endpoint.route_template != item.route_reference
+            ):
+                raise ValueError("request template does not match its endpoint")
+            endpoint_parameter_ids = {
+                value.parameter_id
+                for value in self.parameters
+                if value.endpoint_id == item.endpoint_id
+            }
+            _require_references(
+                item.parameter_ids,
+                endpoint_parameter_ids,
+                "request template parameters",
+            )
+            _require_references(
+                item.evidence_references, evidence_ids, "request template evidence"
+            )
+            _require_references(
+                item.source_capture_references,
+                evidence_source_references,
+                "request template capture provenance",
+            )
+            _require_reference(
+                item.provenance_id, provenance_ids, "request template provenance"
             )
         for item in self.identities:
             _require_reference(
@@ -1120,6 +1256,11 @@ class ResearchState(ResearchContract):
                 tuple(usage.surface_id for usage in item.surface_usage),
                 surface_ids,
                 "budget surfaces",
+            )
+        for item in self.bootstrap_progress:
+            _require_reference(item.target_id, target_ids, "bootstrap target")
+            _require_reference(
+                item.provenance_id, provenance_ids, "bootstrap provenance"
             )
 
         # These sets are also used by entity-reference validation and keeping

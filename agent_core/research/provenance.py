@@ -43,6 +43,7 @@ _SYNTHETIC_SECRET = re.compile(
     re.IGNORECASE,
 )
 _API_KEY = re.compile(r"^(?:sk|pk|api)[-_][A-Za-z0-9_-]{12,}$", re.IGNORECASE)
+_SAFE_API_IDENTIFIER = re.compile(r"^api[-_]authorization$", re.IGNORECASE)
 _REDACTED_VALUES = frozenset({"[redacted]", "[redacted jwt]", "<redacted>", "redacted"})
 
 
@@ -111,7 +112,10 @@ def reject_secret_material(value: Any, *, location: str = "research mutation") -
             raise SecretMaterialRejected(
                 f"{location} contains embedded secret material"
             )
-        if _SYNTHETIC_SECRET.search(candidate) or _API_KEY.fullmatch(candidate.strip()):
+        if _SYNTHETIC_SECRET.search(candidate) or (
+            _API_KEY.fullmatch(candidate.strip())
+            and not _SAFE_API_IDENTIFIER.fullmatch(candidate.strip())
+        ):
             raise SecretMaterialRejected(
                 f"{location} contains secret sentinel material"
             )

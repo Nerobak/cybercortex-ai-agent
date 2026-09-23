@@ -39,7 +39,10 @@ from agent_core.research.state import (
     Observation,
     Parameter,
     ProvenanceRecord,
+    RequestIdentityRequirement,
     Relationship,
+    ResearchBootstrapProgress,
+    ResearchRequestTemplate,
     RequestBudgetSnapshot,
     ResearchObject,
     ResearchExperimentRecord,
@@ -366,6 +369,17 @@ from agent_core.research.orchestrator import (
     ResearchLoopResult,
     SecurityResearchOrchestrator,
 )
+from agent_core.research.adapters import (
+    AttackSurfaceResearchAdapter,
+    ControlledContextResearchAdapter,
+)
+from agent_core.research.bootstrap import (
+    BOOTSTRAP_VERSION,
+    BootstrapStopReason,
+    ResearchBootstrapLimits,
+    ResearchBootstrapper,
+)
+from agent_core.research.templates import RequestTemplateFactory
 
 __all__ = [
     "EvidenceRelationshipHypothesisRule",
@@ -397,6 +411,9 @@ __all__ = [
     "ResearchEvaluation",
     "ResearchExperimentRecord",
     "ResearchExperimentStatus",
+    "ResearchBootstrapProgress",
+    "ResearchRequestTemplate",
+    "RequestIdentityRequirement",
     "ResearchLoopResult",
     "ResearchModelFailure",
     "ResearchReasoningEngine",
@@ -407,6 +424,13 @@ __all__ = [
     "ResearchStrategyDecision",
     "ResearchStrategyProvenance",
     "SecurityResearchOrchestrator",
+    "AttackSurfaceResearchAdapter",
+    "BOOTSTRAP_VERSION",
+    "BootstrapStopReason",
+    "ControlledContextResearchAdapter",
+    "RequestTemplateFactory",
+    "ResearchBootstrapLimits",
+    "ResearchBootstrapper",
     "material_experiment_fingerprint",
     "AuthorizationBlockedError",
     "AuthoritativeExperimentOutcome",

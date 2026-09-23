@@ -88,6 +88,13 @@ class ResearchEvidencePacket(ResearchContract):
     surfaces: tuple[dict[str, JsonValue], ...] = Field(default=(), max_length=200)
     endpoints: tuple[dict[str, JsonValue], ...] = Field(default=(), max_length=500)
     parameters: tuple[dict[str, JsonValue], ...] = Field(default=(), max_length=1_000)
+    request_templates: tuple[dict[str, JsonValue], ...] = Field(
+        default=(), max_length=500
+    )
+    graphql_operations: tuple[dict[str, JsonValue], ...] = Field(
+        default=(), max_length=200
+    )
+    workflows: tuple[dict[str, JsonValue], ...] = Field(default=(), max_length=200)
     safe_evidence_summaries: tuple[dict[str, JsonValue], ...] = Field(
         default=(), max_length=500
     )
@@ -95,6 +102,12 @@ class ResearchEvidencePacket(ResearchContract):
     relationships: tuple[dict[str, JsonValue], ...] = Field(default=(), max_length=500)
     controlled_identities: tuple[dict[str, JsonValue], ...] = Field(
         default=(), max_length=200
+    )
+    controlled_sessions: tuple[dict[str, JsonValue], ...] = Field(
+        default=(), max_length=500
+    )
+    controlled_tokens: tuple[dict[str, JsonValue], ...] = Field(
+        default=(), max_length=500
     )
     controlled_objects: tuple[dict[str, JsonValue], ...] = Field(
         default=(), max_length=500
@@ -106,6 +119,13 @@ class ResearchEvidencePacket(ResearchContract):
     remaining_budgets: dict[str, JsonValue]
     available_execution_primitives: tuple[dict[str, JsonValue], ...] = Field(
         default=(), max_length=100
+    )
+    proposal_timing: dict[str, JsonValue] = Field(
+        default_factory=lambda: {
+            "authority": "deterministic_compiler",
+            "model_supplies_expiry": False,
+            "maximum_ttl_seconds": 900,
+        }
     )
     policy_limitations: tuple[str, ...] = Field(default=(), max_length=100)
 
@@ -188,9 +208,14 @@ class PublicSafeResearchPacketBuilder:
         self,
         registry: ExperimentRegistry,
         budget_manager: ResearchBudgetManager,
+        *,
+        proposal_ttl_seconds: int = 900,
     ) -> None:
+        if not 1 <= proposal_ttl_seconds <= 86_400:
+            raise ValueError("proposal TTL is outside the supported bound")
         self.registry = registry
         self.budget_manager = budget_manager
+        self.proposal_ttl_seconds = proposal_ttl_seconds
 
     def build(
         self,
@@ -213,6 +238,13 @@ class PublicSafeResearchPacketBuilder:
             for item in state.hypotheses
             if item.hypothesis_id in unresolved and item.surface_id is not None
         }
+        if not unresolved:
+            target_ids = {item.target_id for item in state.targets}
+            surface_ids = {
+                item.surface_id
+                for item in state.surfaces
+                if item.target_id in target_ids
+            }
         endpoint_ids = {
             item.endpoint_id
             for item in state.endpoints
@@ -224,6 +256,32 @@ class PublicSafeResearchPacketBuilder:
             if item.hypothesis_id in unresolved
             for reference in (*item.supporting_evidence, *item.refuting_evidence)
         }
+        if not unresolved:
+            evidence_ids.update(
+                reference
+                for item in state.surfaces
+                if item.surface_id in surface_ids
+                for reference in item.evidence_references
+            )
+            evidence_ids.update(
+                reference
+                for item in state.observations
+                if item.target_id in target_ids
+                and (item.surface_id is None or item.surface_id in surface_ids)
+                for reference in item.evidence_references
+            )
+        evidence_ids.update(
+            reference
+            for item in state.endpoints
+            if item.endpoint_id in endpoint_ids
+            for reference in item.evidence_references
+        )
+        evidence_ids.update(
+            reference
+            for item in state.parameters
+            if item.endpoint_id in endpoint_ids
+            for reference in item.evidence_references
+        )
         budget = self.budget_manager.state(state)
         packet = ResearchEvidencePacket(
             research_id=state.research_id,
@@ -243,6 +301,7 @@ class PublicSafeResearchPacketBuilder:
                     "confirmation_policy_reference": (
                         item.confirmation_policy_reference
                     ),
+                    "provenance_id": item.provenance_id,
                     "supporting_evidence": list(item.supporting_evidence),
                     "refuting_evidence": list(item.refuting_evidence),
                     "attempt_count": item.attempt_count,
@@ -294,6 +353,62 @@ class PublicSafeResearchPacketBuilder:
                 for item in state.parameters
                 if item.endpoint_id in endpoint_ids
             ),
+            request_templates=tuple(
+                {
+                    "template_id": item.template_id,
+                    "target_id": item.target_id,
+                    "surface_id": item.surface_id,
+                    "endpoint_id": item.endpoint_id,
+                    "method": item.method.value,
+                    "route_reference": item.route_reference,
+                    "parameter_ids": list(item.parameter_ids),
+                    "body_shape_reference": item.body_shape_reference,
+                    "content_type": item.content_type,
+                    "identity_required": item.identity_requirement.required,
+                    "identity_mechanisms": list(item.identity_requirement.mechanisms),
+                    "required_role_reference": (
+                        item.identity_requirement.role_reference
+                    ),
+                    "tenant_bound": item.identity_requirement.tenant_bound,
+                    "evidence_references": list(item.evidence_references),
+                }
+                for item in state.request_templates
+                if item.endpoint_id in endpoint_ids
+            ),
+            graphql_operations=tuple(
+                {
+                    "operation_id": item.operation_id,
+                    "surface_id": item.surface_id,
+                    "endpoint_id": item.endpoint_id,
+                    "operation_name": item.operation_name,
+                    "operation_type": item.operation_type.value,
+                    "root_fields": list(item.root_fields),
+                    "variable_parameter_ids": list(item.variable_parameter_ids),
+                    "evidence_references": list(item.evidence_references),
+                }
+                for item in state.graphql_operations
+                if item.endpoint_id in endpoint_ids
+            ),
+            workflows=tuple(
+                {
+                    "workflow_id": item.workflow_id,
+                    "surface_id": item.surface_id,
+                    "name": item.name,
+                    "steps": [
+                        {
+                            "step_id": step.step_id,
+                            "sequence": step.sequence,
+                            "endpoint_id": step.endpoint_id,
+                            "method": step.method.value if step.method else None,
+                            "state_changing": step.state_changing,
+                        }
+                        for step in item.steps
+                    ],
+                    "evidence_references": list(item.evidence_references),
+                }
+                for item in state.workflows
+                if item.surface_id in surface_ids
+            ),
             safe_evidence_summaries=tuple(
                 {
                     "evidence_id": item.evidence_id,
@@ -338,17 +453,51 @@ class PublicSafeResearchPacketBuilder:
                 for item in state.identities
                 if item.controlled
             ),
+            controlled_sessions=tuple(
+                {
+                    "session_ref_id": item.session_ref_id,
+                    "identity_id": item.identity_id,
+                    "lifecycle": item.lifecycle.value,
+                    "expires_at": item.expires_at,
+                }
+                for item in state.session_refs
+                if item.identity_id
+                in {
+                    identity.identity_id
+                    for identity in state.identities
+                    if identity.controlled
+                }
+            ),
+            controlled_tokens=tuple(
+                {
+                    "token_ref_id": item.token_ref_id,
+                    "identity_id": item.identity_id,
+                    "token_kind": item.token_kind.value,
+                    "lifecycle": item.lifecycle.value,
+                    "issuer_reference": item.issuer_reference,
+                    "audience_references": list(item.audience_references),
+                    "expires_at": item.expires_at,
+                }
+                for item in state.token_refs
+                if item.identity_id
+                in {
+                    identity.identity_id
+                    for identity in state.identities
+                    if identity.controlled
+                }
+            ),
             controlled_objects=tuple(
                 {
                     "object_id": item.object_id,
                     "surface_id": item.surface_id,
                     "object_type": item.object_type,
+                    "object_reference": item.object_reference,
                     "owner_identity_id": item.owner_identity_id,
                     "tenant_reference": item.tenant_reference,
                     "test_owned": item.test_owned,
                 }
                 for item in state.objects
-                if item.test_owned
+                if item.test_owned and item.target_id in target_ids
             ),
             previous_experiments=tuple(
                 {
@@ -387,6 +536,7 @@ class PublicSafeResearchPacketBuilder:
                 {
                     "name": item.name,
                     "version": item.version,
+                    "input_schema_reference": item.input_schema_reference,
                     "minimum_requests": item.minimum_requests,
                     "worst_case_requests": item.worst_case_requests,
                     "risk": item.risk_class.value,
@@ -397,6 +547,11 @@ class PublicSafeResearchPacketBuilder:
                 for item in self.registry.definitions
                 if item.capability_state is PrimitiveCapabilityState.execution_available
             ),
+            proposal_timing={
+                "authority": "deterministic_compiler",
+                "model_supplies_expiry": False,
+                "maximum_ttl_seconds": self.proposal_ttl_seconds,
+            },
             policy_limitations=policy_limitations,
         )
         return packet
@@ -431,8 +586,10 @@ class ResearchReasoningEngine:
             system_instructions=RESEARCH_STRATEGY_SYSTEM_INSTRUCTIONS,
             user_content=(
                 "Return one strict ResearchStrategyCandidate JSON object. "
-                "Use only proposal primitives listed as available. Pretty print JSON "
-                "with one field per line so each public-safe line remains bounded."
+                "Use only proposal primitives listed as available. Omit proposal "
+                "expires_at so the deterministic compiler supplies the deadline. "
+                "Pretty print JSON with one field per line so each public-safe line "
+                "remains bounded."
             ),
             evidence=packet_payload,
             structured_output=True,
@@ -530,10 +687,17 @@ def _packet_references(packet: ResearchEvidencePacket) -> set[str]:
         packet.surfaces,
         packet.endpoints,
         packet.parameters,
+        packet.request_templates,
+        packet.graphql_operations,
+        packet.workflows,
         packet.safe_evidence_summaries,
         packet.facts,
         packet.relationships,
         packet.previous_experiments,
+        packet.controlled_identities,
+        packet.controlled_sessions,
+        packet.controlled_tokens,
+        packet.controlled_objects,
     ):
         for item in collection:
             for key, value in item.items():

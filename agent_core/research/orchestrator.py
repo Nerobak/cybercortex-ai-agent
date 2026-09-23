@@ -51,6 +51,7 @@ from agent_core.research.types import (
 
 
 class OrchestratorStopReason(str, Enum):
+    no_research_hypotheses = "no_research_hypotheses"
     no_eligible_hypotheses = "no_eligible_hypotheses"
     no_eligible_experiments = "no_eligible_experiments"
     global_experiment_budget_exhausted = "global_experiment_budget_exhausted"
@@ -101,6 +102,7 @@ class SecurityResearchOrchestrator:
         compiler_context: ExperimentCompilerContext | None = None,
         runtime: object | None = None,
         policy_limitations: tuple[str, ...] = (),
+        bootstrapper: object | None = None,
     ) -> None:
         self.store = store
         self.compiler = compiler
@@ -116,6 +118,7 @@ class SecurityResearchOrchestrator:
         self.compiler_context = compiler_context or compiler.context
         self.runtime = runtime or getattr(gate, "runtime", None)
         self.policy_limitations = policy_limitations
+        self.bootstrapper = bootstrapper
         if self.compiler_context is None:
             raise TypeError("the research orchestrator requires compiler context")
         if self.runtime is None:
@@ -142,6 +145,11 @@ class SecurityResearchOrchestrator:
         static_proposals = tuple(proposals)
 
         state = self._prepare(self.store.load_research(research_id))
+        if self.bootstrapper is not None:
+            context_adapter = getattr(self.bootstrapper, "compiler_context", None)
+            if callable(context_adapter):
+                self.compiler_context = context_adapter(state, self.compiler_context)
+                self.compiler.context = self.compiler_context
         if state.status in {ResearchRunStatus.stopped, ResearchRunStatus.failed}:
             return ResearchLoopResult(
                 research_id=research_id,
@@ -188,7 +196,11 @@ class SecurityResearchOrchestrator:
                 reason = (
                     OrchestratorStopReason.all_hypotheses_resolved
                     if state.hypotheses
-                    else OrchestratorStopReason.no_eligible_hypotheses
+                    else (
+                        OrchestratorStopReason.no_research_hypotheses
+                        if self.bootstrapper is not None
+                        else OrchestratorStopReason.no_eligible_hypotheses
+                    )
                 )
                 state = self._report_and_stop(state, reason)
                 return ResearchLoopResult(
@@ -455,6 +467,14 @@ class SecurityResearchOrchestrator:
             )
 
     def _prepare(self, state: ResearchState) -> ResearchState:
+        if self.bootstrapper is not None:
+            prepare = getattr(self.bootstrapper, "prepare", None)
+            if not callable(prepare):
+                raise TypeError("research bootstrapper must provide prepare(state)")
+            prepared = prepare(state)
+            if not isinstance(prepared, ResearchState):
+                raise TypeError("research bootstrapper returned invalid state")
+            return prepared
         paths = {
             ResearchRunStatus.initializing: (
                 ResearchRunStatus.discovering,
