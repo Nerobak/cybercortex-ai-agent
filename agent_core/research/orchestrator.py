@@ -225,6 +225,7 @@ class SecurityResearchOrchestrator:
 
             decision = None
             model_proposals: tuple[ExperimentProposal, ...] = ()
+            model_failure_code: str | None = None
             if self.reasoning_engine is not None:
                 try:
                     packet = self.packet_builder.build(  # type: ignore[union-attr]
@@ -248,12 +249,23 @@ class SecurityResearchOrchestrator:
                         )
                     model_proposals = decision.proposals
                 except ResearchReasoningError as exc:
+                    model_failure_code = {
+                        "invalid_output": "model_invalid_structured_response",
+                        "provider_unavailable": "model_provider_unavailable",
+                        "timeout": "model_timeout",
+                        "rate_limited": "model_rate_limited",
+                        "model_budget_exhausted": "model_budget_rejection",
+                        "schema_rejected": "model_schema_rejection",
+                    }[exc.reason.value]
                     invalid_model_outputs += 1
                     if (
                         "budget" in exc.reason.value
                         and not static_proposals
                         and self.proposal_source is None
                     ):
+                        state = self._with_diagnostic_codes(
+                            state, model_failure_code, "model_budget_rejection"
+                        )
                         state = self._stop(
                             state, OrchestratorStopReason.model_budget_exhausted
                         )
@@ -271,6 +283,9 @@ class SecurityResearchOrchestrator:
                         and not static_proposals
                         and self.proposal_source is None
                     ):
+                        state = self._with_diagnostic_codes(
+                            state, model_failure_code, "model_reasoning_failure"
+                        )
                         state = self._stop(
                             state, OrchestratorStopReason.invalid_model_output_limit
                         )
@@ -318,6 +333,28 @@ class SecurityResearchOrchestrator:
                     update={"selected": None, "stop_reason": "no-material-pivot"}
                 )
             if selection.selected is None:
+                diagnostic_codes = []
+                if model_failure_code is not None:
+                    diagnostic_codes.append(model_failure_code)
+                if not candidates:
+                    diagnostic_codes.append("no_proposal")
+                elif any(
+                    reason.value == "invalid_proposal"
+                    for assessment in selection.assessments
+                    for reason in assessment.reasons
+                ):
+                    diagnostic_codes.append("compiler_rejection")
+                else:
+                    diagnostic_codes.append("selector_rejection")
+                if not state.objects:
+                    diagnostic_codes.append("missing_controlled_object")
+                if any(
+                    item.identity_requirement.required
+                    and not item.identity_requirement.mechanisms
+                    for item in state.request_templates
+                ):
+                    diagnostic_codes.append("missing_authentication_mechanism")
+                state = self._with_diagnostic_codes(state, *diagnostic_codes)
                 reason = self._selection_stop_reason(selection)
                 state = self._stop(state, reason)
                 return ResearchLoopResult(
@@ -498,7 +535,12 @@ class SecurityResearchOrchestrator:
         return state
 
     def _transition(
-        self, state: ResearchState, next_status: ResearchRunStatus, reason: str
+        self,
+        state: ResearchState,
+        next_status: ResearchRunStatus,
+        reason: str,
+        *,
+        replacement: ResearchState | None = None,
     ) -> ResearchState:
         occurred_at = self._now(state.updated_at)
         machine = ResearchStateMachine(state)
@@ -512,6 +554,14 @@ class SecurityResearchOrchestrator:
             occurred_at=occurred_at,
         )
         next_state = machine.snapshot()
+        if replacement is not None:
+            payload = replacement.model_dump(mode="python")
+            payload.update(
+                revision=next_state.revision,
+                status=next_state.status,
+                updated_at=next_state.updated_at,
+            )
+            next_state = ResearchState.model_validate(payload)
         return self.store.commit_revision(
             state.research_id,
             expected_revision=state.revision,
@@ -522,11 +572,50 @@ class SecurityResearchOrchestrator:
     def _stop(
         self, state: ResearchState, reason: OrchestratorStopReason
     ) -> ResearchState:
+        persisted = self.store.load_research(state.research_id)
+        if persisted.revision != state.revision or persisted.status is not state.status:
+            persisted = state
+        synchronized = self._with_synchronized_budget(state)
         if state.status is ResearchRunStatus.reporting:
-            return self._transition(state, ResearchRunStatus.stopped, reason.value)
+            return self._transition(
+                persisted,
+                ResearchRunStatus.stopped,
+                reason.value,
+                replacement=synchronized,
+            )
         if ResearchRunStatus.stopped in self._allowed_next(state):
-            return self._transition(state, ResearchRunStatus.stopped, reason.value)
-        return self._transition(state, ResearchRunStatus.failed, reason.value)
+            return self._transition(
+                persisted,
+                ResearchRunStatus.stopped,
+                reason.value,
+                replacement=synchronized,
+            )
+        return self._transition(
+            persisted,
+            ResearchRunStatus.failed,
+            reason.value,
+            replacement=synchronized,
+        )
+
+    def _with_synchronized_budget(self, state: ResearchState) -> ResearchState:
+        synchronized = self.budget_manager.state(state)
+        budgets = {item.budget_reference: item for item in state.budgets}
+        budgets[synchronized.budget_reference] = synchronized
+        return ResearchState.model_validate(
+            {
+                **state.model_dump(mode="python"),
+                "budgets": tuple(budgets[key] for key in sorted(budgets)),
+            }
+        )
+
+    @staticmethod
+    def _with_diagnostic_codes(state: ResearchState, *codes: str) -> ResearchState:
+        return ResearchState.model_validate(
+            {
+                **state.model_dump(mode="python"),
+                "diagnostic_codes": tuple(sorted({*state.diagnostic_codes, *codes})),
+            }
+        )
 
     def _report_and_stop(
         self, state: ResearchState, reason: OrchestratorStopReason

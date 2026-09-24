@@ -316,6 +316,7 @@ class ResearchObject(ResearchContract):
     owner_identity_id: IdentityId | None = None
     tenant_reference: OpaqueIdentifier | None = None
     test_owned: StrictBool
+    parameter_references: tuple[ParameterId, ...] = Field(default=(), max_length=100)
     evidence_references: tuple[EvidenceArtifactId, ...] = Field(
         min_length=1, max_length=100
     )
@@ -330,6 +331,13 @@ class ResearchObject(ResearchContract):
         )
         if self.test_owned and self.owner_identity_id is None:
             raise ValueError("a test-owned object requires an owner identity")
+        object.__setattr__(
+            self,
+            "parameter_references",
+            _canonical_references(
+                self.parameter_references, "object parameter references"
+            ),
+        )
         return self
 
 
@@ -960,6 +968,7 @@ class ResearchState(ResearchContract):
     bootstrap_progress: tuple[ResearchBootstrapProgress, ...] = Field(
         default=(), max_length=64
     )
+    diagnostic_codes: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=100)
     provenance: tuple[ProvenanceRecord, ...] = Field(default=(), max_length=20_000)
 
     @model_validator(mode="after")
@@ -999,6 +1008,11 @@ class ResearchState(ResearchContract):
                 field_name,
                 tuple(sorted(values, key=lambda item: getattr(item, id_field))),
             )
+        object.__setattr__(
+            self,
+            "diagnostic_codes",
+            _canonical_references(self.diagnostic_codes, "diagnostic codes"),
+        )
 
         if _as_datetime(self.updated_at) < _as_datetime(self.created_at):
             raise ValueError("updated_at cannot precede created_at")
@@ -1110,6 +1124,9 @@ class ResearchState(ResearchContract):
             )
             _require_references(
                 item.evidence_references, evidence_ids, "object evidence"
+            )
+            _require_references(
+                item.parameter_references, parameter_ids, "object parameters"
             )
             _require_reference(item.provenance_id, provenance_ids, "object provenance")
         for item in self.graphql_operations:

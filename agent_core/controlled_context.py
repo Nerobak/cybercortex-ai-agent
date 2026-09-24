@@ -70,6 +70,12 @@ class ControlledObject(StrictModel):
     tenant_id: str | None = None
     object_type: str = "unknown"
     test_owned: bool = True
+    parameter_ids: tuple[str, ...] = ()
+    ownership_basis: Literal[
+        "configured_controlled_context",
+        "owner_scoped_authenticated_collection",
+    ] = "configured_controlled_context"
+    source_reference: str | None = None
 
 
 class OwnedObjectAcquisition(StrictModel):

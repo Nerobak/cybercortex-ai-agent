@@ -168,7 +168,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--research-id", help="Identifier for a new research run")
     run.add_argument("--resume", metavar="RESEARCH_ID", help="Resume persisted state")
     run.add_argument("--provider", choices=("ollama",), default="ollama")
-    run.add_argument("--model", default="deepseek-r1:32b")
+    run.add_argument(
+        "--model",
+        default=None,
+        help="Explicit model override (otherwise use configured provider model)",
+    )
+    run.add_argument(
+        "--model-timeout-seconds",
+        type=float,
+        default=None,
+        help="Explicit provider timeout override in seconds",
+    )
+    run.add_argument(
+        "--model-max-output-tokens",
+        type=_bounded_int(1, 1_000_000),
+        default=None,
+        help="Explicit model output-token ceiling override",
+    )
     run.add_argument(
         "--request-budget",
         type=_bounded_int(1, MAXIMUM_CLI_REQUEST_BUDGET),
@@ -251,10 +267,14 @@ def controlled_context_from_environment(
         account_id = configured_id or default_account_id
         if not raw_token:
             raise ResearchCLIError(f"controlled_account_{slot.lower()}_token_is_empty")
+        authorization_value = (
+            raw_token if len(raw_token.split(None, 1)) == 2 else f"Bearer {raw_token}"
+        )
         reference = vault.put(
-            raw_token,
+            authorization_value,
             label=f"research-cli:{slot.lower()}:{account_id}:token",
         )
+        authorization_value = None
         raw_token = None
         accounts.append(
             ControlledAccount(
@@ -385,15 +405,33 @@ def _validate_resume_research_policy(
         raise ResearchCLIError("resume_research_budget_must_match_persisted_state")
 
 
-def _model_configuration(provider: str, model: str) -> ModelConfiguration:
-    local_environment = {
-        "MODEL_DEFAULT_PROVIDER": provider,
-        "P3_OLLAMA_MODEL": model,
-    }
-    local_base_url = os.environ.get("OLLAMA_BASE_URL")
-    if local_base_url:
-        local_environment["OLLAMA_BASE_URL"] = local_base_url
-    return ModelConfiguration.from_env(local_environment)
+def _model_configuration(
+    provider: str,
+    model: str | None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    timeout_seconds: float | None = None,
+    max_output_tokens: int | None = None,
+) -> ModelConfiguration:
+    """Apply explicit CLI choices without discarding repository configuration."""
+
+    configuration = ModelConfiguration.from_env(environ)
+    selected = configuration.provider_configuration(provider)
+    updates: dict[str, object] = {}
+    if model is not None:
+        updates["model_name"] = model
+    if timeout_seconds is not None:
+        if not 0 < timeout_seconds <= 3_600:
+            raise ResearchCLIError("model_timeout_seconds_is_out_of_range")
+        updates["timeout_seconds"] = timeout_seconds
+    if max_output_tokens is not None:
+        updates["max_output_tokens"] = max_output_tokens
+    return configuration.model_copy(
+        update={
+            "default_provider": provider,
+            provider: selected.model_copy(update=updates),
+        }
+    )
 
 
 def _bootstrap_limits(args: argparse.Namespace) -> ResearchBootstrapLimits:
@@ -445,6 +483,7 @@ def build_wiring(
     vault: CredentialVault,
     controlled_context: ControlledContext,
     tracer: SafeTracer,
+    environ: Mapping[str, str] | None = None,
 ) -> ResearchWiring:
     store = ResearchStore(args.database)
     research_id, target, target_class, resumed_state = _resolve_run_identity(
@@ -493,12 +532,26 @@ def build_wiring(
     else:
         state = resumed_state
 
-    registry = ProviderRegistry(_model_configuration(args.provider, args.model))
+    model_configuration = _model_configuration(
+        args.provider,
+        args.model,
+        environ=environ,
+        timeout_seconds=args.model_timeout_seconds,
+        max_output_tokens=args.model_max_output_tokens,
+    )
+    provider_configuration = model_configuration.provider_configuration(args.provider)
+    if provider_configuration.model_name is None:
+        raise ResearchCLIError("model_name_is_unavailable")
+    registry = ProviderRegistry(model_configuration)
     router = ModelRouter(registry, ledger=model_ledger)
-    reasoning_engine = ResearchReasoningEngine(router)
+    reasoning_engine = ResearchReasoningEngine(
+        router, max_output_tokens=provider_configuration.max_output_tokens
+    )
     routing_policy = ModelRoutingPolicy(
         mode=RoutingMode.local_only,
-        preferred=ModelRoute(provider=args.provider, model=args.model),
+        preferred=ModelRoute(
+            provider=args.provider, model=provider_configuration.model_name
+        ),
         fallbacks=(),
         fallback_allowed=False,
         max_provider_attempts=1,
@@ -760,6 +813,7 @@ def execute_run(
             vault=vault,
             controlled_context=controlled_context,
             tracer=tracer,
+            environ=environ,
         )
         state = wiring.state
         iterations = 0

@@ -13,6 +13,7 @@ from agent_core.credential_vault import CredentialVault
 from agent_core.policy import AssessmentPolicy, ScopeAsset
 from agent_core.request_budget import RequestBudget
 from agent_core.research import (
+    AuthenticationDifferentialInput,
     BaselineIntent,
     BaselineKind,
     CleanupDefinition,
@@ -115,6 +116,47 @@ def replay_proposal() -> ExperimentProposal:
                             value_source_reference="safe-value-1",
                         ),
                     ),
+                ),
+            ),
+        ),
+        provenance_id="provenance-1",
+        expires_at=FUTURE,
+    )
+
+
+def authentication_differential_proposal() -> ExperimentProposal:
+    return ExperimentProposal(
+        proposal_id="authentication-differential-proposal",
+        research_id="research-1",
+        state_revision=4,
+        hypothesis_id="hypothesis-1",
+        capability="authentication_enforcement",
+        target_id="target-1",
+        surface_id="surface-1",
+        endpoint_id="endpoint-1",
+        objective="Compare one protected request with its anonymous form.",
+        primary_identity_id="identity-1",
+        primary_session_ref_id="session-1",
+        baseline=BaselineIntent(
+            kind=BaselineKind.registered_request, reference_id="template-1"
+        ),
+        mutation_intent=MutationIntent(kind="differential"),
+        expected_secure_behavior="Anonymous access is denied or challenged.",
+        expected_vulnerable_behavior="Anonymous access exposes the protected response.",
+        required_evidence_intent=(
+            EvidenceIntent(
+                selector=DifferentialSelector.status_class,
+                predicate_reference="authentication-boundary-predicate",
+            ),
+        ),
+        rationale="A same-template differential isolates authentication enforcement.",
+        primitive_steps=(
+            PrimitiveStepProposal(
+                step_id="authentication-differential-step",
+                input=AuthenticationDifferentialInput(
+                    request_template_id="template-1",
+                    endpoint_id="endpoint-1",
+                    identity_id="identity-1",
                 ),
             ),
         ),
@@ -302,6 +344,29 @@ def test_request_replay_is_exactly_one_accounted_registered_request():
     )
     assert fixture.calls[0][2]["headers"]["Authorization"] == SECRET_SENTINEL
     assert outcome.request_delta.verification == outcome.request_delta.total == 1
+    assert SECRET_SENTINEL not in outcome.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("statuses", "classification"),
+    (((200, 403), "secure_signal"), ((200, 200), "vulnerable_signal")),
+)
+def test_authentication_differential_is_exactly_two_accounted_requests(
+    statuses, classification
+):
+    fixture = build_runtime_fixture(
+        proposal=authentication_differential_proposal(), statuses=statuses
+    )
+    fixture.gate.transport.session.cookies.set("sid", SECRET_SENTINEL)
+    authorization, binding = fixture.gate.authorize_and_bind(fixture.experiment)
+    outcome = binding.submit(authorization)
+    assert len(fixture.calls) == 2
+    assert fixture.calls[0][2]["headers"]["Authorization"] == SECRET_SENTINEL
+    assert "Authorization" not in fixture.calls[1][2]["headers"]
+    assert not fixture.gate.transport.session.cookies
+    assert outcome.result_classification.value == classification
+    assert outcome.request_delta.verification == 2
+    assert outcome.request_delta.total == 2
     assert SECRET_SENTINEL not in outcome.model_dump_json()
 
 

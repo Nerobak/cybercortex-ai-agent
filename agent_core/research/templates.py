@@ -114,6 +114,24 @@ class RequestTemplateFactory:
         policy: AssessmentPolicy,
         identity_required: bool = False,
     ) -> ResearchRequestTemplate:
+        endpoint_parameters = tuple(
+            item
+            for item in state.parameters
+            if item.endpoint_id == endpoint.endpoint_id
+        )
+        header_names = {
+            str(item.name).strip().casefold().replace("_", "-")
+            for item in endpoint_parameters
+            if item.location is ParameterLocation.header
+        }
+        mechanisms = []
+        if "authorization" in header_names:
+            mechanisms.append("authorization_header")
+        if "cookie" in header_names or any(
+            item.location is ParameterLocation.cookie for item in endpoint_parameters
+        ):
+            mechanisms.append("cookie")
+        evidenced_identity = identity_required or bool(mechanisms)
         template = ResearchRequestTemplate(
             template_id=stable_research_identifier(
                 "request-template", endpoint.target_id, endpoint.endpoint_id
@@ -128,7 +146,10 @@ class RequestTemplateFactory:
             content_type=(
                 endpoint.content_types[0] if endpoint.content_types else None
             ),
-            identity_requirement=RequestIdentityRequirement(required=identity_required),
+            identity_requirement=RequestIdentityRequirement(
+                required=evidenced_identity,
+                mechanisms=tuple(mechanisms),
+            ),
             evidence_references=endpoint.evidence_references,
             provenance_id=endpoint.provenance_id,
         )
@@ -283,6 +304,7 @@ class RequestTemplateFactory:
             surface_id=template.surface_id,
             endpoint_id=template.endpoint_id,
             parameter_ids=template.parameter_ids,
+            authentication_mechanisms=template.identity_requirement.mechanisms,
         )
 
     @staticmethod
@@ -320,6 +342,8 @@ class RequestTemplateFactory:
                     location=parameters[parameter_id].location,
                 )
                 for parameter_id in template.parameter_ids
+                if parameters[parameter_id].location
+                not in {ParameterLocation.header, ParameterLocation.cookie}
             ),
             safe_headers=(),
             credential_header_name=credential_header_name,

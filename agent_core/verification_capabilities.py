@@ -882,6 +882,7 @@ _RESEARCH_PRIMITIVE_ADAPTERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "response_differential",
         ),
         "authentication_enforcement": (
+            "authentication_differential",
             "request_replay",
             "cookie_mutation",
             "response_differential",

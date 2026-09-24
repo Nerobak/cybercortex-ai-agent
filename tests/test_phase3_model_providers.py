@@ -764,6 +764,35 @@ def test_ollama_schema_structured_output_uses_schema_once_with_same_accounting()
     assert provider.telemetry[-1].total_tokens == 13
 
 
+def test_ollama_schema_rejection_is_normalized_without_retry_or_raw_response():
+    class RejectedResponse:
+        status_code = 400
+
+        @staticmethod
+        def raise_for_status():
+            raise AssertionError("schema rejection should be normalized first")
+
+    class Client:
+        calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return RejectedResponse()
+
+    client = Client()
+    provider = OllamaProvider(ollama_config(), client=client)
+    with pytest.raises(ModelProviderError) as captured:
+        provider.generate(
+            request(
+                structured_output=True,
+                structured_output_schema={"type": "object", "properties": {}},
+            )
+        )
+    assert captured.value.code is ModelErrorCode.schema_rejected
+    assert len(client.calls) == 1
+    assert provider.telemetry[-1].usage_known is False
+
+
 def test_ollama_ignores_thinking_and_keeps_message_content_authoritative():
     client = FakeHTTPClient(
         {

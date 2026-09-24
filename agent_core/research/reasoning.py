@@ -58,6 +58,7 @@ class ResearchModelFailure(str, Enum):
     timeout = "timeout"
     rate_limited = "rate_limited"
     model_budget_exhausted = "model_budget_exhausted"
+    schema_rejected = "schema_rejected"
 
 
 class ResearchReasoningError(RuntimeError):
@@ -495,6 +496,7 @@ class PublicSafeResearchPacketBuilder:
                     "owner_identity_id": item.owner_identity_id,
                     "tenant_reference": item.tenant_reference,
                     "test_owned": item.test_owned,
+                    "parameter_references": list(item.parameter_references),
                 }
                 for item in state.objects
                 if item.test_owned and item.target_id in target_ids
@@ -593,6 +595,7 @@ class ResearchReasoningEngine:
             ),
             evidence=packet_payload,
             structured_output=True,
+            structured_output_schema=schema,
             temperature=0.0,
             max_output_tokens=self.max_output_tokens,
             task_type="research_strategy",
@@ -733,6 +736,10 @@ def _model_failure(code: ModelErrorCode) -> ResearchModelFailure:
         return ResearchModelFailure.timeout
     if code is ModelErrorCode.rate_limited:
         return ResearchModelFailure.rate_limited
+    if code is ModelErrorCode.invalid_response:
+        return ResearchModelFailure.invalid_output
+    if code is ModelErrorCode.schema_rejected:
+        return ResearchModelFailure.schema_rejected
     return ResearchModelFailure.provider_unavailable
 
 

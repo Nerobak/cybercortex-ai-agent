@@ -112,6 +112,50 @@ def test_parser_accepts_bounded_live_command(tmp_path):
     assert args.trace is True
 
 
+def test_model_configuration_preserves_repository_provider_values():
+    configuration = research_cli._model_configuration(
+        "ollama",
+        "explicit-local-model",
+        environ={
+            "MODEL_DEFAULT_PROVIDER": "ollama",
+            "MODEL_TIMEOUT_SECONDS": "120",
+            "MODEL_MAX_OUTPUT_TOKENS": "3072",
+            "OLLAMA_BASE_URL": "http://127.0.0.1:11555",
+            "P3_OLLAMA_MODEL": "repository-model",
+        },
+    )
+    assert configuration.ollama.model_name == "explicit-local-model"
+    assert configuration.ollama.timeout_seconds == 120
+    assert configuration.ollama.max_output_tokens == 3072
+    assert configuration.ollama.base_url == "http://127.0.0.1:11555"
+
+
+def test_model_configuration_uses_repository_model_without_cli_override():
+    configuration = research_cli._model_configuration(
+        "ollama",
+        None,
+        environ={"P3_OLLAMA_MODEL": "repository-model"},
+    )
+    assert configuration.ollama.model_name == "repository-model"
+
+
+def test_explicit_model_limits_override_repository_values_without_dropping_base_url():
+    configuration = research_cli._model_configuration(
+        "ollama",
+        "explicit-local-model",
+        environ={
+            "MODEL_TIMEOUT_SECONDS": "120",
+            "MODEL_MAX_OUTPUT_TOKENS": "3072",
+            "OLLAMA_BASE_URL": "http://127.0.0.1:11555",
+        },
+        timeout_seconds=180,
+        max_output_tokens=2048,
+    )
+    assert configuration.ollama.timeout_seconds == 180
+    assert configuration.ollama.max_output_tokens == 2048
+    assert configuration.ollama.base_url == "http://127.0.0.1:11555"
+
+
 def test_parser_rejects_non_enum_target_class(tmp_path):
     values = [
         "run",
@@ -139,6 +183,7 @@ def test_controlled_tokens_enter_vault_and_only_references_enter_context():
         references = [item.credential_references["token"] for item in context.accounts]
         assert all(reference.startswith("cred_") for reference in references)
         assert all(vault.contains(reference) for reference in references)
+        assert vault.get(references[0]) == f"Bearer {SYNTHETIC_SECRET}"
         assert SYNTHETIC_SECRET not in context.model_dump_json()
 
 
@@ -208,6 +253,26 @@ def test_wiring_shares_one_request_budget_and_is_local_only(tmp_path):
         assert wiring.routing_policy.max_provider_attempts == 1
         assert wiring.bootstrapper.limits.maximum_discovery_target_requests == 30
         assert wiring.bootstrapper.limits.maximum_bootstrap_model_calls == 1
+
+
+def test_wiring_aligns_reasoning_and_provider_output_ceilings(tmp_path):
+    args = cli_args(tmp_path, "--dry-run")
+    with CredentialVault() as vault:
+        wiring = research_cli.build_wiring(
+            args,
+            vault=vault,
+            controlled_context=research_cli.ControlledContext(),
+            tracer=research_cli.SafeTracer(False, io.StringIO()),
+            environ={
+                "MODEL_TIMEOUT_SECONDS": "120",
+                "MODEL_MAX_OUTPUT_TOKENS": "3072",
+                "OLLAMA_BASE_URL": "http://127.0.0.1:11555",
+            },
+        )
+        provider = wiring.reasoning_engine.router.registry.create("ollama")
+    assert wiring.reasoning_engine.max_output_tokens == 3072
+    assert provider.configuration.max_output_tokens == 3072
+    assert provider.configuration.timeout_seconds == 120
 
 
 def test_new_run_contains_only_registered_target_before_bootstrap(tmp_path):

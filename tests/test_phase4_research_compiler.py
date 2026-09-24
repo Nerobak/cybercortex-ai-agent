@@ -229,6 +229,7 @@ def compiler_context() -> CompilerContext:
                 surface_id="surface-1",
                 endpoint_id=f"endpoint-{index}",
                 parameter_ids=(f"parameter-{index}",),
+                authentication_mechanisms=("authorization_header",),
             )
             for index in (1, 2)
         ),
@@ -337,6 +338,42 @@ def test_compiler_generates_strict_immutable_derived_contract(
     payload["executor"] = "forged"
     with pytest.raises(ValidationError, match="extra_forbidden"):
         SecurityExperiment.model_validate(payload)
+
+
+def test_authenticated_object_substitution_requires_template_auth_mechanism(
+    research_state: ResearchState, compiler_context: CompilerContext
+):
+    templates = tuple(
+        item.model_copy(update={"authentication_mechanisms": ()})
+        for item in compiler_context.request_templates
+    )
+    context = compiler_context.model_copy(update={"request_templates": templates})
+    assert_error(
+        CompilerErrorCode.missing_authentication_mechanism,
+        object_proposal(),
+        research_state,
+        context,
+    )
+
+
+def test_object_substitution_honors_evidence_backed_parameter_relationship(
+    research_state: ResearchState, compiler_context: CompilerContext
+):
+    objects = tuple(
+        (
+            item.model_copy(update={"parameter_references": ("parameter-2",)})
+            if item.object_id == "object-1"
+            else item
+        )
+        for item in research_state.objects
+    )
+    state = research_state.model_copy(update={"objects": objects})
+    assert_error(
+        CompilerErrorCode.object_binding_mismatch,
+        object_proposal(),
+        state,
+        compiler_context,
+    )
 
 
 @pytest.mark.parametrize(

@@ -35,6 +35,7 @@ from agent_core.verification_capabilities import (
 def test_initial_registry_inventory_and_capability_states_are_explicit():
     names = {item.name for item in DEFAULT_EXPERIMENT_REGISTRY.definitions}
     assert names == {
+        "authentication_differential",
         "request_replay",
         "identity_switch",
         "parameter_mutation",
@@ -56,6 +57,7 @@ def test_initial_registry_inventory_and_capability_states_are_explicit():
         for item in DEFAULT_EXPERIMENT_REGISTRY.definitions
         if item.capability_state is PrimitiveCapabilityState.execution_available
     } == {
+        "authentication_differential",
         "request_replay",
         "identity_switch",
         "parameter_mutation",

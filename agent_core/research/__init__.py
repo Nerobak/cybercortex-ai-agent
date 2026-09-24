@@ -164,6 +164,7 @@ from agent_core.research.types import (
     WorkflowId,
 )
 from agent_core.research.primitives import (
+    AuthenticationDifferentialInput,
     CleanupBehavior,
     CompiledPrimitiveStep,
     ContextEvidence,
@@ -498,6 +499,7 @@ __all__ = [
     "PrimitiveDefinition",
     "PrimitiveExecutionError",
     "PrimitiveExecutionEvidence",
+    "AuthenticationDifferentialInput",
     "PrimitiveExecutorRegistry",
     "PrimitiveExecutorRoute",
     "PrimitiveUnavailableError",

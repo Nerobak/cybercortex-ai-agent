@@ -14,6 +14,7 @@ class ModelErrorCode(str, Enum):
     rate_limited = "rate_limited"
     connection_failed = "connection_failed"
     invalid_response = "invalid_response"
+    schema_rejected = "schema_rejected"
     configuration_error = "configuration_error"
     routing_exhausted = "routing_exhausted"
     routing_policy_blocked = "routing_policy_blocked"
@@ -31,6 +32,9 @@ PUBLIC_ERROR_MESSAGES = {
     ModelErrorCode.connection_failed: "The model provider could not be reached.",
     ModelErrorCode.invalid_response: (
         "The model provider returned an invalid normalized response."
+    ),
+    ModelErrorCode.schema_rejected: (
+        "The model provider rejected the structured-output schema."
     ),
     ModelErrorCode.configuration_error: (
         "The model provider configuration is invalid."

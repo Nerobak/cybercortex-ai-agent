@@ -112,6 +112,15 @@ class RequestReplayInput(ResearchContract):
     bindings: tuple[SafeValueBinding, ...] = Field(default=(), max_length=50)
 
 
+class AuthenticationDifferentialInput(ResearchContract):
+    """Compare one registered protected request with and without its identity."""
+
+    primitive: Literal["authentication_differential"] = "authentication_differential"
+    request_template_id: OpaqueIdentifier
+    endpoint_id: EndpointId
+    identity_id: IdentityId
+
+
 class IdentitySwitchInput(ResearchContract):
     primitive: Literal["identity_switch"] = "identity_switch"
     primary_identity_id: IdentityId
@@ -316,6 +325,7 @@ class UploadVariantInput(ResearchContract):
 
 PrimitiveInput: TypeAlias = Annotated[
     RequestReplayInput
+    | AuthenticationDifferentialInput
     | IdentitySwitchInput
     | ParameterMutationInput
     | ObjectSubstitutionInput

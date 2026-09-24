@@ -35,6 +35,7 @@ class SafeResponseSummary(ResearchContract):
     content_length_class: OpaqueIdentifier
     content_type: OpaqueIdentifier | None = None
     structural_digest: Sha256Digest
+    content_digest: Sha256Digest
     top_level_fields: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=200)
     body_present: StrictBool
 

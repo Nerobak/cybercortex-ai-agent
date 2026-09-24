@@ -37,6 +37,7 @@ from agent_core.research.experiments import (
 )
 from agent_core.research.fingerprint import experiment_fingerprint
 from agent_core.research.primitives import (
+    AuthenticationDifferentialInput,
     CompiledPrimitiveStep,
     CookieMutationInput,
     GraphQLOperationInput,
@@ -150,6 +151,8 @@ class CompilerErrorCode(str, Enum):
     parameter_endpoint_mismatch = "parameter_endpoint_mismatch"
     operation_endpoint_mismatch = "operation_endpoint_mismatch"
     request_template_mismatch = "request_template_mismatch"
+    missing_authentication_mechanism = "missing_authentication_mechanism"
+    incomplete_authentication_differential = "incomplete_authentication_differential"
     identity_binding_mismatch = "identity_binding_mismatch"
     identity_relationship_mismatch = "identity_relationship_mismatch"
     object_binding_mismatch = "object_binding_mismatch"
@@ -174,6 +177,9 @@ class RegisteredRequestTemplate(ResearchContract):
     surface_id: SurfaceId
     endpoint_id: EndpointId
     parameter_ids: tuple[ParameterId, ...] = Field(default=(), max_length=100)
+    authentication_mechanisms: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=2
+    )
 
 
 class RegisteredSafeHeader(ResearchContract):
@@ -434,6 +440,11 @@ class ExperimentCompiler:
                 proposal.mutation_intent.value_source_reference,
             )
         self._validate_baseline(proposal, indexes, compiler_context)
+        if proposal.capability == "authentication_enforcement" and not any(
+            isinstance(item.input, AuthenticationDifferentialInput)
+            for item in compiled_steps
+        ):
+            _fail(CompilerErrorCode.incomplete_authentication_differential)
         self._validate_legacy_surface(
             adapter, endpoint, parameters, target.target_class
         )
@@ -661,7 +672,15 @@ class ExperimentCompiler:
                     reference_id=template.template_id,
                 )
             )
-        if isinstance(primitive, RequestReplayInput):
+        if isinstance(primitive, AuthenticationDifferentialInput):
+            _require_authentication_mechanism(template)
+            identities.append(self._controlled_identity(indexes, primitive.identity_id))
+        elif isinstance(primitive, RequestReplayInput):
+            if (
+                primitive.identity_id is not None
+                or primitive.session_ref_id is not None
+            ):
+                _require_authentication_mechanism(template)
             if primitive.identity_id is not None:
                 identities.append(
                     self._controlled_identity(indexes, primitive.identity_id)
@@ -725,6 +744,11 @@ class ExperimentCompiler:
             )
             if owned.owner_identity_id != primitive.primary_identity_id:
                 _fail(CompilerErrorCode.object_binding_mismatch)
+            if (
+                owned.parameter_references
+                and primitive.parameter_id not in owned.parameter_references
+            ):
+                _fail(CompilerErrorCode.object_binding_mismatch)
             if not set(primitive.ownership_evidence_ids).issubset(
                 set(owned.evidence_references)
             ):
@@ -734,6 +758,7 @@ class ExperimentCompiler:
             objects.append(owned)
             if primitive.request_template_id is not None:
                 template = _template(context, primitive.request_template_id)
+                _require_authentication_mechanism(template)
                 _validate_template(template, endpoint, proposal)
                 _validate_parameter(parameter, endpoint, template)
             if primitive.operation_id is not None:
@@ -888,6 +913,8 @@ class ExperimentCompiler:
                 if relationship is not None and relationship != primitive.relationship:
                     _fail(CompilerErrorCode.identity_binding_mismatch)
                 relationship = relationship or primitive.relationship
+            elif isinstance(primitive, AuthenticationDifferentialInput):
+                primary_identity = merge(primary_identity, primitive.identity_id)
             elif isinstance(primitive, RequestReplayInput):
                 primary_identity = merge(primary_identity, primitive.identity_id)
                 primary_session = merge(primary_session, primitive.session_ref_id)
@@ -1215,7 +1242,9 @@ class ExperimentCompiler:
                 step_worst = min(step_worst, step.input.maximum_variants)
             minimum += step_minimum
             worst += step_worst
-        if adapter is not None:
+        if adapter is not None and not any(
+            isinstance(step.input, AuthenticationDifferentialInput) for step in steps
+        ):
             minimum = max(
                 minimum,
                 max(0, adapter.min_requests - cleanup.minimum_requests),
@@ -1504,6 +1533,13 @@ def _safe_header(
         if item.header_definition_id == header_id:
             return item
     _fail(CompilerErrorCode.unknown_safe_header)
+
+
+def _require_authentication_mechanism(template: RegisteredRequestTemplate) -> None:
+    if not set(template.authentication_mechanisms).intersection(
+        {"authorization_header", "cookie"}
+    ):
+        _fail(CompilerErrorCode.missing_authentication_mechanism)
 
 
 def _credential_header(name: str) -> bool:

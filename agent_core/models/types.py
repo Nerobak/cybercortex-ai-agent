@@ -96,8 +96,7 @@ def _thaw_json(value: Any) -> Any:
 def _canonical_structured_output_schema(value: Any) -> dict[str, JsonValue]:
     if not isinstance(value, dict):
         raise ValueError("structured_output_schema must be a JSON schema object")
-    safe = public_result(value)
-    if safe != value:
+    if not _schema_text_is_public_safe(value):
         raise ValueError("structured_output_schema must contain only public-safe data")
     try:
         encoded = json.dumps(
@@ -113,6 +112,21 @@ def _canonical_structured_output_schema(value: Any) -> dict[str, JsonValue]:
         raise ValueError("structured_output_schema exceeds its size limit")
     canonical = json.loads(encoded)
     return _freeze_json(canonical)
+
+
+def _schema_text_is_public_safe(value: Any) -> bool:
+    """Validate schema text while treating definition/property names as structure."""
+
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str)
+            and sanitize_text(key) == key
+            and _schema_text_is_public_safe(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return all(_schema_text_is_public_safe(item) for item in value)
+    return not isinstance(value, str) or sanitize_text(value) == value
 
 
 class ModelContract(BaseModel):

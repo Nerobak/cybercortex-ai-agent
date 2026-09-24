@@ -446,7 +446,10 @@ class ResearchRuntime:
                     ResearchAuthorizationErrorCode.cleanup_reserve_unavailable
                 )
         headers = {item.name: item.value for item in template.safe_headers}
-        if template.credential_header_name is not None:
+        if (
+            template.credential_header_name is not None
+            and request.identity_id is not None
+        ):
             binding = identity_bindings.get(str(request.identity_id))
             reference = getattr(binding, "vault_reference", None)
             if binding is None or reference is None:
@@ -474,6 +477,11 @@ class ResearchRuntime:
             max_redirects=0,
             headers=headers,
             purpose=request.purpose,
+            allow_session_credentials=(
+                template.credential_header_name is None
+                or request.identity_id is not None
+            ),
+            isolate_session_cookies=template.credential_header_name is not None,
             **kwargs,
         )
         request_summary = SafeRequestSummary(
@@ -755,6 +763,7 @@ def _safe_response_summary(response: object) -> SafeResponseSummary:
         content_length_class=length_class,
         content_type=content_type,
         structural_digest=_digest(shape),
+        content_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
         top_level_fields=top_fields,
         body_present=bool(raw),
     )

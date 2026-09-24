@@ -28,6 +28,7 @@ from agent_core.research.outcomes import (
     SelectorResult,
 )
 from agent_core.research.primitives import (
+    AuthenticationDifferentialInput,
     CompiledPrimitiveStep,
     DifferentialSelector,
     IdentitySwitchInput,
@@ -52,6 +53,8 @@ _CREDENTIAL_HEADERS = frozenset(
     {"authorization", "cookie", "proxy-authorization", "x-api-key", "x-auth-token"}
 )
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_AUTH_SUCCESS = frozenset({200, 201, 202, 204})
+_AUTH_DENIAL = frozenset({401, 403, 404})
 _ROUTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,2047}$")
 
 
@@ -278,6 +281,7 @@ class PrimitiveExecutorContext:
         ) = None,
         identity_id: str | None = None,
         purpose: Literal["verification", "state_mutation", "cleanup"] | None = None,
+        anonymous: bool = False,
     ) -> ResolvedRequest:
         overrides = overrides or {}
         unknown = set(overrides) - {item.parameter_id for item in template.parameters}
@@ -327,7 +331,7 @@ class PrimitiveExecutorContext:
                 )
         parsed = urlparse(template.url)
         resolved_url = parsed._replace(path=path).geturl()
-        selected_identity = self.identity(identity_id)
+        selected_identity = None if anonymous else self.identity(identity_id)
         method = template.method.value
         return ResolvedRequest(
             template_id=template.template_id,
@@ -420,6 +424,69 @@ class RequestReplayExecutor:
                 request_summaries=(result.request_summary,),
                 response_summaries=(result.response_summary,),
             )
+        )
+
+
+class AuthenticationDifferentialExecutor:
+    route_reference = "research-native:authentication_differential/v1"
+
+    def execute(
+        self, step: CompiledPrimitiveStep, context: PrimitiveExecutorContext
+    ) -> ExecutorStepResult:
+        value = _input(step, AuthenticationDifferentialInput)
+        template = context.template(value.request_template_id)
+        if template.credential_header_name is None:
+            raise PrimitiveExecutionError(
+                "registered authentication mechanism is unavailable"
+            )
+        authenticated = context.resolve(template, identity_id=value.identity_id)
+        anonymous = context.resolve(template, anonymous=True)
+        authenticated_result = context.send(authenticated)
+        anonymous_result = context.send(anonymous)
+        authenticated_response = authenticated_result.response_summary
+        anonymous_response = anonymous_result.response_summary
+        authenticated_success = bool(
+            authenticated_response.status_code in _AUTH_SUCCESS
+            and authenticated_response.body_present
+        )
+        anonymous_denied = anonymous_response.status_code in _AUTH_DENIAL
+        materially_equal = bool(
+            authenticated_response.body_present
+            and anonymous_response.body_present
+            and authenticated_response.content_type == anonymous_response.content_type
+            and authenticated_response.content_digest
+            == anonymous_response.content_digest
+            and authenticated_response.structural_digest
+            == anonymous_response.structural_digest
+            and authenticated_response.top_level_fields
+            == anonymous_response.top_level_fields
+        )
+        if authenticated_success and anonymous_denied:
+            classification = ExperimentResultClassification.secure_signal
+        elif (
+            authenticated_success
+            and anonymous_response.status_code in _AUTH_SUCCESS
+            and materially_equal
+        ):
+            classification = ExperimentResultClassification.vulnerable_signal
+        else:
+            classification = ExperimentResultClassification.inconclusive
+        return ExecutorStepResult(
+            evidence=context.evidence(
+                step,
+                "Compared one registered authenticated baseline with its anonymous form.",
+                request_template_reference=template.template_id,
+                identity_references=(value.identity_id,),
+                request_summaries=(
+                    authenticated_result.request_summary,
+                    anonymous_result.request_summary,
+                ),
+                response_summaries=(
+                    authenticated_response,
+                    anonymous_response,
+                ),
+            ),
+            classification=classification,
         )
 
 
@@ -646,6 +713,7 @@ class PrimitiveExecutorRegistry:
 
     def __init__(self, executors: Iterable[PrimitiveExecutor] = ()) -> None:
         selected = tuple(executors) or (
+            AuthenticationDifferentialExecutor(),
             RequestReplayExecutor(),
             IdentitySwitchExecutor(),
             ParameterMutationExecutor(),

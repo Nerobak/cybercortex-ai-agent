@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from agent_core.models import ModelUsageDelta
+from agent_core.models import (
+    ModelCallLedger,
+    ModelErrorCode,
+    ModelProviderError,
+    ModelRoute,
+    ModelRoutingPolicy,
+    ModelUsageDelta,
+    RoutingMode,
+)
 from agent_core.phase2_result_status import Phase2ResultStatus
 from agent_core.request_budget import RequestDelta
 from agent_core.research import (
@@ -28,11 +36,13 @@ from agent_core.research import (
     PrimitiveStepProposal,
     ProvenanceProducerType,
     ProvenanceRecord,
+    PublicSafeResearchPacketBuilder,
     ResearchBudgetManager,
     ResearchBudgetPolicy,
     ResearchCleanupBarrier,
     ResearchConfidence,
     ResearchExecutionGate,
+    ResearchReasoningEngine,
     ResearchPredicate,
     ResearchRunStatus,
     ResearchRuntime,
@@ -46,6 +56,7 @@ from agent_core.research import (
     SurfaceType,
     TargetAsset,
     TargetClass,
+    ExperimentRegistry,
 )
 from agent_core.research.compiler import ExperimentCompilerContext
 from agent_core.research.outcomes import ExperimentOutcome
@@ -410,6 +421,63 @@ def test_orchestrator_dependencies_keep_model_outside_authority_boundary():
     assert not hasattr(ExperimentProposal, "execute")
     assert not hasattr(ExperimentProposal, "authorize")
     assert ResearchExecutionGate is not ResearchRuntime
+
+
+def test_terminal_stop_persists_authoritative_model_ledger_and_reason_codes(tmp_path):
+    class TimeoutRouter:
+        def __init__(self):
+            self.ledger = ModelCallLedger()
+
+        def route(self, request, _policy):
+            self.ledger.record_failure(
+                provider="ollama",
+                model="fake-local-model",
+                latency_seconds=1.0,
+                task_type=request.task_type,
+                run_id=request.run_id,
+                hypothesis_id=request.hypothesis_id,
+                fallback_depth=0,
+                outcome=ModelErrorCode.timeout,
+                estimated_cost_usd=0.0,
+            )
+            raise ModelProviderError(ModelErrorCode.timeout)
+
+    store = ResearchStore(tmp_path / "terminal-ledger.sqlite3")
+    store.create_research(research_state())
+    router = TimeoutRouter()
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        model_ledger=router.ledger,
+        model_call_ceiling=4,
+    )
+    compiler = ExperimentCompiler(context=compiler_context())
+    selector = ExperimentSelector(compiler, budgets)
+    runner = SecurityResearchOrchestrator(
+        store=store,
+        compiler=compiler,
+        compiler_context=compiler_context(),
+        gate=FakeGate(),
+        runtime=FakeResearchRuntime(()),
+        selector=selector,
+        evaluator=ExperimentEvaluator(),
+        pivot_planner=PivotPlanner(selector),
+        budget_manager=budgets,
+        reasoning_engine=ResearchReasoningEngine(router),
+        routing_policy=ModelRoutingPolicy(
+            mode=RoutingMode.local_only,
+            preferred=ModelRoute(provider="ollama", model="fake-local-model"),
+        ),
+        packet_builder=PublicSafeResearchPacketBuilder(ExperimentRegistry(), budgets),
+    )
+
+    result = runner.run("research-1")
+    persisted = store.load_research("research-1")
+
+    assert result.stop_reason.value == "no_eligible_experiments"
+    assert persisted.budgets[0].model_budget.usage.attempted_calls == 1
+    assert persisted.budgets[0].model_budget.usage.failed_calls == 1
+    assert "model_timeout" in persisted.diagnostic_codes
+    assert "no_proposal" in persisted.diagnostic_codes
 
 
 def test_critical_loop_uses_real_gate_runtime_and_fake_transport(tmp_path):

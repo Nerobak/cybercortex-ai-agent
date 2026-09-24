@@ -47,6 +47,9 @@ from agent_core.research.adapters import (
     opaque_reference,
     stable_research_identifier,
 )
+from agent_core.research.authenticated_discovery import (
+    ControlledAccountDiscoveryAdapter,
+)
 from agent_core.research.budgets import ResearchBudgetManager
 from agent_core.research.compiler import ExperimentCompilerContext
 from agent_core.research.reasoning import (
@@ -156,6 +159,9 @@ class ResearchBootstrapper:
         object_acquisition_sender: (
             Callable[[dict[str, Any]], dict[str, Any]] | None
         ) = None,
+        authenticated_discovery_adapter: (
+            ControlledAccountDiscoveryAdapter | None
+        ) = None,
         reasoning_engine: ResearchReasoningEngine | None = None,
         routing_policy: ModelRoutingPolicy | None = None,
         packet_builder: PublicSafeResearchPacketBuilder | None = None,
@@ -224,6 +230,17 @@ class ResearchBootstrapper:
             )
         else:
             self.tool_runner = tool_runner
+        candidate_transport = getattr(self.tool_runner, "http_client", None)
+        self.authenticated_discovery_adapter = authenticated_discovery_adapter
+        if (
+            self.authenticated_discovery_adapter is None
+            and self.profile == "authenticated"
+            and self.vault is not None
+            and isinstance(candidate_transport, ScopedHTTPClient)
+        ):
+            self.authenticated_discovery_adapter = ControlledAccountDiscoveryAdapter(
+                candidate_transport
+            )
 
     @classmethod
     def register_target(
@@ -484,6 +501,22 @@ class ResearchBootstrapper:
         captures = tuple(bundle.requests) if bundle is not None else ()
         before = self.request_budget.snapshot()
         acquired, acquisition_limitations = self._acquire_objects(progress)
+        already_consumed = progress.request_delta.total if progress else 0
+        acquisition_consumed = RequestDelta.from_snapshots(
+            before, self.request_budget.snapshot()
+        ).total
+        authenticated, authenticated_limitations = self._discover_controlled_objects(
+            state,
+            target,
+            maximum_requests=max(
+                0,
+                self.limits.maximum_discovery_target_requests
+                - already_consumed
+                - acquisition_consumed,
+            ),
+        )
+        acquired = (*acquired, *authenticated)
+        self._register_acquired_objects(acquired)
         after = self.request_budget.snapshot()
         delta = RequestDelta.from_snapshots(before, after)
         if (
@@ -530,6 +563,7 @@ class ResearchBootstrapper:
             limitations=(
                 *context_records.limitations,
                 *acquisition_limitations,
+                *authenticated_limitations,
             ),
         )
         adapted = self._with_progress_and_budget(adapted, next_progress)
@@ -693,6 +727,44 @@ class ResearchBootstrapper:
                     "A bounded controlled object could not be acquired; missing context was retained."
                 )
         return tuple(output), tuple(sorted(set(limitations)))
+
+    def _discover_controlled_objects(
+        self,
+        state: ResearchState,
+        target: TargetAsset,
+        *,
+        maximum_requests: int,
+    ) -> tuple[tuple[ControlledObject, ...], tuple[str, ...]]:
+        adapter = self.authenticated_discovery_adapter
+        if (
+            adapter is None
+            or self.vault is None
+            or not self.controlled_context.accounts
+        ):
+            return (), ()
+        result = adapter.discover(
+            state,
+            target=target,
+            context=self.controlled_context,
+            policy=self.policy,
+            vault=self.vault,
+            maximum_requests=maximum_requests,
+        )
+        return result.objects, result.limitations
+
+    def _register_acquired_objects(self, objects: Sequence[ControlledObject]) -> None:
+        """Retain raw values only in the process-local controlled context."""
+
+        existing = {
+            (item.owner_account_id, item.object_type, item.object_id)
+            for item in self.controlled_context.objects
+        }
+        for item in objects:
+            key = (item.owner_account_id, item.object_type, item.object_id)
+            if key in existing or len(self.controlled_context.objects) >= 100:
+                continue
+            self.controlled_context.objects.append(item)
+            existing.add(key)
 
     def _transition(
         self,

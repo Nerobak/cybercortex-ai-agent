@@ -72,6 +72,7 @@ from agent_core.research.outcomes import ExperimentOutcome
 from agent_core.research.evaluation import HypothesisProposalSource
 from agent_core.research.templates import RequestTemplateFactory
 from agent_core.research.types import ExperimentRuntimeStatus, HttpMethod
+from agent_core.research import Parameter, ParameterLocation, ResearchState
 
 NOW = "2026-09-22T12:00:00+00:00"
 TARGET = "https://blind.example"
@@ -418,6 +419,70 @@ def test_capture_template_secret_boundary_and_identity_survives_adapters(tmp_pat
         assert not runtime_template.safe_headers
         assert template.identity_requirement.role_reference == "user"
         assert template.identity_requirement.tenant_bound is True
+    finally:
+        vault.close()
+
+
+def test_endpoint_template_infers_only_evidenced_authentication_headers(tmp_path):
+    store, _budgets, vault, _runner, bootstrapper = bootstrap_fixture(tmp_path)
+    try:
+        state = bootstrapper.prepare(store.load_research("research-blind"))
+        endpoint = state.endpoints[0]
+
+        def with_headers(*names: str) -> ResearchState:
+            parameters = tuple(
+                Parameter(
+                    parameter_id=f"header-parameter-{index}",
+                    endpoint_id=endpoint.endpoint_id,
+                    name=name,
+                    location=ParameterLocation.header,
+                    required=True,
+                    evidence_references=endpoint.evidence_references,
+                    provenance_id=endpoint.provenance_id,
+                )
+                for index, name in enumerate(names)
+            )
+            return ResearchState.model_validate(
+                {
+                    **state.model_dump(mode="python"),
+                    "request_templates": (),
+                    "parameters": (*state.parameters, *parameters),
+                }
+            )
+
+        anonymous = RequestTemplateFactory().from_endpoint(
+            endpoint, state, policy=policy()
+        )
+        unrelated_state = with_headers("X-Trace-Id")
+        unrelated = RequestTemplateFactory().from_endpoint(
+            endpoint, unrelated_state, policy=policy()
+        )
+        authorization_state = with_headers("Authorization")
+        authorization = RequestTemplateFactory().from_endpoint(
+            endpoint, authorization_state, policy=policy()
+        )
+        multiple_state = with_headers("Authorization", "Cookie")
+        multiple = RequestTemplateFactory().from_endpoint(
+            endpoint, multiple_state, policy=policy()
+        )
+
+        assert anonymous.identity_requirement.required is False
+        assert anonymous.identity_requirement.mechanisms == ()
+        assert unrelated.identity_requirement.required is False
+        assert unrelated.identity_requirement.mechanisms == ()
+        assert authorization.identity_requirement.required is True
+        assert authorization.identity_requirement.mechanisms == (
+            "authorization_header",
+        )
+        assert multiple.identity_requirement.mechanisms == (
+            "authorization_header",
+            "cookie",
+        )
+        runtime = RequestTemplateFactory.to_runtime_template(
+            authorization, authorization_state
+        )
+        assert runtime.credential_header_name == "Authorization"
+        assert all(item.name != "Authorization" for item in runtime.parameters)
     finally:
         vault.close()
 

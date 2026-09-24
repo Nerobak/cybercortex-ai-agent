@@ -175,6 +175,17 @@ def _definition(
 
 _DEFAULT_DEFINITIONS = (
     _definition(
+        "authentication_differential",
+        "AuthenticationDifferentialInput",
+        "DifferentialEvidence",
+        state=PrimitiveCapabilityState.execution_available,
+        minimum=2,
+        worst=2,
+        risk=RiskLevel.low,
+        requirements=("registered_request_template", "controlled_identity"),
+        executor_adapter_reference="research-native:authentication_differential/v1",
+    ),
+    _definition(
         "request_replay",
         "RequestReplayInput",
         "ReplayEvidence",

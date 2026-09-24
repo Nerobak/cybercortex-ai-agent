@@ -806,11 +806,19 @@ class ControlledContextResearchAdapter:
                                 "test_owned": True,
                             }
                         ),
-                        summary="Controlled context records researcher-authorized test ownership.",
-                        source_reference=stable_research_identifier(
-                            "controlled-object-source",
-                            controlled_object.owner_account_id,
-                            controlled_object.object_id,
+                        summary=(
+                            "An owner-scoped authenticated collection returned this controlled resource."
+                            if controlled_object.ownership_basis
+                            == "owner_scoped_authenticated_collection"
+                            else "Controlled context records researcher-authorized test ownership."
+                        ),
+                        source_reference=(
+                            controlled_object.source_reference
+                            or stable_research_identifier(
+                                "controlled-object-source",
+                                controlled_object.owner_account_id,
+                                controlled_object.object_id,
+                            )
                         ),
                         observed_at=timestamp,
                         provenance_id=provenance_id,
@@ -839,6 +847,7 @@ class ControlledContextResearchAdapter:
                             else None
                         ),
                         test_owned=True,
+                        parameter_references=controlled_object.parameter_ids,
                         evidence_references=(evidence_id,),
                         provenance_id=provenance_id,
                     )

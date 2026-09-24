@@ -87,6 +87,13 @@ class OllamaProvider(ModelProvider):
                 timeout=self.configuration.timeout_seconds,
             )
         raise_for_status = getattr(response, "raise_for_status", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in {400, 422} and request.structured_output_schema is not None:
+            raise ModelProviderError(
+                ModelErrorCode.schema_rejected,
+                provider=self.provider_name,
+                model=self.model_name,
+            )
         if callable(raise_for_status):
             raise_for_status()
         try:
@@ -133,11 +140,12 @@ class OllamaProvider(ModelProvider):
             code = ModelErrorCode.timeout
         elif isinstance(exc, httpx.HTTPStatusError):
             status = exc.response.status_code
-            code = (
-                ModelErrorCode.rate_limited
-                if status == 429
-                else ModelErrorCode.connection_failed
-            )
+            if status == 429:
+                code = ModelErrorCode.rate_limited
+            elif status in {400, 422}:
+                code = ModelErrorCode.configuration_error
+            else:
+                code = ModelErrorCode.connection_failed
         elif isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
             code = ModelErrorCode.connection_failed
         else:
