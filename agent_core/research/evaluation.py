@@ -454,6 +454,9 @@ class ExperimentEvaluator:
             policy_fingerprint=outcome.runtime_provenance.policy_hash,
             request_cost=outcome.request_delta.total,
             state_changing=experiment.state_changing,
+            reproduction_of=experiment.reproduction_of,
+            reproduction_finding_id=experiment.reproduction_finding_id,
+            reproduction_id=experiment.reproduction_id,
             occurred_at=outcome.occurred_at,
         )
         payload = state.model_dump(mode="python")
@@ -726,6 +729,39 @@ class ExperimentEvaluator:
             evidence_references=outcome.evidence_references,
             cleanup_status=outcome.cleanup_status,
             provenance_id=provenance_id,
+            research_id=experiment.research_id,
+            source_experiment_fingerprint=experiment.fingerprint,
+            source_outcome_id=outcome.outcome_id,
+            source_authorization_reference=outcome.authorization_reference,
+            target_id=experiment.target.target_id,
+            surface_id=experiment.target.surface_id,
+            endpoint_id=experiment.target.endpoint_id,
+            primitive=experiment.primitive_steps[0].primitive_name,
+            capability=experiment.capability.name,
+            security_property_reference=_identifier(
+                "security-property", experiment.expected_secure_behavior
+            ),
+            controlled_identity_ids=tuple(
+                item
+                for item in (
+                    experiment.identity_context.primary_identity_id,
+                    experiment.identity_context.comparison_identity_id,
+                )
+                if item is not None
+            ),
+            controlled_identity_relationship=(
+                experiment.identity_context.relationship.value
+                if experiment.identity_context.relationship is not None
+                else None
+            ),
+            controlled_object_ids=experiment.mutation.controlled_object_ids,
+            expected_secure_behavior=experiment.expected_secure_behavior,
+            observed_vulnerable_behavior=experiment.expected_vulnerable_behavior,
+            source_request_delta=outcome.request_delta,
+            total_request_count=outcome.request_delta.total,
+            created_at=outcome.occurred_at,
+            updated_at=outcome.occurred_at,
+            state_revision=experiment.state_revision,
         )
 
     @staticmethod

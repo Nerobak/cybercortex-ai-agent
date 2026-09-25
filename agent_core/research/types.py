@@ -158,9 +158,64 @@ class HypothesisResearchStatus(str, Enum):
 
 class FindingStatus(str, Enum):
     candidate = "candidate"
+    reproducing = "reproducing"
+    # Kept for compatibility with persisted pre-P4-0F research state. New
+    # confirmation flows move directly from reproducing to confirmed.
     reproduced = "reproduced"
     confirmed = "confirmed"
     rejected = "rejected"
+    needs_manual_review = "needs_manual_review"
+
+
+class ReproductionKind(str, Enum):
+    authentication_differential = "authentication_differential"
+    object_substitution = "object_substitution"
+    parameter_mutation = "parameter_mutation"
+
+
+class ReproductionIndependentDimension(str, Enum):
+    fresh_runtime_authorization = "fresh_runtime_authorization"
+    identity_order_reversal = "identity_order_reversal"
+    different_owned_object = "different_owned_object"
+    equivalent_endpoint_representation = "equivalent_endpoint_representation"
+    fresh_session_binding = "fresh_session_binding"
+    alternate_safe_observation_predicate = "alternate_safe_observation_predicate"
+
+
+class ReproductionPlanStatus(str, Enum):
+    planned = "planned"
+    completed = "completed"
+    blocked = "blocked"
+
+
+class ReproductionClassification(str, Enum):
+    reproduced = "reproduced"
+    not_reproduced = "not_reproduced"
+    inconclusive = "inconclusive"
+    blocked = "blocked"
+    runtime_failed = "runtime_failed"
+    cleanup_failed = "cleanup_failed"
+    conflicting = "conflicting"
+
+
+class FindingConfirmationAction(str, Enum):
+    confirm = "confirm"
+    reject = "reject"
+    remain_candidate = "remain_candidate"
+    manual_review = "manual_review"
+    stop = "stop"
+
+
+class ConflictingEvidenceBehavior(str, Enum):
+    remain_candidate = "remain_candidate"
+    reject = "reject"
+    manual_review = "manual_review"
+
+
+class ServiceInstabilityBehavior(str, Enum):
+    remain_candidate = "remain_candidate"
+    manual_review = "manual_review"
+    stop = "stop"
 
 
 class FactStatus(str, Enum):
@@ -337,6 +392,7 @@ class EntityKind(str, Enum):
     fact = "fact"
     hypothesis = "hypothesis"
     experiment_outcome = "experiment_outcome"
+    reproduction = "reproduction"
     finding = "finding"
     attack_chain = "attack_chain"
 
@@ -362,6 +418,11 @@ class ResearchPredicate(str, Enum):
     tested_by = "TESTED_BY"
     supported_by = "SUPPORTED_BY"
     refuted_by = "REFUTED_BY"
+    finding_reproduced_by = "FINDING_REPRODUCED_BY"
+    finding_confirmed_by = "FINDING_CONFIRMED_BY"
+    finding_rejected_by = "FINDING_REJECTED_BY"
+    reproduction_of = "REPRODUCTION_OF"
+    conflicts_with = "CONFLICTS_WITH"
 
 
 class MetadataEntry(ResearchContract):

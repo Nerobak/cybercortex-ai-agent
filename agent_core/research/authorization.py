@@ -386,6 +386,7 @@ class ResearchExecutionGate:
         ):
             raise ScopeMismatchError(ResearchAuthorizationErrorCode.scope_mismatch)
         self._validate_surface_endpoint(experiment, state, target)
+        self._validate_reproduction_binding(experiment, state)
         identity_bindings = self._identity_bindings(experiment, state)
         object_bindings = self._object_bindings(experiment, state, identity_bindings)
         routes = self._routes_and_requests(experiment, state, target)
@@ -897,6 +898,41 @@ class ResearchExecutionGate:
         raise DuplicateExperimentError(
             ResearchAuthorizationErrorCode.duplicate_experiment
         )
+
+    @staticmethod
+    def _validate_reproduction_binding(
+        experiment: SecurityExperiment, state: ResearchState
+    ) -> None:
+        """Bind explicit P4-0F reproductions to one persisted candidate and plan."""
+
+        if experiment.reproduction_finding_id is None:
+            return
+        finding = _one(
+            state.findings,
+            "finding_id",
+            experiment.reproduction_finding_id,
+        )
+        plan = _one(
+            state.reproduction_plans,
+            "reproduction_id",
+            str(experiment.reproduction_id),
+        )
+        if (
+            finding is None
+            or plan is None
+            or finding.status.value != "reproducing"
+            or plan.finding_id != finding.finding_id
+            or plan.source_experiment_id != experiment.reproduction_of
+            or finding.candidate_experiment_id != experiment.reproduction_of
+            or plan.status.value != "planned"
+            or any(
+                item.reproduction_id == plan.reproduction_id
+                for item in state.reproduction_outcomes
+            )
+        ):
+            raise AuthorizationBlockedError(
+                ResearchAuthorizationErrorCode.authorization_blocked
+            )
 
 
 def _url_belongs_to_endpoint(base: str, route_template: str, candidate: str) -> bool:

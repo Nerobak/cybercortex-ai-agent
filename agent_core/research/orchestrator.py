@@ -23,6 +23,10 @@ from agent_core.research.candidates import (
     materialize_candidate,
 )
 from agent_core.research.compiler import ExperimentCompiler, ExperimentCompilerContext
+from agent_core.research.confirmation import (
+    FindingConfirmationEvaluator,
+    FindingConfirmationPolicy,
+)
 from agent_core.research.evaluation import (
     ExperimentEvaluator,
     ResearchConsequence,
@@ -30,6 +34,16 @@ from agent_core.research.evaluation import (
 )
 from agent_core.research.experiments import ExperimentProposal, SecurityExperiment
 from agent_core.research.outcomes import ExperimentOutcome
+from agent_core.research.primitives import (
+    AuthenticationDifferentialInput,
+    ObjectSubstitutionInput,
+    ParameterMutationInput,
+)
+from agent_core.research.reproduction import (
+    ReproductionPlanner,
+    ReproductionPlanningError,
+    candidate_reproduction_eligible,
+)
 from agent_core.research.pivot import PivotPlanner
 from agent_core.research.reasoning import (
     PublicSafeResearchPacketBuilder,
@@ -46,11 +60,18 @@ from agent_core.research.selection import (
     ProposalRankingAdvice,
     material_experiment_fingerprint,
 )
-from agent_core.research.state import ResearchExperimentRecord, ResearchState
+from agent_core.research.state import (
+    FindingRecord,
+    ResearchExperimentRecord,
+    ResearchState,
+)
 from agent_core.research.store import ResearchStore
 from agent_core.research.transitions import ResearchStateMachine
 from agent_core.research.types import (
     HypothesisResearchStatus,
+    FindingStatus,
+    ReproductionPlanStatus,
+    ReproductionKind,
     ResearchContract,
     ResearchExperimentStatus,
     ResearchRunStatus,
@@ -112,6 +133,9 @@ class SecurityResearchOrchestrator:
         runtime: object | None = None,
         policy_limitations: tuple[str, ...] = (),
         bootstrapper: object | None = None,
+        reproduction_planner: ReproductionPlanner | None = None,
+        confirmation_evaluator: FindingConfirmationEvaluator | None = None,
+        enable_finding_confirmation: bool = False,
     ) -> None:
         self.store = store
         self.compiler = compiler
@@ -130,6 +154,11 @@ class SecurityResearchOrchestrator:
         self.runtime = runtime or getattr(gate, "runtime", None)
         self.policy_limitations = policy_limitations
         self.bootstrapper = bootstrapper
+        self.reproduction_planner = reproduction_planner or ReproductionPlanner()
+        self.confirmation_evaluator = (
+            confirmation_evaluator or FindingConfirmationEvaluator()
+        )
+        self.enable_finding_confirmation = bool(enable_finding_confirmation)
         if self.compiler_context is None:
             raise TypeError("the research orchestrator requires compiler context")
         if self.runtime is None:
@@ -171,6 +200,33 @@ class SecurityResearchOrchestrator:
                 research_id=research_id,
                 state=state,
                 iterations=0,
+                completed=True,
+            )
+        if state.status is ResearchRunStatus.reproducing:
+            state, resumed_attempts = self._resume_reproduction(state)
+            iterations += resumed_attempts
+            state = self.store.load_research(research_id)
+            if state.status is ResearchRunStatus.reproducing:
+                state = self._transition(
+                    state,
+                    ResearchRunStatus.evaluating_result,
+                    "reproduction-recovery-complete",
+                )
+            reason = (
+                OrchestratorStopReason.candidate_requires_reproduction
+                if any(
+                    item.status in {FindingStatus.candidate, FindingStatus.reproducing}
+                    for item in state.findings
+                )
+                else OrchestratorStopReason.all_hypotheses_resolved
+            )
+            state = self._report_and_stop(state, reason)
+            return ResearchLoopResult(
+                research_id=research_id,
+                state=state,
+                iterations=iterations,
+                evaluations=tuple(evaluations),
+                stop_reason=reason,
                 completed=True,
             )
         if state.status is ResearchRunStatus.evaluating_result:
@@ -527,6 +583,18 @@ class SecurityResearchOrchestrator:
             state = self.store.load_research(research_id)
             exceptional_expansion_attempted = False
 
+            if (
+                self.enable_finding_confirmation
+                and evaluation.candidate_finding is not None
+            ):
+                state, reproduction_attempts = self._attempt_reproduction(
+                    state,
+                    evaluation.candidate_finding,
+                    experiment,
+                    outcome,
+                )
+                iterations += reproduction_attempts
+
             if evaluation.stop_required:
                 state = self._stop(
                     state, OrchestratorStopReason.deterministic_safety_stop
@@ -588,9 +656,23 @@ class SecurityResearchOrchestrator:
                     "continue-research",
                 )
                 continue
+            current_candidate = (
+                next(
+                    (
+                        item
+                        for item in state.findings
+                        if item.finding_id == evaluation.candidate_finding.finding_id
+                    ),
+                    None,
+                )
+                if evaluation.candidate_finding is not None
+                else None
+            )
             reason = (
                 OrchestratorStopReason.candidate_requires_reproduction
-                if evaluation.candidate_finding is not None
+                if current_candidate is not None
+                and current_candidate.status
+                in {FindingStatus.candidate, FindingStatus.reproducing}
                 else OrchestratorStopReason.all_hypotheses_resolved
             )
             state = self._report_and_stop(state, reason)
@@ -602,6 +684,249 @@ class SecurityResearchOrchestrator:
                 stop_reason=reason,
                 completed=True,
             )
+
+    def _resume_reproduction(self, state: ResearchState) -> tuple[ResearchState, int]:
+        pending = next(
+            (
+                item
+                for item in state.reproduction_plans
+                if item.status is ReproductionPlanStatus.planned
+            ),
+            None,
+        )
+        if pending is None:
+            return state, 0
+        finding = next(
+            item for item in state.findings if item.finding_id == pending.finding_id
+        )
+        policy = self._confirmation_policy_for_kind(finding, pending.reproduction_kind)
+        compiled = self.reproduction_planner.compile(
+            pending,
+            None,
+            state,
+            self.compiler,
+            self.compiler_context,
+        )
+        experiment = compiled.experiment
+        try:
+            authorization = self.gate.authorize(experiment)
+            bind = getattr(self.gate, "bind", None)
+            if callable(bind):
+                bind(authorization)
+        except ResearchAuthorizationError as exc:
+            state = self._record_authorization_block(state, experiment, exc)
+            return (
+                self._mark_reproduction_blocked(
+                    state, pending.reproduction_id, finding.finding_id
+                ),
+                0,
+            )
+        runtime_outcome = self.runtime.submit(authorization)
+        if not isinstance(runtime_outcome, ExperimentOutcome):
+            raise TypeError("research runtime returned an invalid outcome")
+        self.confirmation_evaluator.evaluate_and_commit(
+            finding_id=finding.finding_id,
+            plan=pending,
+            experiment=experiment,
+            runtime_outcome=runtime_outcome,
+            policy=policy,
+            store=self.store,
+            budget_manager=self.budget_manager,
+        )
+        return self.store.load_research(state.research_id), 1
+
+    def _attempt_reproduction(
+        self,
+        state: ResearchState,
+        finding: FindingRecord,
+        source_experiment: SecurityExperiment,
+        source_outcome: ExperimentOutcome,
+    ) -> tuple[ResearchState, int]:
+        """Run only deterministic, profile-supported independent reproductions."""
+
+        policy = self._confirmation_policy(finding, source_experiment)
+        if policy is None or not candidate_reproduction_eligible(finding):
+            return state, 0
+        attempts = 0
+        while attempts < policy.maximum_attempts:
+            state = self.store.load_research(state.research_id)
+            current = next(
+                item for item in state.findings if item.finding_id == finding.finding_id
+            )
+            if current.status not in {
+                FindingStatus.candidate,
+                FindingStatus.reproducing,
+            }:
+                break
+            if state.status is ResearchRunStatus.evaluating_result:
+                state = self._transition(
+                    state,
+                    ResearchRunStatus.reproducing,
+                    "candidate-independent-reproduction",
+                )
+            pending = next(
+                (
+                    item
+                    for item in state.reproduction_plans
+                    if item.finding_id == current.finding_id
+                    and item.status is ReproductionPlanStatus.planned
+                ),
+                None,
+            )
+            if pending is None:
+                try:
+                    plans = self.reproduction_planner.plan(
+                        current,
+                        state,
+                        source_experiment,
+                        source_outcome,
+                        registry=self.compiler.registry,
+                        confirmation_policy=policy,
+                        budget_manager=self.budget_manager,
+                    )
+                except ReproductionPlanningError as exc:
+                    state = self._with_diagnostic_codes(
+                        state, f"reproduction_{str(exc)}"
+                    )
+                    if state.status is ResearchRunStatus.reproducing:
+                        state = self._transition(
+                            state,
+                            ResearchRunStatus.evaluating_result,
+                            "reproduction-not-eligible",
+                            replacement=state,
+                        )
+                    break
+                pending = plans[0]
+                state = self.reproduction_planner.persist_plan(
+                    pending,
+                    self.store,
+                    budget_manager=self.budget_manager,
+                    occurred_at=self._now(state.updated_at),
+                )
+            compiled = self.reproduction_planner.compile(
+                pending,
+                source_experiment,
+                state,
+                self.compiler,
+                self.compiler_context,
+            )
+            experiment = compiled.experiment
+            try:
+                authorization = self.gate.authorize(experiment)
+                bind = getattr(self.gate, "bind", None)
+                if callable(bind):
+                    bind(authorization)
+            except ResearchAuthorizationError as exc:
+                state = self._record_authorization_block(state, experiment, exc)
+                state = self._mark_reproduction_blocked(
+                    state, pending.reproduction_id, current.finding_id
+                )
+                state = self._transition(
+                    state,
+                    ResearchRunStatus.evaluating_result,
+                    "reproduction-authorization-blocked",
+                )
+                break
+            runtime_outcome = self.runtime.submit(authorization)
+            if not isinstance(runtime_outcome, ExperimentOutcome):
+                raise TypeError("research runtime returned an invalid outcome")
+            self.confirmation_evaluator.evaluate_and_commit(
+                finding_id=current.finding_id,
+                plan=pending,
+                experiment=experiment,
+                runtime_outcome=runtime_outcome,
+                policy=policy,
+                store=self.store,
+                budget_manager=self.budget_manager,
+            )
+            attempts += 1
+            state = self.store.load_research(state.research_id)
+            state = self._transition(
+                state,
+                ResearchRunStatus.evaluating_result,
+                "reproduction-evaluated",
+            )
+            current = next(
+                item for item in state.findings if item.finding_id == current.finding_id
+            )
+            if current.status is not FindingStatus.candidate:
+                break
+        return state, attempts
+
+    @staticmethod
+    def _confirmation_policy(
+        finding: FindingRecord, experiment: SecurityExperiment
+    ) -> FindingConfirmationPolicy | None:
+        inputs = tuple(item.input for item in experiment.primitive_steps)
+        if any(isinstance(item, ObjectSubstitutionInput) for item in inputs):
+            return SecurityResearchOrchestrator._confirmation_policy_for_kind(
+                finding, ReproductionKind.object_substitution
+            )
+        if any(isinstance(item, AuthenticationDifferentialInput) for item in inputs):
+            return SecurityResearchOrchestrator._confirmation_policy_for_kind(
+                finding, ReproductionKind.authentication_differential
+            )
+        if any(isinstance(item, ParameterMutationInput) for item in inputs):
+            return SecurityResearchOrchestrator._confirmation_policy_for_kind(
+                finding, ReproductionKind.parameter_mutation
+            )
+        return None
+
+    @staticmethod
+    def _confirmation_policy_for_kind(
+        finding: FindingRecord, kind: ReproductionKind
+    ) -> FindingConfirmationPolicy:
+        if kind is ReproductionKind.object_substitution:
+            return FindingConfirmationPolicy.authorization_read_only(
+                finding.confirmation_policy_reference
+            )
+        if kind is ReproductionKind.authentication_differential:
+            return FindingConfirmationPolicy.authentication_read_only(
+                finding.confirmation_policy_reference
+            )
+        return FindingConfirmationPolicy.parameter_mutation_read_only(
+            finding.confirmation_policy_reference
+        )
+
+    def _mark_reproduction_blocked(
+        self, state: ResearchState, reproduction_id: str, finding_id: str
+    ) -> ResearchState:
+        occurred_at = self._now(state.updated_at)
+        plans = tuple(
+            (
+                item.model_copy(update={"status": ReproductionPlanStatus.blocked})
+                if item.reproduction_id == reproduction_id
+                else item
+            )
+            for item in state.reproduction_plans
+        )
+        findings = tuple(
+            (
+                item.model_copy(
+                    update={
+                        "status": FindingStatus.candidate,
+                        "updated_at": occurred_at,
+                        "decision_reason_code": "reproduction_authorization_blocked",
+                    }
+                )
+                if item.finding_id == finding_id
+                else item
+            )
+            for item in state.findings
+        )
+        payload = state.model_dump(mode="python")
+        payload.update(
+            revision=state.revision + 1,
+            updated_at=occurred_at,
+            reproduction_plans=plans,
+            findings=findings,
+        )
+        next_state = ResearchState.model_validate(payload)
+        return self.store.commit_revision(
+            state.research_id,
+            expected_revision=state.revision,
+            state=next_state,
+        )
 
     def _prepare(self, state: ResearchState) -> ResearchState:
         if self.bootstrapper is not None:
@@ -759,6 +1084,9 @@ class SecurityResearchOrchestrator:
             relevant_state_revision=state.revision,
             policy_reference=self.compiler_context.policy_reference,
             policy_fingerprint=self._policy_fingerprint(),
+            reproduction_of=experiment.reproduction_of,
+            reproduction_finding_id=experiment.reproduction_finding_id,
+            reproduction_id=experiment.reproduction_id,
             occurred_at=self._now(state.updated_at),
         )
         payload = state.model_dump(mode="python")

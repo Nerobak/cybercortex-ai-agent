@@ -239,6 +239,8 @@ class ExperimentCompilerContext(ResearchContract):
     policy_reference: OpaqueIdentifier | None = None
     context_reference: OpaqueIdentifier | None = None
     reproduction_of: OpaqueIdentifier | None = None
+    reproduction_finding_id: OpaqueIdentifier | None = None
+    reproduction_id: OpaqueIdentifier | None = None
 
     @model_validator(mode="after")
     def validate_unique_registrations(self) -> "ExperimentCompilerContext":
@@ -256,6 +258,12 @@ class ExperimentCompilerContext(ResearchContract):
             raise ValueError("controlled value references must be unique")
         if len(self.state_references) != len(set(self.state_references)):
             raise ValueError("state references must be unique")
+        markers = (
+            self.reproduction_finding_id is not None,
+            self.reproduction_id is not None,
+        )
+        if any(markers) and (self.reproduction_of is None or not all(markers)):
+            raise ValueError("compiler reproduction markers must be supplied together")
         return self
 
 
@@ -577,6 +585,8 @@ class ExperimentCompiler:
             "preconditions": canonical_preconditions,
             "stop_conditions": stop_conditions,
             "reproduction_of": compiler_context.reproduction_of,
+            "reproduction_finding_id": compiler_context.reproduction_finding_id,
+            "reproduction_id": compiler_context.reproduction_id,
             "expires_at": expires_at,
             "provenance": provenance,
         }

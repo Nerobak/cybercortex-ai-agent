@@ -44,6 +44,9 @@ class ResearchEventType(str, Enum):
     experiment_outcome_recorded = "experiment_outcome_recorded"
     research_evaluation_recorded = "research_evaluation_recorded"
     finding_status_changed = "finding_status_changed"
+    reproduction_planned = "reproduction_planned"
+    reproduction_outcome_recorded = "reproduction_outcome_recorded"
+    finding_confirmation_decided = "finding_confirmation_decided"
     budget_updated = "budget_updated"
     research_state_transitioned = "research_state_transitioned"
     research_stopped = "research_stopped"
@@ -126,6 +129,28 @@ class FindingStatusChangedPayload(ResearchContract):
         return self
 
 
+class ReproductionPlannedPayload(ResearchContract):
+    event_type: Literal["reproduction_planned"] = "reproduction_planned"
+    reproduction_id: OpaqueIdentifier
+    finding_id: FindingId
+
+
+class ReproductionOutcomeRecordedPayload(ResearchContract):
+    event_type: Literal["reproduction_outcome_recorded"] = (
+        "reproduction_outcome_recorded"
+    )
+    reproduction_id: OpaqueIdentifier
+    finding_id: FindingId
+    outcome_id: ExperimentOutcomeId
+
+
+class FindingConfirmationDecidedPayload(ResearchContract):
+    event_type: Literal["finding_confirmation_decided"] = "finding_confirmation_decided"
+    decision_id: OpaqueIdentifier
+    finding_id: FindingId
+    action: OpaqueIdentifier
+
+
 class BudgetUpdatedPayload(ResearchContract):
     event_type: Literal["budget_updated"] = "budget_updated"
     budget_reference: OpaqueIdentifier
@@ -184,6 +209,9 @@ ResearchEventPayload: TypeAlias = Annotated[
     | ExperimentOutcomeRecordedPayload
     | ResearchEvaluationRecordedPayload
     | FindingStatusChangedPayload
+    | ReproductionPlannedPayload
+    | ReproductionOutcomeRecordedPayload
+    | FindingConfirmationDecidedPayload
     | BudgetUpdatedPayload
     | ResearchStateTransitionedPayload
     | ResearchStoppedPayload

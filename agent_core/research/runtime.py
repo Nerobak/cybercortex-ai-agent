@@ -404,7 +404,15 @@ class ResearchRuntime:
             occurred_at=_timestamp(self._now()),
             dry_run=False,
         )
-        self._persist(authorization, outcome)
+        # A fully bound P4-0F reproduction is persisted by the confirmation
+        # coordinator together with its decision, finding status, graph, and
+        # budget state. Legacy ``reproduction_of`` callers keep the original
+        # runtime persistence behavior for compatibility.
+        if (
+            authorization.experiment.reproduction_id is None
+            or authorization.experiment.reproduction_finding_id is None
+        ):
+            self._persist(authorization, outcome)
         self.__completed_fingerprints.add(authorization.experiment_fingerprint)
         self.__completed_experiment_ids.add(authorization.experiment_id)
         return outcome

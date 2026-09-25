@@ -8,6 +8,7 @@ from pydantic import Field, StrictBool, StrictInt, model_validator
 
 from agent_core.research.provenance import reject_secret_material
 from agent_core.research.state import ExperimentOutcome as StoredExperimentOutcome
+from agent_core.research.state import ReproductionOutcome
 from agent_core.research.types import (
     CleanupStatus,
     EvidenceArtifactId,
@@ -150,6 +151,7 @@ __all__ = [
     "PrimitiveExecutionEvidence",
     "ProposedExecutionMetadata",
     "RuntimeProvenance",
+    "ReproductionOutcome",
     "SafeRequestSummary",
     "SafeResponseSummary",
     "SelectorResult",

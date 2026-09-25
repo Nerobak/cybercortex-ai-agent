@@ -13,6 +13,7 @@ from agent_core.research.events import (
 )
 from agent_core.research.state import ResearchState
 from agent_core.research.types import (
+    FindingStatus,
     OpaqueIdentifier,
     ProvenanceRecordId,
     ResearchEventId,
@@ -107,6 +108,8 @@ ALLOWED_RESEARCH_TRANSITIONS: dict[ResearchRunStatus, frozenset[ResearchRunStatu
     ResearchRunStatus.reproducing: frozenset(
         {
             ResearchRunStatus.evaluating_result,
+            ResearchRunStatus.impact_analysis,
+            ResearchRunStatus.selecting_experiment,
             ResearchRunStatus.stopped,
             ResearchRunStatus.failed,
         }
@@ -136,6 +139,37 @@ ALLOWED_RESEARCH_TRANSITIONS: dict[ResearchRunStatus, frozenset[ResearchRunStatu
     ResearchRunStatus.stopped: frozenset(),
     ResearchRunStatus.failed: frozenset(),
 }
+
+
+ALLOWED_FINDING_TRANSITIONS: dict[FindingStatus, frozenset[FindingStatus]] = {
+    FindingStatus.candidate: frozenset(
+        {FindingStatus.reproducing, FindingStatus.needs_manual_review}
+    ),
+    FindingStatus.reproducing: frozenset(
+        {
+            FindingStatus.candidate,
+            FindingStatus.confirmed,
+            FindingStatus.rejected,
+            FindingStatus.needs_manual_review,
+        }
+    ),
+    # Compatibility state retained from the pre-P4-0F schema.
+    FindingStatus.reproduced: frozenset(
+        {FindingStatus.confirmed, FindingStatus.rejected}
+    ),
+    FindingStatus.confirmed: frozenset(),
+    FindingStatus.rejected: frozenset(),
+    FindingStatus.needs_manual_review: frozenset(),
+}
+
+
+def validate_finding_transition(
+    previous: FindingStatus, next_status: FindingStatus
+) -> None:
+    if next_status not in ALLOWED_FINDING_TRANSITIONS[previous]:
+        raise InvalidResearchStateTransition(
+            f"Invalid finding transition: {previous.value} -> {next_status.value}"
+        )
 
 
 class ResearchStateMachine:

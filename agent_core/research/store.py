@@ -421,6 +421,9 @@ class ResearchStore:
             EntityKind.experiment_outcome: {
                 item.outcome_id for item in state.experiment_outcomes
             },
+            EntityKind.reproduction: {
+                item.reproduction_id for item in state.reproduction_plans
+            },
             EntityKind.finding: {item.finding_id for item in state.findings},
             EntityKind.attack_chain: {
                 item.attack_chain_id for item in state.attack_chains
@@ -506,6 +509,50 @@ class ResearchStore:
                         event_payload.finding_id,
                         entity_ids[EntityKind.finding],
                         "finding",
+                    ),
+                )
+            elif event.event_type is ResearchEventType.reproduction_planned:
+                referenced_ids = (
+                    (
+                        event_payload.reproduction_id,
+                        entity_ids[EntityKind.reproduction],
+                        "reproduction",
+                    ),
+                    (
+                        event_payload.finding_id,
+                        entity_ids[EntityKind.finding],
+                        "finding",
+                    ),
+                )
+            elif event.event_type is ResearchEventType.reproduction_outcome_recorded:
+                referenced_ids = (
+                    (
+                        event_payload.reproduction_id,
+                        entity_ids[EntityKind.reproduction],
+                        "reproduction",
+                    ),
+                    (
+                        event_payload.finding_id,
+                        entity_ids[EntityKind.finding],
+                        "finding",
+                    ),
+                    (
+                        event_payload.outcome_id,
+                        entity_ids[EntityKind.experiment_outcome],
+                        "experiment outcome",
+                    ),
+                )
+            elif event.event_type is ResearchEventType.finding_confirmation_decided:
+                referenced_ids = (
+                    (
+                        event_payload.finding_id,
+                        entity_ids[EntityKind.finding],
+                        "finding",
+                    ),
+                    (
+                        event_payload.decision_id,
+                        {item.decision_id for item in state.confirmation_decisions},
+                        "confirmation decision",
                     ),
                 )
             elif event.event_type is ResearchEventType.budget_updated:

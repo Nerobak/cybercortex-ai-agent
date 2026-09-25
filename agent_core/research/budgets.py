@@ -15,6 +15,7 @@ from agent_core.research.state import (
     HypothesisBudgetUsage,
     ModelBudgetSnapshot,
     RequestBudgetSnapshot,
+    ReproductionBudgetUsage,
     ResearchState,
     SurfaceBudgetUsage,
 )
@@ -35,6 +36,11 @@ class ResearchBudgetStopReason(str, Enum):
     state_change_budget_exhausted = "state_change_budget_exhausted"
     cleanup_barrier = "cleanup_barrier"
     repeated_service_instability = "repeated_service_instability"
+    reproduction_attempt_budget_exhausted = "reproduction_attempt_budget_exhausted"
+    reproduction_request_budget_exhausted = "reproduction_request_budget_exhausted"
+    reproduction_model_budget_exhausted = "reproduction_model_budget_exhausted"
+    reproduction_wall_time_exhausted = "reproduction_wall_time_exhausted"
+    reproduction_state_change_forbidden = "reproduction_state_change_forbidden"
 
 
 class ResearchBudgetPolicy(ResearchContract):
@@ -77,6 +83,20 @@ class ResearchBudgetDecision(ResearchContract):
     def validate_reason(self) -> "ResearchBudgetDecision":
         if self.allowed == (self.reason is not None):
             raise ValueError("denied budget decisions require exactly one reason")
+        return self
+
+
+class ReproductionBudgetDecision(ResearchContract):
+    allowed: bool
+    reason: ResearchBudgetStopReason | None = None
+    remaining_attempts: StrictInt = Field(ge=0)
+    remaining_target_requests: StrictInt = Field(ge=0)
+    remaining_model_calls: StrictInt = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_reason(self) -> "ReproductionBudgetDecision":
+        if self.allowed == (self.reason is not None):
+            raise ValueError("denied reproduction budgets require exactly one reason")
         return self
 
 
@@ -266,6 +286,126 @@ class ResearchBudgetManager:
             BudgetState.model_validate(payload), research.research_id
         )
 
+    def check_reproduction(
+        self,
+        research: ResearchState,
+        *,
+        finding_id: str,
+        confirmation_policy: object,
+        estimated_requests: int,
+        state_changing: bool = False,
+        model_calls: int = 0,
+    ) -> ReproductionBudgetDecision:
+        """Check the independent reproduction ledger without consuming it."""
+
+        if estimated_requests < 0 or model_calls < 0:
+            raise ValueError("reproduction estimates cannot be negative")
+        budget = self.state(research)
+        usage = next(
+            (
+                item
+                for item in budget.reproduction_usage
+                if item.finding_id == finding_id
+            ),
+            ReproductionBudgetUsage(finding_id=finding_id),
+        )
+        attempt_ceiling = int(getattr(confirmation_policy, "maximum_attempts"))
+        request_ceiling = int(getattr(confirmation_policy, "maximum_requests"))
+        model_ceiling = int(getattr(confirmation_policy, "maximum_model_calls"))
+        wall_ceiling = float(getattr(confirmation_policy, "maximum_wall_time_seconds"))
+        state_change_allowed = bool(
+            getattr(confirmation_policy, "state_changing_confirmation_permitted")
+        )
+        remaining_attempts = max(0, attempt_ceiling - usage.attempts_consumed)
+        remaining_requests = max(0, request_ceiling - usage.target_requests_consumed)
+        remaining_model_calls = max(0, model_ceiling - usage.model_calls_consumed)
+        reason = None
+        if usage.attempts_consumed >= attempt_ceiling:
+            reason = ResearchBudgetStopReason.reproduction_attempt_budget_exhausted
+        elif estimated_requests > remaining_requests:
+            reason = ResearchBudgetStopReason.reproduction_request_budget_exhausted
+        elif estimated_requests > budget.request_budget.remaining:
+            reason = ResearchBudgetStopReason.request_budget_exhausted
+        elif model_calls > remaining_model_calls:
+            reason = ResearchBudgetStopReason.reproduction_model_budget_exhausted
+        elif usage.wall_time_consumed_seconds >= wall_ceiling:
+            reason = ResearchBudgetStopReason.reproduction_wall_time_exhausted
+        elif state_changing and not state_change_allowed:
+            reason = ResearchBudgetStopReason.reproduction_state_change_forbidden
+        elif (
+            budget.cleanup_status
+            in {
+                CleanupStatus.pending,
+                CleanupStatus.failed,
+                CleanupStatus.externally_required,
+            }
+            or budget.cleanup_barrier_reference is not None
+        ):
+            reason = ResearchBudgetStopReason.cleanup_barrier
+        return ReproductionBudgetDecision(
+            allowed=reason is None,
+            reason=reason,
+            remaining_attempts=remaining_attempts,
+            remaining_target_requests=remaining_requests,
+            remaining_model_calls=remaining_model_calls,
+        )
+
+    def consume_reproduction_attempt(
+        self,
+        research: ResearchState,
+        *,
+        finding_id: str,
+        model_calls: int = 0,
+        state_changing: bool = False,
+    ) -> BudgetState:
+        """Consume an attempt at plan persistence; attempts are never refunded."""
+
+        current = self.state(research)
+        usage = {item.finding_id: item for item in current.reproduction_usage}
+        prior = usage.get(finding_id, ReproductionBudgetUsage(finding_id=finding_id))
+        usage[finding_id] = prior.model_copy(
+            update={
+                "attempts_consumed": prior.attempts_consumed + 1,
+                "model_calls_consumed": prior.model_calls_consumed + model_calls,
+                "state_changes_consumed": prior.state_changes_consumed
+                + int(state_changing),
+            }
+        )
+        payload = current.model_dump(mode="python")
+        payload["reproduction_usage"] = tuple(usage.values())
+        return self._synchronize(
+            BudgetState.model_validate(payload), research.research_id
+        )
+
+    def consume_reproduction_result(
+        self,
+        research: ResearchState,
+        *,
+        finding_id: str,
+        request_delta: RequestDelta,
+        wall_time_seconds: float = 0.0,
+    ) -> BudgetState:
+        """Record authoritative reproduction traffic without refund semantics."""
+
+        current = self.state(research)
+        usage = {item.finding_id: item for item in current.reproduction_usage}
+        prior = usage.get(finding_id, ReproductionBudgetUsage(finding_id=finding_id))
+        usage[finding_id] = prior.model_copy(
+            update={
+                "target_requests_consumed": prior.target_requests_consumed
+                + request_delta.total,
+                "cleanup_requests_consumed": prior.cleanup_requests_consumed
+                + request_delta.cleanup,
+                "wall_time_consumed_seconds": prior.wall_time_consumed_seconds
+                + max(0.0, wall_time_seconds),
+            }
+        )
+        payload = current.model_dump(mode="python")
+        payload["reproduction_usage"] = tuple(usage.values())
+        return self._synchronize(
+            BudgetState.model_validate(payload), research.research_id
+        )
+
     def _new_state(self, research_id: str) -> BudgetState:
         request = self._request_snapshot()
         model = self._model_snapshot(research_id)
@@ -358,6 +498,7 @@ def utc_now() -> str:
 
 
 __all__ = [
+    "ReproductionBudgetDecision",
     "ResearchBudgetDecision",
     "ResearchBudgetManager",
     "ResearchBudgetPolicy",

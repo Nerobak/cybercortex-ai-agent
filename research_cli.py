@@ -116,6 +116,13 @@ class SafeTracer:
             "PIVOT",
             "NEW_HYPOTHESIS",
             "CANDIDATE",
+            "REPRODUCTION_PLAN",
+            "REPRODUCTION_AUTHORIZE",
+            "REPRODUCTION_EXECUTE",
+            "REPRODUCTION_EVALUATE",
+            "CONFIRM",
+            "REJECT",
+            "MANUAL_REVIEW",
             "STOP",
         }
     )
@@ -690,6 +697,7 @@ def _build_orchestrator(
         runtime=gate.runtime,
         policy_limitations=policy_limitations,
         bootstrapper=wiring.bootstrapper,
+        enable_finding_confirmation=True,
     )
 
 
@@ -747,9 +755,14 @@ def safe_run_summary(
     findings = [
         {
             "id": item.finding_id,
+            "category": item.category,
             "source_hypothesis": item.source_hypothesis_id,
+            "source_experiment": item.candidate_experiment_id,
             "status": item.status.value,
+            "reproduction_ids": list(item.reproduction_ids),
             "evidence_references": list(item.evidence_references),
+            "confirmation_policy_reference": (item.confirmation_policy_reference),
+            "total_finding_request_count": item.total_request_count,
         }
         for item in state.findings
     ]
@@ -822,6 +835,43 @@ def _trace_state(tracer: SafeTracer, state: ResearchState, stop_reason: str) -> 
             finding_id=finding.finding_id,
             status=finding.status.value,
         )
+    for plan in state.reproduction_plans:
+        tracer.emit(
+            "REPRODUCTION_PLAN",
+            reproduction_id=plan.reproduction_id,
+            finding_id=plan.finding_id,
+            dimension=plan.independent_dimension.value,
+        )
+        if plan.compiled_experiment_id is not None:
+            tracer.emit(
+                "REPRODUCTION_AUTHORIZE",
+                reproduction_id=plan.reproduction_id,
+                experiment_id=plan.compiled_experiment_id,
+                status=plan.status.value,
+            )
+    for outcome in state.reproduction_outcomes:
+        tracer.emit(
+            "REPRODUCTION_EXECUTE",
+            reproduction_id=outcome.reproduction_id,
+            request_count=outcome.request_delta.total,
+        )
+        tracer.emit(
+            "REPRODUCTION_EVALUATE",
+            reproduction_id=outcome.reproduction_id,
+            classification=outcome.classification.value,
+        )
+    for decision in state.confirmation_decisions:
+        event = {
+            "confirm": "CONFIRM",
+            "reject": "REJECT",
+            "manual_review": "MANUAL_REVIEW",
+        }.get(decision.action.value)
+        if event is not None:
+            tracer.emit(
+                event,
+                finding_id=decision.finding_id,
+                decision_id=decision.decision_id,
+            )
     tracer.emit("STOP", status=state.status.value, reason=stop_reason)
 
 

@@ -370,6 +370,8 @@ class SecurityExperiment(ResearchContract):
     stop_conditions: StopConditions
     fingerprint: Sha256Digest
     reproduction_of: ExperimentId | None = None
+    reproduction_finding_id: OpaqueIdentifier | None = None
+    reproduction_id: OpaqueIdentifier | None = None
     expires_at: Timestamp
     provenance: ExperimentProvenance
 
@@ -379,10 +381,34 @@ class SecurityExperiment(ResearchContract):
             raise ValueError("state-changing experiments require cleanup")
         if self.request_estimate.cleanup != self.cleanup.worst_case_requests:
             raise ValueError("cleanup reserve must match the cleanup plan")
+        markers = (
+            self.reproduction_finding_id is not None,
+            self.reproduction_id is not None,
+        )
+        if any(markers) and (self.reproduction_of is None or not all(markers)):
+            raise ValueError("reproduction markers must be supplied together")
         from agent_core.research.fingerprint import experiment_fingerprint
 
         if experiment_fingerprint(self) != self.fingerprint:
             raise ValueError("experiment fingerprint does not match its semantics")
+        return self
+
+
+class ReproductionExperiment(ResearchContract):
+    """Strict wrapper around the ordinary compiler output used for reproduction."""
+
+    reproduction_id: OpaqueIdentifier
+    finding_id: OpaqueIdentifier
+    experiment: SecurityExperiment
+
+    @model_validator(mode="after")
+    def validate_markers(self) -> "ReproductionExperiment":
+        if (
+            self.experiment.reproduction_of is None
+            or self.experiment.reproduction_id != self.reproduction_id
+            or self.experiment.reproduction_finding_id != self.finding_id
+        ):
+            raise ValueError("compiled reproduction markers do not match the plan")
         return self
 
 
