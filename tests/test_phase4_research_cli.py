@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,12 @@ import research_cli
 from agent_core.attack_surface import CanonicalAttackSurface, SurfaceEvidence
 from agent_core.credential_vault import CredentialVault
 from agent_core.models import ModelCallLedger, ModelErrorCode, ModelUsageDelta
-from agent_core.research import ExperimentCompiler, PublicSafeResearchPacketBuilder
+from agent_core.research import (
+    ExperimentCompiler,
+    PublicSafeResearchPacketBuilder,
+    ResearchExecutionGate,
+    reject_secret_material,
+)
 from tests.test_phase4_research_compiler import (
     compiler_context as compiler_context_fixture,
 )
@@ -18,6 +24,8 @@ from tests.test_phase4_research_compiler import object_proposal
 from tests.test_phase4_research_compiler import (
     research_state as compiler_state_fixture,
 )
+from tests.test_phase4_research_runtime import build_runtime_fixture
+from tools.safe_http import ScopedHTTPClient
 
 SYNTHETIC_SECRET = "cli-secret-sentinel-7f4d2b"
 TARGET = "https://research-cli.example"
@@ -224,6 +232,77 @@ def test_read_only_policy_is_exact_and_conservative():
     assert policy.max_concurrency == 1
     assert policy.allowed_assets[0].value == TARGET
     assert policy.allowed_assets[0].ports == [443]
+
+
+def test_cli_policy_reference_is_neutral_stable_and_authorizable():
+    fixture = build_runtime_fixture()
+    state = fixture.gate.state
+    target = state.targets[0].canonical_reference
+    controlled = fixture.gate.controlled_context
+    policy = research_cli.build_assessment_policy(
+        target=target,
+        research_id=state.research_id,
+        request_budget=fixture.budget.limit,
+        controlled_context=controlled,
+    )
+    equivalent = research_cli.build_assessment_policy(
+        target=target,
+        research_id=state.research_id,
+        request_budget=fixture.budget.limit,
+        controlled_context=controlled.model_copy(
+            update={"accounts": tuple(reversed(controlled.accounts))}
+        ),
+    )
+    changed = research_cli.build_assessment_policy(
+        target=target,
+        research_id=state.research_id,
+        request_budget=fixture.budget.limit - 1,
+        controlled_context=controlled,
+    )
+    assert re.fullmatch(r"policy_[0-9a-f]{16}", policy.authorization_reference)
+    assert equivalent.authorization_reference == policy.authorization_reference
+    assert changed.authorization_reference != policy.authorization_reference
+    reject_secret_material(policy.authorization_reference, location="policy reference")
+
+    context = fixture.gate.compiler_context.model_copy(
+        update={"policy_reference": policy.authorization_reference}
+    )
+    experiment = ExperimentCompiler(context=context).compile(
+        object_proposal(), state, context
+    )
+    calls = []
+
+    def requester(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("authorization must not invoke transport")
+
+    transport = ScopedHTTPClient(
+        policy=policy,
+        budget=fixture.budget,
+        requester=requester,
+        max_response_bytes=100_000,
+    )
+    gate = ResearchExecutionGate(
+        state=state,
+        policy=policy,
+        controlled_context=controlled,
+        vault=fixture.vault,
+        budget=fixture.budget,
+        transport=transport,
+        compiler_context=context,
+        request_templates=tuple(fixture.gate.request_templates.values()),
+        controlled_values=tuple(fixture.gate.controlled_values.values()),
+        evidence_summaries=tuple(fixture.gate.evidence_summaries.values()),
+        state_snapshots=tuple(fixture.gate.state_snapshots.values()),
+        scope_reference=state.targets[0].scope_reference,
+        current_time=fixture.gate.current_time,
+    )
+
+    authorization = gate.authorize(experiment)
+
+    assert authorization.experiment is experiment
+    assert authorization.policy_reference == policy.authorization_reference
+    assert calls == []
 
 
 def test_wiring_shares_one_request_budget_and_is_local_only(tmp_path):

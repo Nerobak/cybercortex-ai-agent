@@ -476,11 +476,7 @@ class SecurityResearchOrchestrator:
                 state,
                 ResearchRunStatus.awaiting_authorization,
                 "experiment-selected",
-            )
-            state = self._transition(
-                state,
-                ResearchRunStatus.executing_experiment,
-                "authorization-required",
+                replacement=self._with_synchronized_budget(state),
             )
             executable_proposal = self._rebase_proposals((selected_proposal,), state)[0]
             experiment = self.compiler.compile(
@@ -491,16 +487,8 @@ class SecurityResearchOrchestrator:
                 bind = getattr(self.gate, "bind", None)
                 if callable(bind):
                     bind(authorization)
-                outcome = self.runtime.submit(authorization)
-                if not isinstance(outcome, ExperimentOutcome):
-                    raise TypeError("research runtime returned an invalid outcome")
             except ResearchAuthorizationError as exc:
                 state = self._record_authorization_block(state, experiment, exc)
-                state = self._transition(
-                    state,
-                    ResearchRunStatus.evaluating_result,
-                    "authorization-blocked",
-                )
                 state = self._transition(
                     state,
                     ResearchRunStatus.selecting_experiment,
@@ -508,6 +496,14 @@ class SecurityResearchOrchestrator:
                 )
                 next_is_pivot = False
                 continue
+            state = self._transition(
+                state,
+                ResearchRunStatus.executing_experiment,
+                "authorization-succeeded",
+            )
+            outcome = self.runtime.submit(authorization)
+            if not isinstance(outcome, ExperimentOutcome):
+                raise TypeError("research runtime returned an invalid outcome")
 
             state = self.store.load_research(research_id)
             state = self._transition(

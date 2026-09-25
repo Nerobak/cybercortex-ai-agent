@@ -57,6 +57,7 @@ from agent_core.research.types import (
     MetadataEntry,
     ProvenanceProducerType,
     PublicMetadata,
+    ResearchRunStatus,
 )
 
 RESEARCH_RUNTIME_NAME = "cybercortex-research-runtime"
@@ -266,8 +267,8 @@ class ResearchRuntime:
             )
         state = self._current_state()
         if (
-            state.revision != authorization.state_revision
-            or state.research_id != authorization.research_id
+            state.research_id != authorization.research_id
+            or not self._authorization_state_is_current(state, authorization)
             or target_fingerprint(
                 self.target(authorization.experiment.target.target_id)
             )
@@ -616,7 +617,7 @@ class ResearchRuntime:
             return
         try:
             state = self.__store.load_research(authorization.research_id)
-            if state.revision != authorization.state_revision:
+            if not self._authorization_state_is_current(state, authorization):
                 raise ValueError("research revision changed before outcome commit")
             evidence = tuple(
                 EvidenceArtifact(
@@ -695,6 +696,35 @@ class ResearchRuntime:
         except Exception as exc:
             object.__setattr__(self, "_ResearchRuntime__persistence_failed", True)
             raise ResearchPersistenceError("persistence_failure") from exc
+
+    def _authorization_state_is_current(
+        self, state: ResearchState, authorization: AuthorizedExperiment
+    ) -> bool:
+        if state.revision == authorization.state_revision:
+            return True
+        if (
+            self.__store is None
+            or state.revision != authorization.state_revision + 1
+            or state.status is not ResearchRunStatus.executing_experiment
+        ):
+            return False
+        try:
+            authorized_state = self.__store.load_research(
+                authorization.research_id, authorization.state_revision
+            )
+        except Exception:
+            return False
+        if (
+            not isinstance(authorized_state, ResearchState)
+            or authorized_state.status is not ResearchRunStatus.awaiting_authorization
+        ):
+            return False
+        authorized_payload = authorized_state.model_dump(mode="python")
+        current_payload = state.model_dump(mode="python")
+        for field in ("revision", "status", "updated_at"):
+            authorized_payload.pop(field, None)
+            current_payload.pop(field, None)
+        return authorized_payload == current_payload
 
     def _current_state(self) -> ResearchState:
         if self.__store is None:

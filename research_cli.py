@@ -20,6 +20,7 @@ from typing import Any, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
 from agent_core.adaptive_orchestrator import AdaptiveAssessmentOrchestrator
+from agent_core.agent_models import stable_identifier
 from agent_core.controlled_context import (
     ControlledAccount,
     ControlledContext,
@@ -311,9 +312,17 @@ def build_assessment_policy(
     parsed = urlsplit(target)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     account_ids = [item.account_id for item in controlled_context.accounts]
+    authorization_reference = stable_identifier(
+        "policy",
+        "phase4-blind-research",
+        research_id,
+        target,
+        request_budget,
+        ",".join(sorted(account_ids)),
+    )
     return AssessmentPolicy(
         profile_name="phase4-blind-research",
-        authorization_reference=f"authorization:{research_id}",
+        authorization_reference=authorization_reference,
         authorization_confirmed=True,
         allowed_assets=[
             ScopeAsset(

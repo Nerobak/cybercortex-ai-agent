@@ -297,7 +297,10 @@ def test_migration_registry_applies_one_transactional_step():
     (
         "SYNTHETIC_SECRET",
         "Authorization: Bearer SYNTHETIC_TOKEN_VALUE",
+        "Cookie: session=SYNTHETIC_COOKIE_VALUE",
+        "api_key=SYNTHETIC_API_KEY_VALUE",
         "password=SYNTHETIC_PASSWORD",
+        "token=SYNTHETIC_TOKEN_VALUE",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.fake_signature",
     ),
 )

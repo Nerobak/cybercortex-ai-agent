@@ -14,6 +14,7 @@ from agent_core.models import (
 from agent_core.phase2_result_status import Phase2ResultStatus
 from agent_core.request_budget import RequestDelta
 from agent_core.research import (
+    AuthorizationBlockedError,
     BaselineIntent,
     BaselineKind,
     CleanupExecutionResult,
@@ -42,6 +43,7 @@ from agent_core.research import (
     ResearchCleanupBarrier,
     ResearchConfidence,
     ResearchExecutionGate,
+    ResearchAuthorizationErrorCode,
     ResearchReasoningEngine,
     ResearchPredicate,
     ResearchRunStatus,
@@ -421,6 +423,100 @@ def test_orchestrator_dependencies_keep_model_outside_authority_boundary():
     assert not hasattr(ExperimentProposal, "execute")
     assert not hasattr(ExperimentProposal, "authorize")
     assert ResearchExecutionGate is not ResearchRuntime
+
+
+def test_authorization_succeeds_before_executing_and_runtime_submission(tmp_path):
+    store = ResearchStore(tmp_path / "authorization-order.sqlite3")
+    store.create_research(research_state())
+    order = []
+
+    class OrderedGate(FakeGate):
+        def authorize(self, experiment):
+            status = store.load_research("research-1").status
+            order.append(f"authorize:{status.value}")
+            assert status is ResearchRunStatus.awaiting_authorization
+            return super().authorize(experiment)
+
+        def bind(self, authorization):
+            status = store.load_research("research-1").status
+            order.append(f"bind:{status.value}")
+            assert status is ResearchRunStatus.awaiting_authorization
+            return super().bind(authorization)
+
+    delegate = FakeResearchRuntime((ExperimentResultClassification.inconclusive,))
+
+    class OrderedRuntime:
+        def submit(self, authorization):
+            status = store.load_research("research-1").status
+            order.append(f"submit:{status.value}")
+            assert status is ResearchRunStatus.executing_experiment
+            return delegate.submit(authorization)
+
+    runner = orchestrator(store, OrderedRuntime())
+    runner.gate = OrderedGate()
+    result = runner.run(
+        "research-1",
+        proposals=(proposal("proposal-e1", DifferentialSelector.status_class),),
+        max_iterations=1,
+    )
+
+    assert order == [
+        "authorize:awaiting_authorization",
+        "bind:awaiting_authorization",
+        "submit:executing_experiment",
+    ]
+    states = tuple(
+        store.load_research("research-1", revision)
+        for revision in range(result.state.revision + 1)
+    )
+    awaiting = next(
+        item
+        for item in states
+        if item.status is ResearchRunStatus.awaiting_authorization
+    )
+    executing = next(
+        item for item in states if item.status is ResearchRunStatus.executing_experiment
+    )
+    assert executing.revision == awaiting.revision + 1
+
+
+def test_failed_authorization_never_enters_executing_or_invokes_runtime(tmp_path):
+    store = ResearchStore(tmp_path / "authorization-failure.sqlite3")
+    store.create_research(research_state())
+    observed_statuses = []
+
+    class RejectingGate(FakeGate):
+        def authorize(self, _experiment):
+            observed_statuses.append(store.load_research("research-1").status)
+            raise AuthorizationBlockedError(
+                ResearchAuthorizationErrorCode.authorization_blocked
+            )
+
+    runtime = FakeResearchRuntime(())
+    runner = orchestrator(store, runtime)
+    runner.gate = RejectingGate()
+    result = runner.run(
+        "research-1",
+        proposals=(proposal("proposal-e1", DifferentialSelector.status_class),),
+    )
+
+    assert observed_statuses == [ResearchRunStatus.awaiting_authorization]
+    assert runtime.calls == []
+    assert result.state.status is not ResearchRunStatus.executing_experiment
+    assert len(result.state.experiment_history) == 1
+    assert result.state.experiment_history[0].result_classification == (
+        ResearchAuthorizationErrorCode.authorization_blocked.value
+    )
+    assert all(
+        store.load_research("research-1", revision).status
+        is not ResearchRunStatus.executing_experiment
+        for revision in range(result.state.revision + 1)
+    )
+
+    restarted_runtime = FakeResearchRuntime(())
+    restarted = orchestrator(store, restarted_runtime).run("research-1")
+    assert restarted.state.status is not ResearchRunStatus.executing_experiment
+    assert restarted_runtime.calls == []
 
 
 def test_terminal_stop_persists_authoritative_model_ledger_and_reason_codes(tmp_path):

@@ -43,7 +43,10 @@ from agent_core.research.primitives import (
     ResponseDifferentialInput,
     StateDifferentialInput,
 )
-from agent_core.research.provenance import reject_secret_material
+from agent_core.research.provenance import (
+    SecretMaterialRejected,
+    reject_secret_material,
+)
 from agent_core.research.registry import (
     DEFAULT_EXPERIMENT_REGISTRY,
     ExperimentRegistry,
@@ -297,9 +300,14 @@ class ResearchExecutionGate:
             raise AuthorizationBlockedError(
                 ResearchAuthorizationErrorCode.authorization_blocked
             )
-        reject_secret_material(
-            experiment.model_dump(mode="json"), location="security experiment"
-        )
+        try:
+            reject_secret_material(
+                experiment.model_dump(mode="json"), location="security experiment"
+            )
+        except SecretMaterialRejected as exc:
+            raise AuthorizationBlockedError(
+                ResearchAuthorizationErrorCode.authorization_blocked
+            ) from exc
         if experiment_fingerprint(experiment) != experiment.fingerprint:
             raise AuthorizationBlockedError(
                 ResearchAuthorizationErrorCode.authorization_blocked

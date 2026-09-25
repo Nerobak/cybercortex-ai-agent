@@ -20,6 +20,7 @@ from agent_core.controlled_context import ControlledContext
 from agent_core.policy import AssessmentPolicy, ScopeAsset
 from agent_core.request_budget import RequestBudget
 from agent_core.research import (
+    AuthorizationBlockedError,
     CleanupStatus,
     DerivationType,
     Endpoint,
@@ -54,6 +55,7 @@ from agent_core.research import (
     RegisteredRequestTemplate,
     ResearchBudgetManager,
     ResearchBudgetPolicy,
+    ResearchAuthorizationErrorCode,
     ResearchBootstrapLimits,
     ResearchBootstrapProgress,
     ResearchBootstrapper,
@@ -540,6 +542,65 @@ def test_model_failure_never_falls_back_to_first_candidate(tmp_path):
     assert not gate.authorized
     assert result.stop_reason.value == "no_eligible_experiments"
     assert "model_invalid_structured_response" in result.state.diagnostic_codes
+
+
+def test_authorization_failure_persists_successful_strategy_call_across_restart(
+    tmp_path,
+):
+    state = synthetic_state(endpoint_count=1, hypotheses=("bola",))
+    database = tmp_path / "authorization-ledger.sqlite3"
+    store = ResearchStore(database)
+    store.create_research(state)
+    router = FakeSelectionRouter()
+    budgets = ResearchBudgetManager(
+        model_ledger=router.ledger,
+        model_call_ceiling=4,
+    )
+    _state, _budgets, compiler, context, builder = candidate_system(
+        state, budgets=budgets
+    )
+
+    class RejectingGate(FakeGate):
+        def authorize(self, _experiment):
+            raise AuthorizationBlockedError(
+                ResearchAuthorizationErrorCode.authorization_blocked
+            )
+
+    runtime = FakeResearchRuntime(())
+    selector = ExperimentSelector(compiler, budgets)
+    runner = SecurityResearchOrchestrator(
+        store=store,
+        compiler=compiler,
+        compiler_context=context,
+        gate=RejectingGate(),
+        runtime=runtime,
+        selector=selector,
+        evaluator=ExperimentEvaluator(),
+        pivot_planner=PivotPlanner(selector),
+        budget_manager=budgets,
+        reasoning_engine=ResearchReasoningEngine(router, max_output_tokens=4096),
+        routing_policy=routing_policy(),
+        packet_builder=PublicSafeResearchPacketBuilder(compiler.registry, budgets),
+        candidate_builder=builder,
+        candidate_packet_builder=PublicSafeCandidatePacketBuilder(budgets),
+    )
+
+    result = runner.run(state.research_id)
+
+    assert len(router.requests) == 1
+    assert runtime.calls == []
+    assert result.state.status is not ResearchRunStatus.executing_experiment
+    assert result.state.experiment_history[0].result_classification == (
+        ResearchAuthorizationErrorCode.authorization_blocked.value
+    )
+    assert result.state.budgets[0].model_budget.usage.attempted_calls == 1
+    assert result.state.budgets[0].model_budget.usage.successful_calls == 1
+
+    store.close()
+    restarted = ResearchStore(database).load_research(state.research_id)
+    assert restarted.status is not ResearchRunStatus.executing_experiment
+    assert restarted.budgets[0].model_budget.usage.attempted_calls == 1
+    assert restarted.budgets[0].model_budget.usage.successful_calls == 1
 
 
 def test_bootstrap_sufficiency_skips_expansion_then_strategy_calls_once(tmp_path):

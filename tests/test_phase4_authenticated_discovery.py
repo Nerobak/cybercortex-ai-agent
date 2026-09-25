@@ -16,6 +16,7 @@ from agent_core.research import (
     BaselineKind,
     DifferentialSelector,
     EvidenceIntent,
+    ExperimentCandidateBuilder,
     ExperimentCompiler,
     ExperimentCompilerContext,
     ExperimentProposal,
@@ -25,14 +26,17 @@ from agent_core.research import (
     MutationKind,
     ObjectSubstitutionInput,
     PrimitiveStepProposal,
+    PublicSafeCandidatePacketBuilder,
     PublicSafeResearchPacketBuilder,
     ResearchBootstrapLimits,
     ResearchBootstrapper,
     ResearchBudgetManager,
     ResearchBudgetPolicy,
+    ResearchExecutionGate,
     ResearchStore,
     RequestTemplateFactory,
     TargetClass,
+    materialize_candidate,
 )
 from tools.safe_http import ScopedHTTPClient
 from agent_core.research.authenticated_discovery import (
@@ -322,7 +326,7 @@ def test_authenticated_discovery_acquires_only_owner_scoped_objects_and_enables_
             ExperimentCompilerContext(
                 current_time=NOW,
                 execution_ready=True,
-                policy_reference="controlled-discovery-policy",
+                policy_reference=assessment_policy.authorization_reference,
                 context_reference="controlled-discovery-context",
             ),
         )
@@ -331,9 +335,53 @@ def test_authenticated_discovery_acquires_only_owner_scoped_objects_and_enables_
         packet = PublicSafeResearchPacketBuilder(compiler.registry, budgets).build(
             state
         )
-        serialized = state.model_dump_json() + packet.model_dump_json()
+        registry = compiler.registry
+        candidate_builder = ExperimentCandidateBuilder(registry, budgets, compiler)
+        candidates = candidate_builder.build(
+            state,
+            compiler_context=compiler_context,
+            expected_state_revision=state.revision,
+            policy_reference=compiler_context.policy_reference,
+        )
+        candidate_packet = PublicSafeCandidatePacketBuilder(budgets).build(
+            state, candidates
+        )
+        candidate = next(
+            item for item in candidates if item.primitive_kind == "object_substitution"
+        )
+        candidate_proposal = materialize_candidate(candidate, state)
+        experiment = compiler.compile(candidate_proposal, state, compiler_context)
+        gate = ResearchExecutionGate(
+            state=state,
+            policy=assessment_policy,
+            controlled_context=context,
+            vault=vault,
+            budget=budget,
+            transport=client,
+            compiler_context=compiler_context,
+            request_templates=bootstrapper.runtime_request_templates(state),
+            store=store,
+            scope_reference=state.targets[0].scope_reference,
+            current_time=NOW,
+        )
+        authorization = gate.authorize(experiment)
+        serialized = "".join(
+            (
+                state.model_dump_json(),
+                packet.model_dump_json(),
+                json.dumps(
+                    [item.model_dump(mode="json") for item in candidates],
+                    sort_keys=True,
+                ),
+                candidate_packet.model_dump_json(),
+                candidate_proposal.model_dump_json(),
+                experiment.model_dump_json(),
+            )
+        )
 
     assert selection.selected is not None
+    assert candidates
+    assert authorization.experiment is experiment
     assert any(
         item["name"] == "object_substitution"
         for item in packet.available_execution_primitives
@@ -342,6 +390,9 @@ def test_authenticated_discovery_acquires_only_owner_scoped_objects_and_enables_
     assert all(item["parameter_references"] for item in packet.controlled_objects)
     assert TOKEN_A not in serialized
     assert TOKEN_B not in serialized
+    for path in tmp_path.iterdir():
+        assert TOKEN_A.encode() not in path.read_bytes()
+        assert TOKEN_B.encode() not in path.read_bytes()
 
 
 def test_shared_collection_identifier_is_not_asserted_as_owned():
