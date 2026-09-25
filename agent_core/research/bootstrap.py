@@ -51,6 +51,7 @@ from agent_core.research.authenticated_discovery import (
     ControlledAccountDiscoveryAdapter,
 )
 from agent_core.research.budgets import ResearchBudgetManager
+from agent_core.research.candidates import ExperimentCandidateBuilder
 from agent_core.research.compiler import ExperimentCompilerContext
 from agent_core.research.reasoning import (
     PublicSafeResearchPacketBuilder,
@@ -165,6 +166,8 @@ class ResearchBootstrapper:
         reasoning_engine: ResearchReasoningEngine | None = None,
         routing_policy: ModelRoutingPolicy | None = None,
         packet_builder: PublicSafeResearchPacketBuilder | None = None,
+        candidate_builder: ExperimentCandidateBuilder | None = None,
+        candidate_compiler_context: ExperimentCompilerContext | None = None,
         allowed_hypothesis_categories: Sequence[str] = tuple(CATEGORY_PRIORITY),
         confirmation_policy_reference: str | None = None,
         now: Callable[[], str] | None = None,
@@ -177,6 +180,10 @@ class ResearchBootstrapper:
             raise ValueError("bootstrap model hypotheses require a routing policy")
         if reasoning_engine is not None and packet_builder is None:
             raise ValueError("bootstrap model hypotheses require a packet builder")
+        if (candidate_builder is None) != (candidate_compiler_context is None):
+            raise ValueError(
+                "bootstrap candidate sufficiency requires builder and compiler context"
+            )
         if (
             reasoning_engine is not None
             and budget_manager.model_ledger is not reasoning_engine.router.ledger
@@ -199,6 +206,8 @@ class ResearchBootstrapper:
         self.reasoning_engine = reasoning_engine
         self.routing_policy = routing_policy
         self.packet_builder = packet_builder
+        self.candidate_builder = candidate_builder
+        self.candidate_compiler_context = candidate_compiler_context
         self.allowed_hypothesis_categories = tuple(allowed_hypothesis_categories)
         self.confirmation_policy_reference = opaque_reference(
             confirmation_policy_reference
@@ -356,6 +365,59 @@ class ResearchBootstrapper:
         for template in state.request_templates:
             self._template_factory.validate(template, state, policy=self.policy)
         return self._template_factory.runtime_templates(state)
+
+    def expand_hypotheses_exceptionally(self, state: ResearchState) -> ResearchState:
+        """Persist one bounded hypothesis-only model expansion after bootstrap."""
+
+        if (
+            self.reasoning_engine is None
+            or self.routing_policy is None
+            or self.packet_builder is None
+            or self.candidate_builder is None
+            or not state.evidence
+        ):
+            return state
+        remaining_calls = self.budget_manager.state(state).model_budget.remaining_calls
+        if remaining_calls <= 0:
+            return state
+        packet = self.packet_builder.build(state)
+        routing_policy = self.routing_policy.model_copy(
+            update={
+                "max_provider_attempts": min(
+                    self.routing_policy.max_provider_attempts, remaining_calls
+                )
+            }
+        )
+        decision = self.reasoning_engine.expand_hypotheses(packet, routing_policy)
+        remaining = max(
+            0, self.limits.maximum_initial_hypotheses - len(state.hypotheses)
+        )
+        records, provenance = adapt_model_hypotheses(
+            decision.new_hypotheses,
+            state,
+            allowed_categories=self.allowed_hypothesis_categories,
+            confirmation_policy_reference=self.confirmation_policy_reference,
+            max_hypotheses=remaining,
+            occurred_at=self._now(state),
+        )
+        merged = self._merge_hypotheses(state, records, provenance)
+        synchronized = self.budget_manager.state(merged)
+        budgets = {item.budget_reference: item for item in merged.budgets}
+        budgets[synchronized.budget_reference] = synchronized
+        timestamp = self._now(merged)
+        next_state = ResearchState.model_validate(
+            {
+                **merged.model_dump(mode="python"),
+                "revision": state.revision + 1,
+                "updated_at": timestamp,
+                "budgets": tuple(budgets[key] for key in sorted(budgets)),
+            }
+        )
+        return self.store.commit_revision(
+            state.research_id,
+            expected_revision=state.revision,
+            state=next_state,
+        )
 
     def _discover(self, state: ResearchState) -> ResearchState:
         progress = self._progress(state)
@@ -609,11 +671,31 @@ class ResearchBootstrapper:
         model_delta = ModelUsageDelta()
         model_limitations: tuple[str, ...] = ()
         attempted = progress.model_usage_delta.attempted_calls if progress else 0
+        deterministic_candidate_sufficient = False
+        if (
+            self.candidate_builder is not None
+            and self.candidate_compiler_context is not None
+            and any(
+                item.derivation_type.value == "deterministic"
+                and item.status.value not in {"closed", "refuted", "supported"}
+                for item in adapted.hypotheses
+            )
+        ):
+            context = self.compiler_context(adapted, self.candidate_compiler_context)
+            deterministic_candidate_sufficient = bool(
+                self.candidate_builder.build(
+                    adapted,
+                    compiler_context=context,
+                    expected_state_revision=adapted.revision,
+                    policy_reference=context.policy_reference,
+                )
+            )
         if (
             self.reasoning_engine is not None
             and self.limits.maximum_bootstrap_model_calls > attempted
             and self.packet_builder is not None
             and adapted.evidence
+            and not deterministic_candidate_sufficient
         ):
             ledger = self.reasoning_engine.router.ledger
             before = ledger.snapshot(run_id=state.research_id)
@@ -630,7 +712,11 @@ class ResearchBootstrapper:
                         )
                     }
                 )
-                decision = self.reasoning_engine.decide(packet, routing_policy)
+                decision = (
+                    self.reasoning_engine.expand_hypotheses(packet, routing_policy)
+                    if self.candidate_builder is not None
+                    else self.reasoning_engine.decide(packet, routing_policy)
+                )
                 remaining = max(
                     0,
                     self.limits.maximum_initial_hypotheses - len(adapted.hypotheses),

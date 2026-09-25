@@ -17,6 +17,11 @@ from agent_core.research.authorization import (
     policy_fingerprint as authorization_policy_fingerprint,
 )
 from agent_core.research.budgets import ResearchBudgetManager
+from agent_core.research.candidates import (
+    ExperimentCandidateBuilder,
+    PublicSafeCandidatePacketBuilder,
+    materialize_candidate,
+)
 from agent_core.research.compiler import ExperimentCompiler, ExperimentCompilerContext
 from agent_core.research.evaluation import (
     ExperimentEvaluator,
@@ -30,6 +35,8 @@ from agent_core.research.reasoning import (
     PublicSafeResearchPacketBuilder,
     ResearchReasoningEngine,
     ResearchReasoningError,
+    ResearchSelectionAction,
+    ResearchSelectionResult,
     ResearchStrategyAction,
     ResearchStrategyDecision,
 )
@@ -99,6 +106,8 @@ class SecurityResearchOrchestrator:
         reasoning_engine: ResearchReasoningEngine | None = None,
         routing_policy: object | None = None,
         packet_builder: PublicSafeResearchPacketBuilder | None = None,
+        candidate_builder: ExperimentCandidateBuilder | None = None,
+        candidate_packet_builder: PublicSafeCandidatePacketBuilder | None = None,
         compiler_context: ExperimentCompilerContext | None = None,
         runtime: object | None = None,
         policy_limitations: tuple[str, ...] = (),
@@ -115,6 +124,8 @@ class SecurityResearchOrchestrator:
         self.reasoning_engine = reasoning_engine
         self.routing_policy = routing_policy
         self.packet_builder = packet_builder
+        self.candidate_builder = candidate_builder
+        self.candidate_packet_builder = candidate_packet_builder
         self.compiler_context = compiler_context or compiler.context
         self.runtime = runtime or getattr(gate, "runtime", None)
         self.policy_limitations = policy_limitations
@@ -127,6 +138,10 @@ class SecurityResearchOrchestrator:
             raise TypeError("model research strategy requires a routing policy")
         if self.reasoning_engine is not None and self.packet_builder is None:
             raise TypeError("model research strategy requires a packet builder")
+        if (self.candidate_builder is None) != (self.candidate_packet_builder is None):
+            raise TypeError(
+                "lightweight selection requires candidate and packet builders"
+            )
 
     def run(
         self,
@@ -142,6 +157,7 @@ class SecurityResearchOrchestrator:
         invalid_model_outputs = 0
         previous_experiment: SecurityExperiment | None = None
         next_is_pivot = False
+        exceptional_expansion_attempted = False
         static_proposals = tuple(proposals)
 
         state = self._prepare(self.store.load_research(research_id))
@@ -193,6 +209,19 @@ class SecurityResearchOrchestrator:
                 }
             )
             if not unresolved:
+                if not exceptional_expansion_attempted:
+                    exceptional_expansion_attempted = True
+                    try:
+                        expanded = self._expand_hypotheses_exceptionally(state)
+                    except ResearchReasoningError as exc:
+                        state = self._with_diagnostic_codes(
+                            state,
+                            f"hypothesis_expansion_{exc.reason.value}",
+                        )
+                    else:
+                        if len(expanded.hypotheses) > len(state.hypotheses):
+                            continue
+                        state = expanded
                 reason = (
                     OrchestratorStopReason.all_hypotheses_resolved
                     if state.hypotheses
@@ -226,16 +255,87 @@ class SecurityResearchOrchestrator:
             decision = None
             model_proposals: tuple[ExperimentProposal, ...] = ()
             model_failure_code: str | None = None
+            lightweight_selection = bool(
+                self.candidate_builder is not None
+                and self.candidate_packet_builder is not None
+                and not static_proposals
+                and self.proposal_source is None
+            )
             if self.reasoning_engine is not None:
                 try:
-                    packet = self.packet_builder.build(  # type: ignore[union-attr]
-                        state, policy_limitations=self.policy_limitations
-                    )
-                    decision = self.reasoning_engine.decide(
-                        packet, self.routing_policy  # type: ignore[arg-type]
-                    )
+                    if lightweight_selection:
+                        experiment_candidates = self.candidate_builder.build(  # type: ignore[union-attr]
+                            state,
+                            compiler_context=self.compiler_context,
+                            expected_state_revision=state.revision,
+                            pivot=next_is_pivot,
+                            cleanup_barrier=bool(getattr(barrier, "active", False)),
+                            policy_reference=self.compiler_context.policy_reference,
+                            policy_fingerprint=self._policy_fingerprint(),
+                        )
+                        if (
+                            not experiment_candidates
+                            and not exceptional_expansion_attempted
+                        ):
+                            exceptional_expansion_attempted = True
+                            expanded = self._expand_hypotheses_exceptionally(state)
+                            if len(expanded.hypotheses) > len(state.hypotheses):
+                                continue
+                            state = expanded
+                        if experiment_candidates:
+                            packet = self.candidate_packet_builder.build(  # type: ignore[union-attr]
+                                state,
+                                experiment_candidates,
+                                policy_limitations=self.policy_limitations,
+                            )
+                            decision = self.reasoning_engine.select(
+                                packet, self.routing_policy  # type: ignore[arg-type]
+                            )
+                            if decision.action in {
+                                ResearchSelectionAction.stop,
+                                ResearchSelectionAction.defer,
+                            }:
+                                state = self._stop(
+                                    state,
+                                    OrchestratorStopReason.model_requested_stop,
+                                )
+                                return ResearchLoopResult(
+                                    research_id=research_id,
+                                    state=state,
+                                    iterations=iterations,
+                                    evaluations=tuple(evaluations),
+                                    stop_reason=(
+                                        OrchestratorStopReason.model_requested_stop
+                                    ),
+                                    completed=True,
+                                )
+                            selected_candidate = next(
+                                item
+                                for item in experiment_candidates
+                                if item.candidate_id == decision.selected_candidate_id
+                            )
+                            model_proposals = (
+                                materialize_candidate(
+                                    selected_candidate,
+                                    state,
+                                    model_decision_id=decision.decision_id,
+                                ),
+                            )
+                            next_is_pivot = next_is_pivot or (
+                                decision.action is ResearchSelectionAction.pivot
+                            )
+                    else:
+                        packet = self.packet_builder.build(  # type: ignore[union-attr]
+                            state, policy_limitations=self.policy_limitations
+                        )
+                        decision = self.reasoning_engine.decide(
+                            packet, self.routing_policy  # type: ignore[arg-type]
+                        )
                     invalid_model_outputs = 0
-                    if decision.action is ResearchStrategyAction.stop:
+                    if (
+                        not lightweight_selection
+                        and decision.action is ResearchStrategyAction.stop
+                    ):
                         state = self._stop(
                             state, OrchestratorStopReason.model_requested_stop
                         )
@@ -247,7 +347,8 @@ class SecurityResearchOrchestrator:
                             stop_reason=OrchestratorStopReason.model_requested_stop,
                             completed=True,
                         )
-                    model_proposals = decision.proposals
+                    if not lightweight_selection:
+                        model_proposals = decision.proposals
                 except ResearchReasoningError as exc:
                     model_failure_code = {
                         "invalid_output": "model_invalid_structured_response",
@@ -412,7 +513,9 @@ class SecurityResearchOrchestrator:
             state = self._transition(
                 state, ResearchRunStatus.evaluating_result, "outcome-available"
             )
-            model_hypotheses = decision.new_hypotheses if decision is not None else ()
+            model_hypotheses = (
+                getattr(decision, "new_hypotheses", ()) if decision is not None else ()
+            )
             evaluation = self.evaluator.evaluate_and_commit(
                 experiment,
                 authorization,
@@ -426,6 +529,7 @@ class SecurityResearchOrchestrator:
             iterations += 1
             previous_experiment = experiment
             state = self.store.load_research(research_id)
+            exceptional_expansion_attempted = False
 
             if evaluation.stop_required:
                 state = self._stop(
@@ -688,7 +792,7 @@ class SecurityResearchOrchestrator:
 
     @staticmethod
     def _advisory(
-        decision: ResearchStrategyDecision | None,
+        decision: ResearchStrategyDecision | ResearchSelectionResult | None,
         proposals: tuple[ExperimentProposal, ...],
     ) -> tuple[ProposalRankingAdvice, ...]:
         if decision is None:
@@ -698,12 +802,14 @@ class SecurityResearchOrchestrator:
                 proposal_id=item.proposal_id,
                 expected_information_gain=(
                     decision.expected_information_gain
-                    if item.proposal_id == decision.selected_proposal_id
+                    if item.proposal_id
+                    == getattr(decision, "selected_proposal_id", item.proposal_id)
                     else InformationGainEstimate.medium
                 ),
                 priority=(
                     decision.priority
-                    if item.proposal_id == decision.selected_proposal_id
+                    if item.proposal_id
+                    == getattr(decision, "selected_proposal_id", item.proposal_id)
                     else 50
                 ),
                 confidence=InformationGainEstimate(decision.confidence.value),
@@ -714,6 +820,15 @@ class SecurityResearchOrchestrator:
     def _policy_fingerprint(self) -> str | None:
         policy = getattr(self.gate, "policy", None)
         return authorization_policy_fingerprint(policy) if policy is not None else None
+
+    def _expand_hypotheses_exceptionally(self, state: ResearchState) -> ResearchState:
+        expander = getattr(self.bootstrapper, "expand_hypotheses_exceptionally", None)
+        if not callable(expander):
+            return state
+        expanded = expander(state)
+        if not isinstance(expanded, ResearchState):
+            raise TypeError("research bootstrapper returned invalid expanded state")
+        return expanded
 
     @staticmethod
     def _selection_stop_reason(selection: object) -> OrchestratorStopReason:

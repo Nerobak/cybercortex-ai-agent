@@ -40,9 +40,11 @@ from agent_core.request_budget import RequestBudget
 from agent_core.research import (
     ExperimentCompiler,
     ExperimentCompilerContext,
+    ExperimentCandidateBuilder,
     ExperimentEvaluator,
     ExperimentSelector,
     PivotPlanner,
+    PublicSafeCandidatePacketBuilder,
     PublicSafeResearchPacketBuilder,
     ResearchBootstrapLimits,
     ResearchBootstrapper,
@@ -90,6 +92,8 @@ class ResearchWiring:
     reasoning_engine: ResearchReasoningEngine
     routing_policy: ModelRoutingPolicy
     packet_builder: PublicSafeResearchPacketBuilder
+    candidate_builder: ExperimentCandidateBuilder
+    candidate_packet_builder: PublicSafeCandidatePacketBuilder
     bootstrapper: ResearchBootstrapper
     compiler: ExperimentCompiler
     transport: ScopedHTTPClient
@@ -560,6 +564,18 @@ def build_wiring(
     )
     compiler = ExperimentCompiler()
     packet_builder = PublicSafeResearchPacketBuilder(compiler.registry, budget_manager)
+    candidate_builder = ExperimentCandidateBuilder(
+        compiler.registry, budget_manager, compiler
+    )
+    candidate_packet_builder = PublicSafeCandidatePacketBuilder(budget_manager)
+    candidate_compiler_context = ExperimentCompilerContext(
+        current_time=datetime.now(timezone.utc).isoformat(),
+        execution_ready=True,
+        max_response_bytes=policy.max_response_bytes,
+        max_request_reservation=request_budget.limit,
+        policy_reference=policy.authorization_reference,
+        context_reference=f"controlled-context:{research_id}",
+    )
     transport = ScopedHTTPClient(policy=policy, budget=request_budget)
     tool_runner = ToolRunner(
         tool_timeout=min(DEFAULT_TOOL_TIMEOUT, args.wall_time),
@@ -587,6 +603,8 @@ def build_wiring(
         reasoning_engine=reasoning_engine,
         routing_policy=routing_policy,
         packet_builder=packet_builder,
+        candidate_builder=candidate_builder,
+        candidate_compiler_context=candidate_compiler_context,
     )
     return ResearchWiring(
         store=store,
@@ -600,6 +618,8 @@ def build_wiring(
         reasoning_engine=reasoning_engine,
         routing_policy=routing_policy,
         packet_builder=packet_builder,
+        candidate_builder=candidate_builder,
+        candidate_packet_builder=candidate_packet_builder,
         bootstrapper=bootstrapper,
         compiler=compiler,
         transport=transport,
@@ -655,6 +675,8 @@ def _build_orchestrator(
         reasoning_engine=wiring.reasoning_engine,
         routing_policy=wiring.routing_policy,
         packet_builder=wiring.packet_builder,
+        candidate_builder=wiring.candidate_builder,
+        candidate_packet_builder=wiring.candidate_packet_builder,
         compiler_context=context,
         runtime=gate.runtime,
         policy_limitations=policy_limitations,
