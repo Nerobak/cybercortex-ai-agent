@@ -22,6 +22,18 @@ from agent_core.research.candidates import (
     PublicSafeCandidatePacketBuilder,
     materialize_candidate,
 )
+from agent_core.research.chain_candidates import (
+    AttackChainCandidateBuilder,
+    ChainExperimentPlanner,
+    PublicSafeChainPacketBuilder,
+    materialize_chain_hypothesis,
+    select_chain_candidate,
+)
+from agent_core.research.chains import (
+    AttackChainCandidate,
+    AttackChainHypothesis,
+    ChainSelectionDecision,
+)
 from agent_core.research.compiler import ExperimentCompiler, ExperimentCompilerContext
 from agent_core.research.confirmation import (
     FindingConfirmationEvaluator,
@@ -105,6 +117,76 @@ class ResearchLoopResult(ResearchContract):
     evaluations: tuple[ResearchEvaluation, ...] = Field(default=(), max_length=10_000)
     stop_reason: OrchestratorStopReason | None = None
     completed: bool = False
+
+
+class ChainStrategyResult(ResearchContract):
+    candidate: AttackChainCandidate | None = None
+    hypothesis: AttackChainHypothesis | None = None
+    decision: ChainSelectionDecision | None = None
+    model_call_skipped: bool
+    reason: str
+
+
+class AttackChainResearchCoordinator:
+    """Bounded strategy coordinator; request execution stays in ResearchRuntime."""
+
+    def __init__(
+        self,
+        candidate_builder: AttackChainCandidateBuilder,
+        packet_builder: PublicSafeChainPacketBuilder,
+        planner: ChainExperimentPlanner,
+        reasoning_engine: ResearchReasoningEngine | None = None,
+    ) -> None:
+        self.candidate_builder = candidate_builder
+        self.packet_builder = packet_builder
+        self.planner = planner
+        self.reasoning_engine = reasoning_engine
+
+    def select(
+        self,
+        state: ResearchState,
+        candidates: Sequence[AttackChainCandidate],
+        *,
+        routing_policy: object | None = None,
+        permit_single_candidate_auto_selection: bool | None = None,
+    ) -> ChainStrategyResult:
+        if not candidates:
+            return ChainStrategyResult(
+                model_call_skipped=True, reason="no_chain_candidates"
+            )
+        decision = None
+        skipped = False
+        auto_select = (
+            self.candidate_builder.policy.permit_single_candidate_auto_selection
+            if permit_single_candidate_auto_selection is None
+            else permit_single_candidate_auto_selection
+        )
+        if len(candidates) == 1 and auto_select:
+            selected = candidates[0]
+            skipped = True
+        else:
+            if self.reasoning_engine is None or routing_policy is None:
+                return ChainStrategyResult(
+                    model_call_skipped=True,
+                    reason="chain_strategy_model_unavailable",
+                )
+            packet = self.packet_builder.build(state, candidates)
+            decision = self.reasoning_engine.select_chain(packet, routing_policy)  # type: ignore[arg-type]
+            selected = select_chain_candidate(candidates, decision)
+        if selected is None:
+            return ChainStrategyResult(
+                decision=decision,
+                model_call_skipped=skipped,
+                reason="chain_selection_deferred",
+            )
+        hypothesis = materialize_chain_hypothesis(selected, decision=decision)
+        return ChainStrategyResult(
+            candidate=selected,
+            hypothesis=hypothesis,
+            decision=decision,
+            model_call_skipped=skipped,
+            reason="chain_candidate_selected",
+        )
 
 
 ProposalSource = Callable[[ResearchState], Sequence[ExperimentProposal]]
@@ -1224,6 +1306,8 @@ def _identifier(prefix: str, *parts: object) -> str:
 
 
 __all__ = [
+    "AttackChainResearchCoordinator",
+    "ChainStrategyResult",
     "OrchestratorStopReason",
     "ResearchLoopResult",
     "SecurityResearchOrchestrator",

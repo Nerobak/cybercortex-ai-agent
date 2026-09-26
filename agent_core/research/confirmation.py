@@ -881,3 +881,17 @@ __all__ = [
     "FindingConfirmationEvaluator",
     "FindingConfirmationPolicy",
 ]
+
+from agent_core.research.chain_evaluation import (  # noqa: E402
+    AttackChainConfirmationEvaluator,
+)
+from agent_core.research.chains import (  # noqa: E402
+    ChainConfirmationDecision,
+    ChainConfirmationPolicy,
+)
+
+__all__ += [
+    "AttackChainConfirmationEvaluator",
+    "ChainConfirmationDecision",
+    "ChainConfirmationPolicy",
+]

@@ -417,19 +417,38 @@ class ResearchStore:
             },
             EntityKind.evidence: evidence_ids,
             EntityKind.fact: {item.fact_id for item in state.facts},
+            EntityKind.relationship: {
+                item.relationship_id for item in state.relationships
+            },
             EntityKind.hypothesis: {item.hypothesis_id for item in state.hypotheses},
             EntityKind.experiment_outcome: {
                 item.outcome_id for item in state.experiment_outcomes
             },
             EntityKind.reproduction: {
-                item.reproduction_id for item in state.reproduction_plans
+                *(item.reproduction_id for item in state.reproduction_plans),
+                *(item.reproduction_id for item in state.chain_reproduction_plans),
             },
             EntityKind.finding: {item.finding_id for item in state.findings},
             EntityKind.attack_chain: {
                 item.attack_chain_id for item in state.attack_chains
             },
         }
-        budget_ids = {item.budget_reference for item in state.budgets}
+        budget_ids = {
+            *(item.budget_reference for item in state.budgets),
+            *(item.budget_reference for item in state.chain_budgets),
+        }
+        chain_candidate_ids = {item.candidate_id for item in state.chain_candidates}
+        chain_hypothesis_ids = {item.hypothesis_id for item in state.chain_hypotheses}
+        chain_step_ids = {
+            str(step.step_id) for item in state.attack_chains for step in item.steps
+        }
+        chain_evaluation_ids = {item.evaluation_id for item in state.chain_evaluations}
+        chain_reproduction_ids = {
+            item.reproduction_id for item in state.chain_reproduction_plans
+        }
+        chain_confirmation_ids = {
+            item.decision_id for item in state.chain_confirmation_decisions
+        }
         event_ids: set[str] = set()
         for event in events:
             if event.event_id in event_ids:
@@ -558,6 +577,54 @@ class ResearchStore:
             elif event.event_type is ResearchEventType.budget_updated:
                 referenced_ids = (
                     (event_payload.budget_reference, budget_ids, "budget"),
+                )
+            elif event.event_type.value.startswith("chain_"):
+                optional_references = (
+                    (
+                        event_payload.chain_id,
+                        entity_ids[EntityKind.attack_chain],
+                        "attack chain",
+                    ),
+                    (
+                        event_payload.candidate_id,
+                        chain_candidate_ids,
+                        "chain candidate",
+                    ),
+                    (
+                        event_payload.chain_hypothesis_id,
+                        chain_hypothesis_ids,
+                        "chain hypothesis",
+                    ),
+                    (event_payload.step_id, chain_step_ids, "chain step"),
+                    (
+                        event_payload.evaluation_id,
+                        chain_evaluation_ids,
+                        "chain evaluation",
+                    ),
+                    (
+                        event_payload.finding_id,
+                        entity_ids[EntityKind.finding],
+                        "chain finding",
+                    ),
+                    (
+                        event_payload.reproduction_id,
+                        chain_reproduction_ids,
+                        "chain reproduction",
+                    ),
+                    (
+                        event_payload.decision_id,
+                        (
+                            chain_confirmation_ids
+                            if event.event_type is ResearchEventType.chain_confirm
+                            else {event_payload.decision_id}
+                        ),
+                        "chain confirmation",
+                    ),
+                )
+                referenced_ids = tuple(
+                    (reference, available, description)
+                    for reference, available, description in optional_references
+                    if reference is not None
                 )
             for reference, available, description in referenced_ids:
                 if reference not in available:

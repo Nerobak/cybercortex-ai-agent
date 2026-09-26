@@ -13,6 +13,7 @@ from agent_core.research.events import (
 )
 from agent_core.research.state import ResearchState
 from agent_core.research.types import (
+    AttackChainStatus,
     FindingStatus,
     OpaqueIdentifier,
     ProvenanceRecordId,
@@ -163,12 +164,72 @@ ALLOWED_FINDING_TRANSITIONS: dict[FindingStatus, frozenset[FindingStatus]] = {
 }
 
 
+ALLOWED_ATTACK_CHAIN_TRANSITIONS: dict[
+    AttackChainStatus, frozenset[AttackChainStatus]
+] = {
+    AttackChainStatus.proposed: frozenset(
+        {
+            AttackChainStatus.testing,
+            AttackChainStatus.inconclusive,
+            AttackChainStatus.rejected,
+        }
+    ),
+    AttackChainStatus.testing: frozenset(
+        {
+            AttackChainStatus.supported,
+            AttackChainStatus.refuted,
+            AttackChainStatus.inconclusive,
+            AttackChainStatus.candidate,
+            AttackChainStatus.rejected,
+        }
+    ),
+    AttackChainStatus.supported: frozenset(
+        {AttackChainStatus.candidate, AttackChainStatus.rejected}
+    ),
+    AttackChainStatus.inconclusive: frozenset(
+        {AttackChainStatus.testing, AttackChainStatus.rejected}
+    ),
+    AttackChainStatus.candidate: frozenset(
+        {
+            AttackChainStatus.reproducing,
+            AttackChainStatus.rejected,
+            AttackChainStatus.manual_review,
+        }
+    ),
+    AttackChainStatus.reproducing: frozenset(
+        {
+            AttackChainStatus.candidate,
+            AttackChainStatus.reproduced,
+            AttackChainStatus.confirmed,
+            AttackChainStatus.rejected,
+            AttackChainStatus.manual_review,
+        }
+    ),
+    AttackChainStatus.reproduced: frozenset(
+        {AttackChainStatus.confirmed, AttackChainStatus.rejected}
+    ),
+    AttackChainStatus.refuted: frozenset(),
+    AttackChainStatus.confirmed: frozenset(),
+    AttackChainStatus.rejected: frozenset(),
+    AttackChainStatus.manual_review: frozenset(),
+}
+
+
 def validate_finding_transition(
     previous: FindingStatus, next_status: FindingStatus
 ) -> None:
     if next_status not in ALLOWED_FINDING_TRANSITIONS[previous]:
         raise InvalidResearchStateTransition(
             f"Invalid finding transition: {previous.value} -> {next_status.value}"
+        )
+
+
+def validate_attack_chain_transition(
+    previous: AttackChainStatus, next_status: AttackChainStatus
+) -> None:
+    if next_status not in ALLOWED_ATTACK_CHAIN_TRANSITIONS[previous]:
+        raise InvalidResearchStateTransition(
+            f"Invalid attack-chain transition: {previous.value} -> {next_status.value}"
         )
 
 

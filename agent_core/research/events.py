@@ -48,6 +48,18 @@ class ResearchEventType(str, Enum):
     reproduction_outcome_recorded = "reproduction_outcome_recorded"
     finding_confirmation_decided = "finding_confirmation_decided"
     budget_updated = "budget_updated"
+    chain_candidate = "chain_candidate"
+    chain_select = "chain_select"
+    chain_hypothesis = "chain_hypothesis"
+    chain_step_plan = "chain_step_plan"
+    chain_step_authorize = "chain_step_authorize"
+    chain_step_execute = "chain_step_execute"
+    chain_step_evaluate = "chain_step_evaluate"
+    chain_supported = "chain_supported"
+    chain_refuted = "chain_refuted"
+    chain_candidate_finding = "chain_candidate_finding"
+    chain_reproduction = "chain_reproduction"
+    chain_confirm = "chain_confirm"
     research_state_transitioned = "research_state_transitioned"
     research_stopped = "research_stopped"
     research_failed = "research_failed"
@@ -156,6 +168,54 @@ class BudgetUpdatedPayload(ResearchContract):
     budget_reference: OpaqueIdentifier
 
 
+class ChainEventPayload(ResearchContract):
+    """Safe reference-only trace for the P4-0G lifecycle."""
+
+    event_type: Literal[
+        "chain_candidate",
+        "chain_select",
+        "chain_hypothesis",
+        "chain_step_plan",
+        "chain_step_authorize",
+        "chain_step_execute",
+        "chain_step_evaluate",
+        "chain_supported",
+        "chain_refuted",
+        "chain_candidate_finding",
+        "chain_reproduction",
+        "chain_confirm",
+    ]
+    chain_id: OpaqueIdentifier | None = None
+    candidate_id: OpaqueIdentifier | None = None
+    chain_hypothesis_id: OpaqueIdentifier | None = None
+    step_id: OpaqueIdentifier | None = None
+    evaluation_id: OpaqueIdentifier | None = None
+    finding_id: FindingId | None = None
+    reproduction_id: OpaqueIdentifier | None = None
+    decision_id: OpaqueIdentifier | None = None
+    classification: OpaqueIdentifier | None = None
+
+    @model_validator(mode="after")
+    def require_lifecycle_references(self) -> "ChainEventPayload":
+        required = {
+            "chain_candidate": ("candidate_id",),
+            "chain_select": ("decision_id",),
+            "chain_hypothesis": ("chain_hypothesis_id", "candidate_id"),
+            "chain_step_plan": ("chain_id", "step_id"),
+            "chain_step_authorize": ("chain_id", "step_id"),
+            "chain_step_execute": ("chain_id", "step_id"),
+            "chain_step_evaluate": ("chain_id", "step_id"),
+            "chain_supported": ("chain_id", "evaluation_id"),
+            "chain_refuted": ("chain_id", "evaluation_id"),
+            "chain_candidate_finding": ("chain_id", "finding_id"),
+            "chain_reproduction": ("chain_id", "reproduction_id"),
+            "chain_confirm": ("chain_id", "finding_id", "decision_id"),
+        }[self.event_type]
+        if any(getattr(self, field_name) is None for field_name in required):
+            raise ValueError("chain event is missing a required lifecycle reference")
+        return self
+
+
 class ResearchStateTransitionedPayload(ResearchContract):
     event_type: Literal["research_state_transitioned"] = "research_state_transitioned"
     previous_state: ResearchRunStatus
@@ -213,6 +273,7 @@ ResearchEventPayload: TypeAlias = Annotated[
     | ReproductionOutcomeRecordedPayload
     | FindingConfirmationDecidedPayload
     | BudgetUpdatedPayload
+    | ChainEventPayload
     | ResearchStateTransitionedPayload
     | ResearchStoppedPayload
     | ResearchFailedPayload,

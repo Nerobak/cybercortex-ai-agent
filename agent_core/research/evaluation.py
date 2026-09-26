@@ -896,3 +896,12 @@ __all__ = [
     "ResearchConsequence",
     "ResearchEvaluation",
 ]
+
+# P4-0G retains this module as the public evaluation surface while keeping the
+# chain-specific implementation isolated from the experiment evaluator above.
+from agent_core.research.chain_evaluation import (  # noqa: E402
+    AttackChainEvaluator,
+    ChainEvaluationPolicy,
+)
+
+__all__ += ["AttackChainEvaluator", "ChainEvaluationPolicy"]

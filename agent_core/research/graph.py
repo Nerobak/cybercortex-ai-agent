@@ -43,6 +43,14 @@ SECURITY_CRITICAL_RELATIONS = frozenset(
         ResearchPredicate.authenticates_to,
         ResearchPredicate.accesses,
         ResearchPredicate.controls,
+        ResearchPredicate.references_same_object,
+        ResearchPredicate.enables,
+        ResearchPredicate.depends_on,
+        ResearchPredicate.reaches,
+        ResearchPredicate.crosses_surface,
+        ResearchPredicate.crosses_identity_boundary,
+        ResearchPredicate.crosses_tenant_boundary,
+        ResearchPredicate.produces_context_for,
     }
 )
 
@@ -69,6 +77,34 @@ class GraphRelation(str, Enum):
     supported_by = "SUPPORTED_BY"
     refuted_by = "REFUTED_BY"
     confirms = "CONFIRMS"
+
+
+# Compatibility bridge: the original GraphRelation vocabulary is iterated by
+# Phase 4 contract consumers as a closed legacy set. P4-0G relations are typed
+# ResearchPredicate members (and therefore accepted by GraphAssertion), while
+# these named attributes make the expanded graph API discoverable without
+# changing legacy Enum iteration semantics.
+for _chain_relation_name in (
+    "references_same_object",
+    "enables",
+    "depends_on",
+    "reaches",
+    "crosses_surface",
+    "crosses_identity_boundary",
+    "crosses_tenant_boundary",
+    "produces_context_for",
+    "chain_tested_by",
+    "chain_supported_by",
+    "chain_refuted_by",
+    "chain_reproduced_by",
+    "chain_confirmed_by",
+):
+    setattr(
+        GraphRelation,
+        _chain_relation_name,
+        getattr(ResearchPredicate, _chain_relation_name),
+    )
+del _chain_relation_name
 
 
 class GraphAssertion(ResearchContract):

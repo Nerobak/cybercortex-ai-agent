@@ -8,7 +8,7 @@ from time import monotonic
 
 from pydantic import Field, StrictFloat, StrictInt, model_validator
 
-from agent_core.models import ModelCallLedger, ModelUsageDelta
+from agent_core.models import ModelCallLedger, ModelUsageDelta, add_model_usage_deltas
 from agent_core.request_budget import RequestBudget, RequestDelta
 from agent_core.research.state import (
     BudgetState,
@@ -19,6 +19,7 @@ from agent_core.research.state import (
     ResearchState,
     SurfaceBudgetUsage,
 )
+from agent_core.research.chains import ChainBudgetLimits, ChainBudgetState
 from agent_core.research.types import (
     CleanupStatus,
     OpaqueIdentifier,
@@ -98,6 +99,258 @@ class ReproductionBudgetDecision(ResearchContract):
         if self.allowed == (self.reason is not None):
             raise ValueError("denied reproduction budgets require exactly one reason")
         return self
+
+
+class ChainBudgetStopReason(str, Enum):
+    candidate_budget_exhausted = "candidate_budget_exhausted"
+    active_hypothesis_budget_exhausted = "active_hypothesis_budget_exhausted"
+    experiment_budget_exhausted = "experiment_budget_exhausted"
+    request_budget_exhausted = "request_budget_exhausted"
+    model_budget_exhausted = "model_budget_exhausted"
+    reproduction_budget_exhausted = "reproduction_budget_exhausted"
+    wall_time_exhausted = "wall_time_exhausted"
+    state_change_budget_exhausted = "state_change_budget_exhausted"
+    cleanup_barrier = "cleanup_barrier"
+
+
+class ChainBudgetDecision(ResearchContract):
+    allowed: bool
+    reason: ChainBudgetStopReason | None = None
+    remaining_candidates: StrictInt = Field(ge=0)
+    remaining_active_hypotheses: StrictInt = Field(ge=0)
+    remaining_experiments: StrictInt = Field(ge=0)
+    remaining_target_requests: StrictInt = Field(ge=0)
+    remaining_model_calls: StrictInt = Field(ge=0)
+    remaining_reproductions: StrictInt = Field(ge=0)
+    remaining_state_changes: StrictInt = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_reason(self) -> "ChainBudgetDecision":
+        if self.allowed == (self.reason is not None):
+            raise ValueError("denied chain budgets require exactly one reason")
+        return self
+
+
+class ChainBudgetManager:
+    """Chain-specific ceilings layered over the authoritative research ledgers."""
+
+    def __init__(
+        self,
+        research_budget_manager: "ResearchBudgetManager",
+        limits: ChainBudgetLimits | None = None,
+        *,
+        budget_reference: str = "chain-budget-v1",
+    ) -> None:
+        self.research_budget_manager = research_budget_manager
+        self.limits = limits or ChainBudgetLimits()
+        self.budget_reference = budget_reference
+
+    def state(self, research: ResearchState) -> ChainBudgetState:
+        matches = [
+            item
+            for item in research.chain_budgets
+            if item.budget_reference == self.budget_reference
+        ]
+        if len(matches) > 1:
+            raise ValueError("chain budget reference is ambiguous")
+        if matches:
+            return matches[0]
+        authoritative = self.research_budget_manager.state(research)
+        return ChainBudgetState(
+            budget_reference=self.budget_reference,
+            limits=self.limits,
+            authoritative_request_ledger_reference=(
+                authoritative.request_budget.ledger_reference
+            ),
+            authoritative_request_total_observed=(
+                authoritative.request_budget.consumed.total
+            ),
+            authoritative_model_calls_observed=(
+                authoritative.model_budget.usage.attempted_calls
+            ),
+        )
+
+    def check(
+        self,
+        research: ResearchState,
+        *,
+        estimated_requests: int = 0,
+        model_calls: int = 0,
+        candidate_count: int = 0,
+        activate_hypothesis: bool = False,
+        experiment: bool = False,
+        reproduction: bool = False,
+        state_changing: bool = False,
+        wall_time_seconds: float = 0.0,
+    ) -> ChainBudgetDecision:
+        if (
+            estimated_requests < 0
+            or model_calls < 0
+            or candidate_count < 0
+            or wall_time_seconds < 0
+        ):
+            raise ValueError("chain budget estimates cannot be negative")
+        chain = self.state(research)
+        research_budget = self.research_budget_manager.state(research)
+        remaining_requests = min(
+            max(
+                0,
+                chain.limits.maximum_chain_target_requests
+                - chain.target_requests_consumed,
+            ),
+            research_budget.request_budget.remaining,
+        )
+        remaining = {
+            "remaining_candidates": max(
+                0,
+                chain.limits.maximum_chain_candidates - chain.candidates_considered,
+            ),
+            "remaining_active_hypotheses": max(
+                0,
+                chain.limits.maximum_active_chain_hypotheses - chain.active_hypotheses,
+            ),
+            "remaining_experiments": max(
+                0,
+                chain.limits.maximum_chain_experiments - chain.experiments_consumed,
+            ),
+            "remaining_target_requests": remaining_requests,
+            "remaining_model_calls": max(
+                0,
+                min(
+                    chain.limits.maximum_chain_model_calls
+                    - chain.model_usage.attempted_calls,
+                    research_budget.model_budget.remaining_calls,
+                ),
+            ),
+            "remaining_reproductions": max(
+                0,
+                chain.limits.maximum_chain_reproductions - chain.reproductions_consumed,
+            ),
+            "remaining_state_changes": max(
+                0,
+                min(
+                    chain.limits.state_changing_chain_ceiling
+                    - chain.state_changes_consumed,
+                    research_budget.state_change_ceiling
+                    - research_budget.state_changes_consumed,
+                ),
+            ),
+        }
+        reason = None
+        if research_budget.cleanup_barrier_reference is not None or (
+            research_budget.cleanup_status
+            in {
+                CleanupStatus.pending,
+                CleanupStatus.failed,
+                CleanupStatus.externally_required,
+            }
+        ):
+            reason = ChainBudgetStopReason.cleanup_barrier
+        elif remaining["remaining_candidates"] < candidate_count:
+            reason = ChainBudgetStopReason.candidate_budget_exhausted
+        elif activate_hypothesis and remaining["remaining_active_hypotheses"] <= 0:
+            reason = ChainBudgetStopReason.active_hypothesis_budget_exhausted
+        elif (
+            chain.wall_time_consumed_seconds + wall_time_seconds
+            > chain.limits.wall_time_ceiling_seconds
+        ):
+            reason = ChainBudgetStopReason.wall_time_exhausted
+        elif experiment and (
+            chain.experiments_consumed >= chain.limits.maximum_chain_experiments
+        ):
+            reason = ChainBudgetStopReason.experiment_budget_exhausted
+        elif remaining_requests < estimated_requests:
+            reason = ChainBudgetStopReason.request_budget_exhausted
+        elif remaining["remaining_model_calls"] < model_calls:
+            reason = ChainBudgetStopReason.model_budget_exhausted
+        elif reproduction and (
+            chain.reproductions_consumed >= chain.limits.maximum_chain_reproductions
+        ):
+            reason = ChainBudgetStopReason.reproduction_budget_exhausted
+        elif state_changing and remaining["remaining_state_changes"] <= 0:
+            reason = ChainBudgetStopReason.state_change_budget_exhausted
+        return ChainBudgetDecision(allowed=reason is None, reason=reason, **remaining)
+
+    def consume(
+        self,
+        research: ResearchState,
+        *,
+        request_delta: RequestDelta = RequestDelta(),
+        model_usage_delta: ModelUsageDelta = ModelUsageDelta(),
+        candidates_considered: int = 0,
+        activate_hypothesis: bool = False,
+        experiment: bool = False,
+        reproduction: bool = False,
+        state_changing: bool = False,
+        wall_time_seconds: float = 0.0,
+        completed_step_id: str | None = None,
+    ) -> ChainBudgetState:
+        """Account actual deltas only; RequestBudget remains authoritative."""
+
+        current = self.state(research)
+        if wall_time_seconds < 0:
+            raise ValueError("chain wall time cannot be negative")
+        if completed_step_id is not None and completed_step_id in (
+            current.completed_step_ids
+        ):
+            raise ValueError("chain step was already accounted")
+        authoritative = self.research_budget_manager.state(research)
+        request_ledger_delta = (
+            authoritative.request_budget.consumed.total
+            - current.authoritative_request_total_observed
+        )
+        model_ledger_delta = (
+            authoritative.model_budget.usage.attempted_calls
+            - current.authoritative_model_calls_observed
+        )
+        if request_ledger_delta != request_delta.total:
+            raise ValueError("chain request delta does not reconcile to the ledger")
+        if model_ledger_delta != model_usage_delta.attempted_calls:
+            raise ValueError("chain model delta does not reconcile to the ledger")
+        decision = self.check(
+            research,
+            estimated_requests=request_delta.total,
+            model_calls=model_usage_delta.attempted_calls,
+            candidate_count=candidates_considered,
+            activate_hypothesis=activate_hypothesis,
+            experiment=experiment,
+            reproduction=reproduction,
+            state_changing=state_changing,
+            wall_time_seconds=wall_time_seconds,
+        )
+        if not decision.allowed:
+            raise ValueError(f"chain budget denied: {decision.reason.value}")
+        payload = current.model_dump(mode="python")
+        payload.update(
+            candidates_considered=(
+                current.candidates_considered + candidates_considered
+            ),
+            active_hypotheses=(current.active_hypotheses + int(activate_hypothesis)),
+            experiments_consumed=current.experiments_consumed + int(experiment),
+            target_requests_consumed=(
+                current.target_requests_consumed + request_delta.total
+            ),
+            model_usage=add_model_usage_deltas(current.model_usage, model_usage_delta),
+            reproductions_consumed=(current.reproductions_consumed + int(reproduction)),
+            wall_time_consumed_seconds=(
+                current.wall_time_consumed_seconds + wall_time_seconds
+            ),
+            state_changes_consumed=(
+                current.state_changes_consumed + int(state_changing)
+            ),
+            completed_step_ids=(
+                (*current.completed_step_ids, completed_step_id)
+                if completed_step_id is not None
+                else current.completed_step_ids
+            ),
+            authoritative_request_total_observed=(
+                authoritative.request_budget.consumed.total
+            ),
+            authoritative_model_calls_observed=(
+                authoritative.model_budget.usage.attempted_calls
+            ),
+        )
+        return ChainBudgetState.model_validate(payload)
 
 
 class ResearchBudgetManager:
@@ -498,6 +751,9 @@ def utc_now() -> str:
 
 
 __all__ = [
+    "ChainBudgetDecision",
+    "ChainBudgetManager",
+    "ChainBudgetStopReason",
     "ReproductionBudgetDecision",
     "ResearchBudgetDecision",
     "ResearchBudgetManager",

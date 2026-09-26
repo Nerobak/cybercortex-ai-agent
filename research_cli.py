@@ -123,6 +123,18 @@ class SafeTracer:
             "CONFIRM",
             "REJECT",
             "MANUAL_REVIEW",
+            "CHAIN_CANDIDATE",
+            "CHAIN_SELECT",
+            "CHAIN_HYPOTHESIS",
+            "CHAIN_STEP_PLAN",
+            "CHAIN_STEP_AUTHORIZE",
+            "CHAIN_STEP_EXECUTE",
+            "CHAIN_STEP_EVALUATE",
+            "CHAIN_SUPPORTED",
+            "CHAIN_REFUTED",
+            "CHAIN_CANDIDATE_FINDING",
+            "CHAIN_REPRODUCTION",
+            "CHAIN_CONFIRM",
             "STOP",
         }
     )
@@ -760,12 +772,22 @@ def safe_run_summary(
             "source_experiment": item.candidate_experiment_id,
             "status": item.status.value,
             "reproduction_ids": list(item.reproduction_ids),
+            "chain_reproduction_ids": list(item.chain_reproduction_ids),
             "evidence_references": list(item.evidence_references),
             "confirmation_policy_reference": (item.confirmation_policy_reference),
             "total_finding_request_count": item.total_request_count,
         }
         for item in state.findings
     ]
+    chain_findings = [item for item in state.findings if item.source_chain_id]
+    chain_model_calls = sum(
+        item.model_usage.attempted_calls for item in state.chain_budgets
+    )
+    chain_requests = (
+        sum(item.target_requests_consumed for item in state.chain_budgets)
+        if state.chain_budgets
+        else sum(item.request_delta.total for item in state.chain_step_outcomes)
+    )
     return {
         "research_id": state.research_id,
         "final_status": state.status.value,
@@ -783,6 +805,25 @@ def safe_run_summary(
         "experiments_attempted": len(state.experiment_history),
         "pivots": sum(item.pivot_count for item in state.hypotheses),
         "candidate_findings": len(findings),
+        "chains_considered": len(state.chain_candidates),
+        "chains_tested": len({item.chain_id for item in state.chain_step_outcomes}),
+        "chains_supported": sum(
+            item.classification.value in {"supported", "candidate_chain_finding"}
+            for item in state.chain_evaluations
+        ),
+        "chains_refuted": sum(
+            item.classification.value == "refuted" for item in state.chain_evaluations
+        ),
+        "chains_inconclusive": sum(
+            item.classification.value in {"inconclusive", "blocked"}
+            for item in state.chain_evaluations
+        ),
+        "chain_findings": len(chain_findings),
+        "confirmed_chain_findings": sum(
+            item.status.value == "confirmed" for item in chain_findings
+        ),
+        "chain_requests": chain_requests,
+        "chain_model_calls": chain_model_calls,
         "hypotheses": hypotheses,
         "experiments": experiments,
         "findings": findings,
@@ -869,6 +910,92 @@ def _trace_state(tracer: SafeTracer, state: ResearchState, stop_reason: str) -> 
         if event is not None:
             tracer.emit(
                 event,
+                finding_id=decision.finding_id,
+                decision_id=decision.decision_id,
+            )
+    for candidate in state.chain_candidates:
+        tracer.emit(
+            "CHAIN_CANDIDATE",
+            candidate_id=candidate.candidate_id,
+            category=candidate.category,
+        )
+    for hypothesis in state.chain_hypotheses:
+        tracer.emit(
+            "CHAIN_SELECT",
+            candidate_id=hypothesis.chain_candidate_id,
+        )
+        tracer.emit(
+            "CHAIN_HYPOTHESIS",
+            hypothesis_id=hypothesis.hypothesis_id,
+            candidate_id=hypothesis.chain_candidate_id,
+        )
+    for outcome in state.chain_step_outcomes:
+        tracer.emit(
+            "CHAIN_STEP_PLAN",
+            chain_id=outcome.chain_id,
+            step_id=outcome.step_id,
+        )
+        tracer.emit(
+            "CHAIN_STEP_AUTHORIZE",
+            chain_id=outcome.chain_id,
+            step_id=outcome.step_id,
+        )
+        tracer.emit(
+            "CHAIN_STEP_EXECUTE",
+            chain_id=outcome.chain_id,
+            step_id=outcome.step_id,
+            request_count=outcome.request_delta.total,
+        )
+        tracer.emit(
+            "CHAIN_STEP_EVALUATE",
+            chain_id=outcome.chain_id,
+            step_id=outcome.step_id,
+            status=outcome.status.value,
+        )
+    for evaluation in state.chain_evaluations:
+        event = (
+            "CHAIN_REFUTED"
+            if evaluation.classification.value == "refuted"
+            else (
+                "CHAIN_SUPPORTED"
+                if evaluation.classification.value
+                in {"supported", "candidate_chain_finding"}
+                else None
+            )
+        )
+        if event:
+            tracer.emit(
+                event,
+                chain_id=evaluation.chain_id,
+                evaluation_id=evaluation.evaluation_id,
+            )
+        if evaluation.classification.value == "candidate_chain_finding":
+            finding = next(
+                (
+                    item
+                    for item in state.findings
+                    if item.source_chain_id == evaluation.chain_id
+                ),
+                None,
+            )
+            tracer.emit(
+                "CHAIN_CANDIDATE_FINDING",
+                chain_id=evaluation.chain_id,
+                evaluation_id=evaluation.evaluation_id,
+                finding_id=finding.finding_id if finding is not None else None,
+            )
+    for reproduction in state.chain_reproduction_outcomes:
+        tracer.emit(
+            "CHAIN_REPRODUCTION",
+            chain_id=reproduction.chain_id,
+            reproduction_id=reproduction.reproduction_id,
+            status=reproduction.status.value,
+        )
+    for decision in state.chain_confirmation_decisions:
+        if decision.action.value == "confirm":
+            tracer.emit(
+                "CHAIN_CONFIRM",
+                chain_id=decision.chain_id,
                 finding_id=decision.finding_id,
                 decision_id=decision.decision_id,
             )

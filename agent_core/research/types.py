@@ -140,10 +140,13 @@ class SurfaceType(str, Enum):
     rest = "rest"
     graphql = "graphql"
     authentication = "authentication"
+    session = "session"
     token = "token"
     upload = "upload"
     workflow = "workflow"
     server_side = "server_side"
+    browser = "browser"
+    capture_derived = "capture_derived"
 
 
 class HypothesisResearchStatus(str, Enum):
@@ -355,10 +358,27 @@ class CleanupStatus(str, Enum):
 
 class AttackChainStatus(str, Enum):
     proposed = "proposed"
+    testing = "testing"
+    supported = "supported"
+    refuted = "refuted"
+    inconclusive = "inconclusive"
     candidate = "candidate"
+    reproducing = "reproducing"
+    # Compatibility with snapshots written before P4-0G. New chain
+    # confirmation moves directly from reproducing to confirmed.
     reproduced = "reproduced"
     confirmed = "confirmed"
     rejected = "rejected"
+    manual_review = "manual_review"
+
+    @property
+    def terminal(self) -> bool:
+        return self in {
+            AttackChainStatus.refuted,
+            AttackChainStatus.confirmed,
+            AttackChainStatus.rejected,
+            AttackChainStatus.manual_review,
+        }
 
 
 class ImpactLevel(str, Enum):
@@ -390,6 +410,7 @@ class EntityKind(str, Enum):
     observation = "observation"
     evidence = "evidence"
     fact = "fact"
+    relationship = "relationship"
     hypothesis = "hypothesis"
     experiment_outcome = "experiment_outcome"
     reproduction = "reproduction"
@@ -423,6 +444,21 @@ class ResearchPredicate(str, Enum):
     finding_rejected_by = "FINDING_REJECTED_BY"
     reproduction_of = "REPRODUCTION_OF"
     conflicts_with = "CONFLICTS_WITH"
+    # P4-0G cross-surface and attack-chain relations. These remain ordinary
+    # evidence-backed graph predicates; merely naming one never establishes it.
+    references_same_object = "REFERENCES_SAME_OBJECT"
+    enables = "ENABLES"
+    depends_on = "DEPENDS_ON"
+    reaches = "REACHES"
+    crosses_surface = "CROSSES_SURFACE"
+    crosses_identity_boundary = "CROSSES_IDENTITY_BOUNDARY"
+    crosses_tenant_boundary = "CROSSES_TENANT_BOUNDARY"
+    produces_context_for = "PRODUCES_CONTEXT_FOR"
+    chain_tested_by = "CHAIN_TESTED_BY"
+    chain_supported_by = "CHAIN_SUPPORTED_BY"
+    chain_refuted_by = "CHAIN_REFUTED_BY"
+    chain_reproduced_by = "CHAIN_REPRODUCED_BY"
+    chain_confirmed_by = "CHAIN_CONFIRMED_BY"
 
 
 class MetadataEntry(ResearchContract):

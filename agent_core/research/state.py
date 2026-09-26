@@ -7,12 +7,34 @@ import json
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, StrictBool, StrictFloat, StrictInt, model_validator
+from pydantic import (
+    AliasChoices,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    model_validator,
+)
 
 from agent_core.models import ModelUsageDelta
 from agent_core.phase2_result_status import Phase2ResultStatus
 from agent_core.request_budget import RequestDelta
 from agent_core.research.primitives import PrimitiveStepProposal
+from agent_core.research.chains import (
+    AttackChainCandidate,
+    AttackChainEvaluation,
+    AttackChainHypothesis,
+    AttackChainStepKind,
+    ChainBudgetState,
+    ChainConfirmationDecision,
+    ChainReproductionOutcome,
+    ChainReproductionPlan,
+    ChainStepOutcome,
+    MAX_CHAIN_DEPTH,
+    UnresolvedChainLink,
+    enforce_chain_public_boundary,
+    stable_chain_digest,
+)
 from agent_core.research.types import (
     AttackChainId,
     AttackChainStatus,
@@ -998,6 +1020,20 @@ class FindingRecord(ResearchContract):
     created_at: Timestamp | None = None
     updated_at: Timestamp | None = None
     state_revision: StrictInt | None = Field(default=None, ge=0, le=1_000_000_000)
+    source_chain_id: AttackChainId | None = None
+    component_finding_ids: tuple[FindingId, ...] = Field(default=(), max_length=20)
+    component_hypothesis_ids: tuple[HypothesisRecordId, ...] = Field(
+        default=(), max_length=20
+    )
+    step_evidence_references: tuple[EvidenceArtifactId, ...] = Field(
+        default=(), max_length=300
+    )
+    combined_impact_evidence_references: tuple[EvidenceArtifactId, ...] = Field(
+        default=(), max_length=100
+    )
+    chain_reproduction_ids: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=20
+    )
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> "FindingRecord":
@@ -1026,6 +1062,11 @@ class FindingRecord(ResearchContract):
             "reproduction_ids",
             "confirmed_evidence_references",
             "conflicting_evidence_references",
+            "component_finding_ids",
+            "component_hypothesis_ids",
+            "step_evidence_references",
+            "combined_impact_evidence_references",
+            "chain_reproduction_ids",
         ):
             object.__setattr__(
                 self,
@@ -1052,6 +1093,23 @@ class FindingRecord(ResearchContract):
             raise ValueError("a rejected finding requires contradictory evidence")
         if self.total_request_count < self.source_request_delta.total:
             raise ValueError("finding request total cannot undercount source requests")
+        if self.source_chain_id is not None:
+            if not self.component_hypothesis_ids:
+                raise ValueError("a chain finding requires component hypotheses")
+            if not self.step_evidence_references:
+                raise ValueError("a chain finding requires step evidence")
+            if not self.combined_impact_evidence_references:
+                raise ValueError("a chain finding requires combined impact evidence")
+            if (
+                self.status is FindingStatus.confirmed
+                and not self.chain_reproduction_ids
+            ):
+                raise ValueError(
+                    "a confirmed chain finding requires chain reproduction"
+                )
+            enforce_chain_public_boundary(
+                self.model_dump(mode="json"), location="chain finding"
+            )
         if (
             self.created_at is not None
             and self.updated_at is not None
@@ -1062,47 +1120,266 @@ class FindingRecord(ResearchContract):
 
 
 class AttackChainStep(ResearchContract):
-    sequence: StrictInt = Field(ge=1, le=100)
-    reference: EntityReference
-    objective: ShortPublicText
+    step_id: OpaqueIdentifier | None = None
+    sequence: StrictInt = Field(ge=1, le=MAX_CHAIN_DEPTH)
+    step_kind: AttackChainStepKind | None = None
+    source_reference: EntityReference | None = None
+    target_reference: EntityReference | None = None
+    # Pre-P4-0G compatibility. It is normalized into source_reference.
+    reference: EntityReference | None = None
+    objective: ShortPublicText | None = None
+    required_preconditions: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=20
+    )
+    produced_fact_kind: OpaqueIdentifier | None = None
+    consumed_fact_ids: tuple[FactId, ...] = Field(default=(), max_length=100)
+    expected_secure_behavior: PublicText | None = None
+    expected_chain_behavior: PublicText | None = None
+    evidence_requirements: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=20
+    )
+    unresolved_link_id: OpaqueIdentifier | None = None
 
     @model_validator(mode="after")
     def restrict_reference_kind(self) -> "AttackChainStep":
-        if self.reference.entity_kind not in {
+        source = self.source_reference or self.reference
+        if source is None:
+            raise ValueError("attack-chain steps require a source reference")
+        if (
+            self.source_reference is not None
+            and self.reference is not None
+            and self.source_reference != self.reference
+        ):
+            raise ValueError("attack-chain source reference aliases disagree")
+        allowed = {
             EntityKind.fact,
+            EntityKind.relationship,
             EntityKind.hypothesis,
             EntityKind.finding,
             EntityKind.observation,
-        }:
-            raise ValueError("attack-chain steps must reference research evidence")
+            EntityKind.experiment_outcome,
+            EntityKind.identity,
+            EntityKind.session,
+            EntityKind.token,
+            EntityKind.object,
+            EntityKind.surface,
+            EntityKind.endpoint,
+            EntityKind.parameter,
+            EntityKind.graphql_operation,
+            EntityKind.upload,
+            EntityKind.workflow,
+        }
+        if source.entity_kind not in allowed:
+            raise ValueError(
+                "attack-chain steps must reference typed research entities"
+            )
+        if (
+            self.target_reference is not None
+            and self.target_reference.entity_kind not in allowed
+        ):
+            raise ValueError("attack-chain step target is not a typed chain entity")
+        kind = self.step_kind
+        if kind is None:
+            kind = {
+                EntityKind.fact: AttackChainStepKind.fact,
+                EntityKind.relationship: AttackChainStepKind.relationship,
+                EntityKind.finding: AttackChainStepKind.finding,
+                EntityKind.experiment_outcome: AttackChainStepKind.experiment,
+                EntityKind.identity: AttackChainStepKind.identity_transition,
+                EntityKind.session: AttackChainStepKind.identity_transition,
+                EntityKind.token: AttackChainStepKind.identity_transition,
+                EntityKind.object: AttackChainStepKind.object_transition,
+                EntityKind.upload: AttackChainStepKind.object_transition,
+                EntityKind.surface: AttackChainStepKind.surface_transition,
+                EntityKind.endpoint: AttackChainStepKind.surface_transition,
+                EntityKind.parameter: AttackChainStepKind.surface_transition,
+                EntityKind.graphql_operation: AttackChainStepKind.surface_transition,
+                EntityKind.workflow: AttackChainStepKind.workflow_transition,
+            }.get(source.entity_kind, AttackChainStepKind.relationship)
+        step_id = self.step_id or (
+            "chain-step-"
+            + stable_chain_digest(
+                {
+                    "sequence": self.sequence,
+                    "source": source.model_dump(mode="json"),
+                    "target": (
+                        self.target_reference.model_dump(mode="json")
+                        if self.target_reference is not None
+                        else None
+                    ),
+                }
+            )[7:31]
+        )
+        object.__setattr__(self, "step_id", step_id)
+        object.__setattr__(self, "step_kind", kind)
+        object.__setattr__(self, "source_reference", source)
+        object.__setattr__(self, "reference", source)
+        for field_name in (
+            "required_preconditions",
+            "consumed_fact_ids",
+            "evidence_requirements",
+        ):
+            values = getattr(self, field_name)
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} must be unique")
+            object.__setattr__(self, field_name, tuple(sorted(values)))
+        enforce_chain_public_boundary(
+            self.model_dump(mode="json"), location="attack-chain step"
+        )
         return self
 
 
 class AttackChain(ResearchContract):
-    attack_chain_id: AttackChainId
+    attack_chain_id: AttackChainId = Field(
+        validation_alias=AliasChoices("attack_chain_id", "chain_id")
+    )
+    research_id: ResearchId | None = None
+    state_revision: StrictInt = Field(default=0, ge=0, le=1_000_000_000)
     title: ShortPublicText
+    category: OpaqueIdentifier = "cross-surface-chain"
     status: AttackChainStatus
-    steps: tuple[AttackChainStep, ...] = Field(min_length=2, max_length=100)
+    target_ids: tuple[TargetAssetId, ...] = Field(default=(), max_length=64)
+    surface_ids: tuple[SurfaceId, ...] = Field(default=(), max_length=20)
+    identity_ids: tuple[IdentityId, ...] = Field(default=(), max_length=20)
+    object_ids: tuple[ResearchObjectId, ...] = Field(default=(), max_length=20)
+    hypothesis_ids: tuple[HypothesisRecordId, ...] = Field(default=(), max_length=20)
+    finding_ids: tuple[FindingId, ...] = Field(default=(), max_length=20)
+    fact_ids: tuple[FactId, ...] = Field(default=(), max_length=100)
+    relationship_ids: tuple[RelationshipId, ...] = Field(default=(), max_length=100)
+    steps: tuple[AttackChainStep, ...] = Field(min_length=2, max_length=MAX_CHAIN_DEPTH)
+    entry_condition: PublicText = "Existing evidence establishes the first chain step."
+    security_property: PublicText = "A bounded security boundary may be crossed."
+    expected_secure_behavior: PublicText = "The security boundary prevents the chain."
+    expected_chain_behavior: PublicText = (
+        "The ordered links demonstrate combined impact."
+    )
+    unresolved_links: tuple[UnresolvedChainLink, ...] = Field(default=(), max_length=3)
     evidence_references: tuple[EvidenceArtifactId, ...] = Field(
         default=(), max_length=200
     )
     provenance_id: ProvenanceRecordId
+    confirmation_policy_reference: OpaqueIdentifier = "chain-confirmation-policy-v1"
+    semantic_fingerprint: Sha256Digest | None = None
+    combined_impact_evidence: tuple[EvidenceArtifactId, ...] = Field(
+        default=(), max_length=100
+    )
+    reproduction_ids: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=20)
+    created_at: Timestamp | None = None
+    updated_at: Timestamp | None = None
+
+    @property
+    def chain_id(self) -> AttackChainId:
+        return self.attack_chain_id
 
     @model_validator(mode="after")
     def validate_steps(self) -> "AttackChain":
         sequences = tuple(step.sequence for step in self.steps)
+        step_ids = tuple(str(step.step_id) for step in self.steps)
         if len(sequences) != len(set(sequences)):
             raise ValueError("attack-chain step sequences must be unique")
-        object.__setattr__(
-            self,
+        if tuple(sorted(sequences)) != tuple(range(1, len(self.steps) + 1)):
+            raise ValueError("attack-chain step sequences must be contiguous")
+        _unique(step_ids, "attack-chain step IDs")
+        for field_name in (
+            "target_ids",
+            "surface_ids",
+            "identity_ids",
+            "object_ids",
+            "hypothesis_ids",
+            "finding_ids",
+            "fact_ids",
+            "relationship_ids",
             "evidence_references",
-            _canonical_references(self.evidence_references, "evidence_references"),
-        )
+            "combined_impact_evidence",
+            "reproduction_ids",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _canonical_references(getattr(self, field_name), field_name),
+            )
+        link_ids = tuple(item.link_id for item in self.unresolved_links)
+        _unique(link_ids, "attack-chain unresolved-link IDs")
         object.__setattr__(
             self, "steps", tuple(sorted(self.steps, key=lambda x: x.sequence))
         )
+        prior_step_ids: set[str] = set()
+        unresolved_link_ids = {item.link_id for item in self.unresolved_links}
+        bound_link_ids: list[str] = []
+        for current, following in zip(self.steps, self.steps[1:]):
+            if (
+                current.target_reference is not None
+                and current.target_reference != following.source_reference
+            ):
+                raise ValueError("attack-chain step target breaks ordered continuity")
+        for step in self.steps:
+            if not set(step.required_preconditions).issubset(prior_step_ids):
+                raise ValueError(
+                    "attack-chain preconditions must reference earlier chain steps"
+                )
+            if step.unresolved_link_id is not None:
+                if step.unresolved_link_id not in unresolved_link_ids:
+                    raise ValueError("attack-chain step references an unavailable link")
+                bound_link_ids.append(step.unresolved_link_id)
+            prior_step_ids.add(str(step.step_id))
+        _unique(tuple(bound_link_ids), "attack-chain bound unresolved links")
+        if set(bound_link_ids) != unresolved_link_ids:
+            raise ValueError("every unresolved chain link must bind exactly one step")
         if self.status is AttackChainStatus.confirmed and not self.evidence_references:
             raise ValueError("a confirmed attack chain requires evidence")
+        if self.status is AttackChainStatus.confirmed and not self.reproduction_ids:
+            raise ValueError("a confirmed attack chain requires reproduction")
+        if self.status is AttackChainStatus.confirmed and not (
+            self.combined_impact_evidence
+        ):
+            raise ValueError("a confirmed attack chain requires combined impact")
+        if (
+            self.created_at
+            and self.updated_at
+            and (_as_datetime(self.updated_at) < _as_datetime(self.created_at))
+        ):
+            raise ValueError("chain update cannot precede creation")
+        fingerprint = stable_chain_digest(
+            {
+                "category": self.category,
+                "ordered_links": [
+                    (
+                        step.source_reference.entity_kind.value,
+                        step.source_reference.entity_id,
+                    )
+                    for step in self.steps
+                ],
+                "security_property": self.security_property,
+                "surfaces": sorted(self.surface_ids),
+                "identities": sorted(self.identity_ids),
+                "objects": sorted(self.object_ids),
+                "unresolved": [
+                    {
+                        "from": (
+                            item.from_reference.entity_kind.value,
+                            item.from_reference.entity_id,
+                        ),
+                        "to": (
+                            item.to_reference.entity_kind.value,
+                            item.to_reference.entity_id,
+                        ),
+                        "capabilities": sorted(item.allowed_experiment_capabilities),
+                    }
+                    for item in self.unresolved_links
+                ],
+            }
+        )
+        if (
+            self.semantic_fingerprint is not None
+            and self.semantic_fingerprint != fingerprint
+        ):
+            raise ValueError(
+                "attack-chain semantic fingerprint does not match bindings"
+            )
+        object.__setattr__(self, "semantic_fingerprint", fingerprint)
+        enforce_chain_public_boundary(
+            self.model_dump(mode="json"), location="attack chain"
+        )
         return self
 
 
@@ -1325,7 +1602,29 @@ class ResearchState(ResearchContract):
         default=(), max_length=5_000
     )
     findings: tuple[FindingRecord, ...] = Field(default=(), max_length=2_000)
+    chain_candidates: tuple[AttackChainCandidate, ...] = Field(
+        default=(), max_length=500
+    )
+    chain_hypotheses: tuple[AttackChainHypothesis, ...] = Field(
+        default=(), max_length=500
+    )
     attack_chains: tuple[AttackChain, ...] = Field(default=(), max_length=500)
+    chain_step_outcomes: tuple[ChainStepOutcome, ...] = Field(
+        default=(), max_length=5_000
+    )
+    chain_evaluations: tuple[AttackChainEvaluation, ...] = Field(
+        default=(), max_length=2_000
+    )
+    chain_reproduction_plans: tuple[ChainReproductionPlan, ...] = Field(
+        default=(), max_length=500
+    )
+    chain_reproduction_outcomes: tuple[ChainReproductionOutcome, ...] = Field(
+        default=(), max_length=1_000
+    )
+    chain_confirmation_decisions: tuple[ChainConfirmationDecision, ...] = Field(
+        default=(), max_length=1_000
+    )
+    chain_budgets: tuple[ChainBudgetState, ...] = Field(default=(), max_length=20)
     budgets: tuple[BudgetState, ...] = Field(default=(), max_length=20)
     bootstrap_progress: tuple[ResearchBootstrapProgress, ...] = Field(
         default=(), max_length=64
@@ -1359,7 +1658,15 @@ class ResearchState(ResearchContract):
             ("reproduction_outcomes", "reproduction_id"),
             ("confirmation_decisions", "decision_id"),
             ("findings", "finding_id"),
+            ("chain_candidates", "candidate_id"),
+            ("chain_hypotheses", "hypothesis_id"),
             ("attack_chains", "attack_chain_id"),
+            ("chain_step_outcomes", "outcome_id"),
+            ("chain_evaluations", "evaluation_id"),
+            ("chain_reproduction_plans", "reproduction_id"),
+            ("chain_reproduction_outcomes", "reproduction_id"),
+            ("chain_confirmation_decisions", "decision_id"),
+            ("chain_budgets", "budget_reference"),
             ("budgets", "budget_reference"),
             ("bootstrap_progress", "bootstrap_id"),
             ("provenance", "provenance_id"),
@@ -1401,7 +1708,15 @@ class ResearchState(ResearchContract):
         confirmation_decision_ids = {
             item.decision_id for item in self.confirmation_decisions
         }
+        chain_confirmation_decision_ids = {
+            item.decision_id for item in self.chain_confirmation_decisions
+        }
         finding_ids = {item.finding_id for item in self.findings}
+        chain_ids = {item.attack_chain_id for item in self.attack_chains}
+        chain_candidate_ids = {item.candidate_id for item in self.chain_candidates}
+        chain_reproduction_ids = {
+            item.reproduction_id for item in self.chain_reproduction_plans
+        }
         observation_ids = {item.observation_id for item in self.observations}
         provenance_ids = {item.provenance_id for item in self.provenance}
 
@@ -1709,7 +2024,7 @@ class ResearchState(ResearchContract):
             )
             _require_optional_reference(
                 item.confirmation_decision_id,
-                confirmation_decision_ids,
+                confirmation_decision_ids | chain_confirmation_decision_ids,
                 "finding confirmation decision",
             )
             if item.controlled_impact is not None:
@@ -1719,15 +2034,240 @@ class ResearchState(ResearchContract):
                     "finding impact evidence",
                 )
             _require_reference(item.provenance_id, provenance_ids, "finding provenance")
+            _require_optional_reference(
+                item.source_chain_id, chain_ids, "finding source chain"
+            )
+            _require_references(
+                item.component_finding_ids, finding_ids, "chain component findings"
+            )
+            _require_references(
+                item.component_hypothesis_ids,
+                hypothesis_ids,
+                "chain component hypotheses",
+            )
+            _require_references(
+                (
+                    *item.step_evidence_references,
+                    *item.combined_impact_evidence_references,
+                ),
+                evidence_ids,
+                "chain finding evidence",
+            )
+            _require_references(
+                item.chain_reproduction_ids,
+                chain_reproduction_ids,
+                "chain finding reproductions",
+            )
+        for item in self.chain_candidates:
+            if item.research_id != self.research_id:
+                raise ValueError("chain candidate research reference mismatch")
+            if item.state_revision > self.revision:
+                raise ValueError("chain candidate references a future state revision")
+            _require_references(item.target_ids, target_ids, "chain candidate targets")
+            _require_references(
+                item.surface_ids, surface_ids, "chain candidate surfaces"
+            )
+            _require_references(
+                item.identity_ids, identity_ids, "chain candidate identities"
+            )
+            _require_references(
+                item.object_ids,
+                {value.object_id for value in self.objects},
+                "chain candidate objects",
+            )
+            _require_references(
+                item.hypothesis_ids,
+                hypothesis_ids,
+                "chain candidate hypotheses",
+            )
+            _require_references(
+                item.finding_ids, finding_ids, "chain candidate findings"
+            )
+            _require_references(item.fact_ids, fact_ids, "chain candidate facts")
+            _require_references(
+                item.evidence_references, evidence_ids, "chain candidate evidence"
+            )
+            _require_references(
+                item.provenance_references,
+                provenance_ids,
+                "chain candidate provenance",
+            )
+            for reference in item.ordered_references:
+                _validate_entity_reference(reference, self)
+            for link in item.required_unresolved_links:
+                _validate_entity_reference(link.from_reference, self)
+                _validate_entity_reference(link.to_reference, self)
+                _require_references(
+                    link.evidence_references,
+                    evidence_ids,
+                    "chain candidate link evidence",
+                )
+        for item in self.chain_hypotheses:
+            if item.research_id != self.research_id:
+                raise ValueError("chain hypothesis research reference mismatch")
+            _require_reference(
+                item.chain_candidate_id,
+                chain_candidate_ids,
+                "chain hypothesis candidate",
+            )
+            _require_references(
+                item.evidence_references, evidence_ids, "chain hypothesis evidence"
+            )
+            _require_references(
+                item.provenance_references,
+                provenance_ids,
+                "chain hypothesis provenance",
+            )
+            for reference in item.ordered_references:
+                _validate_entity_reference(reference, self)
+            for link in item.unresolved_links:
+                _validate_entity_reference(link.from_reference, self)
+                _validate_entity_reference(link.to_reference, self)
+                _require_references(
+                    link.evidence_references,
+                    evidence_ids,
+                    "chain hypothesis link evidence",
+                )
         for item in self.attack_chains:
+            if item.research_id is not None and item.research_id != self.research_id:
+                raise ValueError("attack-chain research reference mismatch")
             _require_references(
                 item.evidence_references, evidence_ids, "attack-chain evidence"
             )
             _require_reference(
                 item.provenance_id, provenance_ids, "attack-chain provenance"
             )
+            _require_references(item.target_ids, target_ids, "attack-chain targets")
+            _require_references(item.surface_ids, surface_ids, "attack-chain surfaces")
+            _require_references(
+                item.identity_ids, identity_ids, "attack-chain identities"
+            )
+            _require_references(
+                item.object_ids,
+                {value.object_id for value in self.objects},
+                "attack-chain objects",
+            )
+            _require_references(
+                item.hypothesis_ids, hypothesis_ids, "attack-chain hypotheses"
+            )
+            _require_references(item.finding_ids, finding_ids, "attack-chain findings")
+            _require_references(item.fact_ids, fact_ids, "attack-chain facts")
+            # Relationship IDs may name journaled GraphAssertions, which are
+            # integrity-checked by ResearchStore rather than duplicated here.
+            _require_references(
+                item.combined_impact_evidence,
+                evidence_ids,
+                "attack-chain combined impact evidence",
+            )
             for step in item.steps:
-                _validate_entity_reference(step.reference, self)
+                _validate_entity_reference(step.source_reference, self)
+                if step.target_reference is not None:
+                    _validate_entity_reference(step.target_reference, self)
+                _require_references(
+                    step.consumed_fact_ids, fact_ids, "attack-chain consumed facts"
+                )
+            for link in item.unresolved_links:
+                _validate_entity_reference(link.from_reference, self)
+                _validate_entity_reference(link.to_reference, self)
+                _require_references(
+                    link.evidence_references,
+                    evidence_ids,
+                    "attack-chain link evidence",
+                )
+        for item in self.chain_step_outcomes:
+            _require_reference(item.chain_id, chain_ids, "chain-step chain")
+            chain = next(
+                value
+                for value in self.attack_chains
+                if value.attack_chain_id == item.chain_id
+            )
+            step = next(
+                (value for value in chain.steps if value.step_id == item.step_id),
+                None,
+            )
+            if step is None or step.sequence != item.sequence:
+                raise ValueError("chain-step outcome does not match its chain step")
+            _require_references(
+                item.evidence_references, evidence_ids, "chain-step evidence"
+            )
+            _require_optional_reference(
+                item.provenance_id, provenance_ids, "chain-step provenance"
+            )
+        for item in self.chain_evaluations:
+            if item.research_id != self.research_id:
+                raise ValueError("chain evaluation research reference mismatch")
+            _require_reference(item.chain_id, chain_ids, "chain evaluation chain")
+            _require_references(
+                (*item.evidence_references, *item.combined_impact_evidence),
+                evidence_ids,
+                "chain evaluation evidence",
+            )
+            _require_optional_reference(
+                item.provenance_id, provenance_ids, "chain evaluation provenance"
+            )
+        for item in self.chain_reproduction_plans:
+            if item.research_id != self.research_id:
+                raise ValueError("chain reproduction research reference mismatch")
+            _require_reference(item.chain_id, chain_ids, "chain reproduction chain")
+            _require_reference(
+                item.finding_id, finding_ids, "chain reproduction finding"
+            )
+            _require_references(
+                item.component_finding_ids,
+                finding_ids,
+                "chain reproduction component findings",
+            )
+            _require_reference(
+                item.provenance_id, provenance_ids, "chain reproduction provenance"
+            )
+            chain = next(
+                value
+                for value in self.attack_chains
+                if value.attack_chain_id == item.chain_id
+            )
+            _require_references(
+                item.ordered_chain_step_ids,
+                {str(value.step_id) for value in chain.steps},
+                "chain reproduction steps",
+            )
+        for item in self.chain_reproduction_outcomes:
+            _require_reference(item.chain_id, chain_ids, "chain reproduction chain")
+            _require_reference(
+                item.finding_id, finding_ids, "chain reproduction finding"
+            )
+            _require_reference(
+                item.reproduction_id,
+                chain_reproduction_ids,
+                "chain reproduction plan",
+            )
+            _require_references(
+                (*item.evidence_references, *item.combined_impact_evidence),
+                evidence_ids,
+                "chain reproduction evidence",
+            )
+            _require_optional_reference(
+                item.provenance_id,
+                provenance_ids,
+                "chain reproduction outcome provenance",
+            )
+        for item in self.chain_confirmation_decisions:
+            _require_reference(item.chain_id, chain_ids, "chain confirmation chain")
+            _require_reference(
+                item.finding_id, finding_ids, "chain confirmation finding"
+            )
+            _require_references(
+                item.reproduction_ids,
+                chain_reproduction_ids,
+                "chain confirmation reproductions",
+            )
+            _require_references(
+                (
+                    *item.confirmed_evidence_references,
+                    *item.conflicting_evidence_references,
+                ),
+                evidence_ids,
+                "chain confirmation evidence",
+            )
         for item in self.budgets:
             _require_references(
                 tuple(usage.hypothesis_id for usage in item.hypothesis_usage),
@@ -1799,12 +2339,14 @@ def _entity_ids(state: ResearchState) -> dict[EntityKind, set[str]]:
         EntityKind.observation: {item.observation_id for item in state.observations},
         EntityKind.evidence: {item.evidence_id for item in state.evidence},
         EntityKind.fact: {item.fact_id for item in state.facts},
+        EntityKind.relationship: {item.relationship_id for item in state.relationships},
         EntityKind.hypothesis: {item.hypothesis_id for item in state.hypotheses},
         EntityKind.experiment_outcome: {
             item.outcome_id for item in state.experiment_outcomes
         },
         EntityKind.reproduction: {
-            item.reproduction_id for item in state.reproduction_plans
+            *(item.reproduction_id for item in state.reproduction_plans),
+            *(item.reproduction_id for item in state.chain_reproduction_plans),
         },
         EntityKind.finding: {item.finding_id for item in state.findings},
         EntityKind.attack_chain: {item.attack_chain_id for item in state.attack_chains},

@@ -723,3 +723,17 @@ __all__ = [
     "ReproductionPlanningError",
     "candidate_reproduction_eligible",
 ]
+
+from agent_core.research.chain_evaluation import (  # noqa: E402
+    ChainReproductionPlanner,
+)
+from agent_core.research.chains import (  # noqa: E402
+    ChainReproductionOutcome,
+    ChainReproductionPlan,
+)
+
+__all__ += [
+    "ChainReproductionOutcome",
+    "ChainReproductionPlan",
+    "ChainReproductionPlanner",
+]
