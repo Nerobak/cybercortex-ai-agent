@@ -71,6 +71,9 @@ def build_research_input(
         controlled_identity_metadata_references=(
             manifest.controlled_account_metadata_references
         ),
+        controlled_setup_object_references=(
+            manifest.controlled_setup_object_references
+        ),
         opaque_credential_references=opaque_credential_references,
         budgets=BenchmarkBudgetSnapshot(
             request_budget=manifest.request_budget,

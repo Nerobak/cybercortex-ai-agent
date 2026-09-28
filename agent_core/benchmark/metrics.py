@@ -153,7 +153,9 @@ class BenchmarkMetricsCalculator:
             if item.classification is ReproductionClassification.reproduced
         }
         reproduced = len(reproduced_finding_ids)
-        rejected = sum(item.status is FindingStatus.rejected for item in ordinary_findings)
+        rejected = sum(
+            item.status is FindingStatus.rejected for item in ordinary_findings
+        )
         manual = sum(
             item.status is FindingStatus.needs_manual_review
             for item in ordinary_findings
@@ -174,7 +176,9 @@ class BenchmarkMetricsCalculator:
         supported = sum(
             item.status is HypothesisResearchStatus.supported for item in hypotheses
         )
-        refuted = sum(item.status is HypothesisResearchStatus.refuted for item in hypotheses)
+        refuted = sum(
+            item.status is HypothesisResearchStatus.refuted for item in hypotheses
+        )
         inconclusive = sum(
             item.status
             in {
@@ -210,13 +214,21 @@ class BenchmarkMetricsCalculator:
         classifications = [
             _value(
                 item.result_classification
-                or getattr(outcome_by_experiment.get(item.experiment_id), "canonical_result_classification", "")
+                or getattr(
+                    outcome_by_experiment.get(item.experiment_id),
+                    "canonical_result_classification",
+                    "",
+                )
             )
             for item in history
         ]
         secure = sum(item in {"secure_signal", "rejected"} for item in classifications)
-        vulnerable = sum(item in {"vulnerable_signal", "verified"} for item in classifications)
-        inconclusive_experiments = sum(item == "inconclusive" for item in classifications)
+        vulnerable = sum(
+            item in {"vulnerable_signal", "verified"} for item in classifications
+        )
+        inconclusive_experiments = sum(
+            item == "inconclusive" for item in classifications
+        )
         blocked = sum(
             item.status is ResearchExperimentStatus.policy_blocked for item in history
         )
@@ -229,7 +241,8 @@ class BenchmarkMetricsCalculator:
             for item in history
         )
         duplicate_blocks = sum(
-            item.status is ResearchExperimentStatus.duplicate_blocked for item in history
+            item.status is ResearchExperimentStatus.duplicate_blocked
+            for item in history
         )
         history_requests = sum(
             outcome_by_experiment[item.experiment_id].request_delta.total
@@ -244,7 +257,9 @@ class BenchmarkMetricsCalculator:
             experiments_blocked=blocked,
             experiments_failed=failed,
             requests_per_experiment=safe_ratio(history_requests, len(history)),
-            experiments_per_confirmed_finding=safe_ratio(len(history), len(confirmed_ids)),
+            experiments_per_confirmed_finding=safe_ratio(
+                len(history), len(confirmed_ids)
+            ),
             inconclusive_rate=safe_ratio(inconclusive_experiments, len(history)),
             duplicate_experiment_blocks=duplicate_blocks,
             policy_blocks=blocked,
@@ -301,7 +316,10 @@ class BenchmarkMetricsCalculator:
         unmatched_confirmed_chains = sum(
             item.chain_id in confirmed_chains
             and item.classification
-            in {FindingMatchClassification.no_match, FindingMatchClassification.ambiguous}
+            in {
+                FindingMatchClassification.no_match,
+                FindingMatchClassification.ambiguous,
+            }
             for item in chain_matches
         )
         chain_evaluations = tuple(final_state.chain_evaluations)
@@ -309,22 +327,36 @@ class BenchmarkMetricsCalculator:
             chain_candidates=len(final_state.chain_candidates),
             chain_hypotheses=len(final_state.chain_hypotheses),
             chains_tested=len(chain_evaluations),
-            chains_supported=sum(_value(item.classification) in {"supported", "candidate_chain_finding"} for item in chain_evaluations),
-            chains_refuted=sum(_value(item.classification) == "refuted" for item in chain_evaluations),
-            chains_inconclusive=sum(_value(item.classification) in {"inconclusive", "blocked"} for item in chain_evaluations),
+            chains_supported=sum(
+                _value(item.classification) in {"supported", "candidate_chain_finding"}
+                for item in chain_evaluations
+            ),
+            chains_refuted=sum(
+                _value(item.classification) == "refuted" for item in chain_evaluations
+            ),
+            chains_inconclusive=sum(
+                _value(item.classification) in {"inconclusive", "blocked"}
+                for item in chain_evaluations
+            ),
             candidate_chain_findings=len(candidate_chains),
             confirmed_chain_findings=len(confirmed_chains),
             true_positive_chains=len(matched_confirmed_chains),
-            missed_chains=max(0, len(ground_truth.chains) - len(matched_confirmed_chains)),
+            missed_chains=max(
+                0, len(ground_truth.chains) - len(matched_confirmed_chains)
+            ),
             unexpected_chains=unmatched_confirmed_chains,
-            chain_recall=safe_ratio(len(matched_confirmed_chains), len(ground_truth.chains)),
+            chain_recall=safe_ratio(
+                len(matched_confirmed_chains), len(ground_truth.chains)
+            ),
             chain_precision=safe_ratio(
                 len(matched_confirmed_chains),
                 len(matched_confirmed_chains) + unmatched_confirmed_chains,
             ),
             chain_requests=max(
                 chain_requests,
-                sum(item.target_requests_consumed for item in final_state.chain_budgets),
+                sum(
+                    item.target_requests_consumed for item in final_state.chain_budgets
+                ),
                 sum(item.request_delta.total for item in chain_evaluations),
             ),
             chain_model_calls=max(
@@ -375,15 +407,19 @@ class BenchmarkMetricsCalculator:
             ),
         )
         timing_metrics = self._timing(final_state, wall_time_seconds, timing)
-        derived_cleanup_failures = sum(
-            item.cleanup_status is CleanupStatus.failed
-            for item in final_state.experiment_outcomes
-        ) + sum(
-            item.cleanup_status is CleanupStatus.failed
-            for item in final_state.reproduction_outcomes
-        ) + sum(
-            item.cleanup_status is CleanupStatus.failed
-            for item in final_state.chain_step_outcomes
+        derived_cleanup_failures = (
+            sum(
+                item.cleanup_status is CleanupStatus.failed
+                for item in final_state.experiment_outcomes
+            )
+            + sum(
+                item.cleanup_status is CleanupStatus.failed
+                for item in final_state.reproduction_outcomes
+            )
+            + sum(
+                item.cleanup_status is CleanupStatus.failed
+                for item in final_state.chain_step_outcomes
+            )
         )
         safety_metrics = safety or SafetyMetrics()
         if derived_cleanup_failures > safety_metrics.cleanup_failures:
@@ -413,9 +449,7 @@ class BenchmarkMetricsCalculator:
             verification = int(
                 snapshot.get("verification_requests", snapshot.get("verification", 0))
             )
-            cleanup = int(
-                snapshot.get("cleanup_requests", snapshot.get("cleanup", 0))
-            )
+            cleanup = int(snapshot.get("cleanup_requests", snapshot.get("cleanup", 0)))
             return {
                 "discovery": discovery,
                 "verification": verification,
@@ -448,7 +482,9 @@ class BenchmarkMetricsCalculator:
         if usage is None and state.budgets:
             usage = state.budgets[-1].model_budget.usage
         if usage is None:
-            entries = tuple(item.model_usage_delta for item in state.experiment_outcomes)
+            entries = tuple(
+                item.model_usage_delta for item in state.experiment_outcomes
+            )
             return {
                 "attempted_calls": sum(item.attempted_calls for item in entries),
                 "successful_calls": sum(item.successful_calls for item in entries),
@@ -462,7 +498,11 @@ class BenchmarkMetricsCalculator:
                     else sum(float(item.estimated_cost_usd or 0.0) for item in entries)
                 ),
             }
-        raw = usage.model_dump(mode="python") if hasattr(usage, "model_dump") else dict(usage)
+        raw = (
+            usage.model_dump(mode="python")
+            if hasattr(usage, "model_dump")
+            else dict(usage)
+        )
         return {
             "attempted_calls": int(raw.get("attempted_calls", 0)),
             "successful_calls": int(raw.get("successful_calls", 0)),
@@ -484,9 +524,15 @@ class BenchmarkMetricsCalculator:
                 time_to_first_hypothesis=explicit.get("time_to_first_hypothesis"),
                 time_to_first_experiment=explicit.get("time_to_first_experiment"),
                 time_to_first_candidate=explicit.get("time_to_first_candidate"),
-                time_to_first_confirmed_finding=explicit.get("time_to_first_confirmed_finding"),
-                time_to_first_confirmed_chain=explicit.get("time_to_first_confirmed_chain"),
-                time_to_completion=max(0.0, float(explicit.get("time_to_completion") or wall_time_seconds)),
+                time_to_first_confirmed_finding=explicit.get(
+                    "time_to_first_confirmed_finding"
+                ),
+                time_to_first_confirmed_chain=explicit.get(
+                    "time_to_first_confirmed_chain"
+                ),
+                time_to_completion=max(
+                    0.0, float(explicit.get("time_to_completion") or wall_time_seconds)
+                ),
             )
         provenance_times = {
             item.provenance_id: item.occurred_at for item in state.provenance
@@ -512,16 +558,25 @@ class BenchmarkMetricsCalculator:
         confirmed_chains = sorted(
             item.updated_at
             for item in state.attack_chains
-            if item.status is AttackChainStatus.confirmed and item.updated_at is not None
+            if item.status is AttackChainStatus.confirmed
+            and item.updated_at is not None
         )
         return TimeMetrics(
             time_to_first_hypothesis=_seconds(
                 state.created_at, hypotheses[0] if hypotheses else None
             ),
-            time_to_first_experiment=_seconds(state.created_at, experiments[0] if experiments else None),
-            time_to_first_candidate=_seconds(state.created_at, candidates[0] if candidates else None),
-            time_to_first_confirmed_finding=_seconds(state.created_at, confirmed[0] if confirmed else None),
-            time_to_first_confirmed_chain=_seconds(state.created_at, confirmed_chains[0] if confirmed_chains else None),
+            time_to_first_experiment=_seconds(
+                state.created_at, experiments[0] if experiments else None
+            ),
+            time_to_first_candidate=_seconds(
+                state.created_at, candidates[0] if candidates else None
+            ),
+            time_to_first_confirmed_finding=_seconds(
+                state.created_at, confirmed[0] if confirmed else None
+            ),
+            time_to_first_confirmed_chain=_seconds(
+                state.created_at, confirmed_chains[0] if confirmed_chains else None
+            ),
             time_to_completion=max(0.0, float(wall_time_seconds)),
         )
 

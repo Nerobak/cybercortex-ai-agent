@@ -11,7 +11,10 @@ from typing import Any
 
 from pydantic import Field, StrictBool
 
-from agent_core.benchmark.integrity import artifact_fingerprint, canonical_artifact_bytes
+from agent_core.benchmark.integrity import (
+    artifact_fingerprint,
+    canonical_artifact_bytes,
+)
 from agent_core.benchmark.types import (
     BenchmarkContract,
     BenchmarkGroundTruth,
@@ -23,6 +26,7 @@ from agent_core.benchmark.types import (
     ResetStrategy,
 )
 from agent_core.research.state import ResearchState
+from agent_core.research.types import ProvenanceProducerType
 
 
 class BenchmarkIsolationError(RuntimeError):
@@ -150,17 +154,51 @@ class BenchmarkBlindnessGuard:
         self._check_keys(visible, violations)
         if strict_blind:
             counts = {
+                "initial-surfaces-present": len(initial_state.surfaces),
                 "initial-endpoints-present": len(initial_state.endpoints),
                 "initial-parameters-present": len(initial_state.parameters),
+                "initial-request-templates-present": len(
+                    initial_state.request_templates
+                ),
+                "initial-graphql-operations-present": len(
+                    initial_state.graphql_operations
+                ),
+                "initial-uploads-present": len(initial_state.uploads),
+                "initial-workflows-present": len(initial_state.workflows),
+                "initial-evidence-present": len(initial_state.evidence),
+                "initial-observations-present": len(initial_state.observations),
+                "initial-facts-present": len(initial_state.facts),
+                "initial-relationships-present": len(initial_state.relationships),
                 "initial-hypotheses-present": len(initial_state.hypotheses),
                 "initial-experiments-present": len(initial_state.experiment_history)
                 + len(initial_state.experiment_outcomes),
+                "initial-reproductions-present": len(initial_state.reproduction_plans)
+                + len(initial_state.reproduction_outcomes)
+                + len(initial_state.confirmation_decisions),
                 "initial-findings-present": len(initial_state.findings),
                 "initial-chains-present": len(initial_state.chain_candidates)
                 + len(initial_state.chain_hypotheses)
-                + len(initial_state.attack_chains),
+                + len(initial_state.attack_chains)
+                + len(initial_state.chain_step_outcomes)
+                + len(initial_state.chain_evaluations)
+                + len(initial_state.chain_reproduction_plans)
+                + len(initial_state.chain_reproduction_outcomes)
+                + len(initial_state.chain_confirmation_decisions)
+                + len(initial_state.chain_budgets),
+                "initial-bootstrap-history-present": len(
+                    initial_state.bootstrap_progress
+                ),
+                "initial-diagnostics-present": len(initial_state.diagnostic_codes),
+                "initial-model-provenance-present": sum(
+                    item.producer_type is ProvenanceProducerType.model
+                    for item in initial_state.provenance
+                ),
             }
-            permitted_objects = set(controlled_setup_object_ids)
+            declared_objects = set(research_input.controlled_setup_object_references)
+            supplied_objects = set(controlled_setup_object_ids)
+            if supplied_objects and supplied_objects != declared_objects:
+                violations.add("controlled-setup-objects-not-declared")
+            permitted_objects = declared_objects
             unknown_objects = {
                 item.object_id for item in initial_state.objects
             } - permitted_objects
@@ -179,6 +217,8 @@ class BenchmarkBlindnessGuard:
             for code, values in seeds.items():
                 if values:
                     violations.add(code)
+            if model_packets:
+                violations.add("initial-model-packets-present")
             if research_graph:
                 violations.add("initial-research-graph-present")
         result = BlindnessCheckResult(
@@ -228,10 +268,15 @@ class BenchmarkContaminationDetector:
                     kind = "exact"
                 elif normalized_secret == normalized_material:
                     kind = "normalized-exact"
-                elif len(normalized_secret) >= 6 and normalized_secret in normalized_material:
+                elif (
+                    len(normalized_secret) >= 6
+                    and normalized_secret in normalized_material
+                ):
                     kind = "normalized-contained"
                 if kind is not None:
-                    matches.add((_safe_hash(normalized_secret), _safe_hash(location), kind))
+                    matches.add(
+                        (_safe_hash(normalized_secret), _safe_hash(location), kind)
+                    )
         ordered = tuple(
             ContaminationMatch(
                 material_fingerprint=material,
@@ -283,10 +328,13 @@ class BenchmarkContaminationDetector:
 
 
 class BenchmarkGroundTruthStore:
-    """Private file vault with status-gated raw truth access.
+    """Private controller vault with status-gated scoring access.
 
-    Pre-run code can request a contamination decision, but cannot obtain the
-    ground-truth object through that operation.
+    The trusted benchmark controller parses private ground truth before research
+    for integrity fingerprints and contamination decisions. Those operations do
+    not return the parsed object. Research execution components receive neither
+    the object nor this store. Raw scoring access remains status-gated until
+    research has terminated.
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -316,7 +364,9 @@ class BenchmarkGroundTruthStore:
                 self._path(reference).read_text(encoding="utf-8")
             )
         except Exception as exc:
-            raise GroundTruthAccessError("ground truth is unavailable or invalid") from exc
+            raise GroundTruthAccessError(
+                "ground truth is unavailable or invalid"
+            ) from exc
 
     def fingerprint(self, reference: str) -> str:
         return artifact_fingerprint(self._load_private(reference))
@@ -352,16 +402,22 @@ class BenchmarkSecretStore:
         try:
             return bytes(self.__values[reference])
         except KeyError as exc:
-            raise GroundTruthAccessError("benchmark secret reference is unavailable") from exc
+            raise GroundTruthAccessError(
+                "benchmark secret reference is unavailable"
+            ) from exc
 
 
 class BenchmarkResetController:
     """Execute only pre-registered fixture callbacks; never shell commands."""
 
-    def __init__(self, callbacks: Mapping[str, Callable[[], bool]] | None = None) -> None:
+    def __init__(
+        self, callbacks: Mapping[str, Callable[[], bool]] | None = None
+    ) -> None:
         self._callbacks = dict(callbacks or {})
 
-    def confirm(self, plan: BenchmarkResetPlan, *, operator_confirmed: bool = False) -> bool:
+    def confirm(
+        self, plan: BenchmarkResetPlan, *, operator_confirmed: bool = False
+    ) -> bool:
         if plan.strategy is ResetStrategy.stateless_target:
             return True
         if plan.strategy is ResetStrategy.external_operator_reset:

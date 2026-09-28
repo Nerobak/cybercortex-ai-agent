@@ -45,8 +45,8 @@ from agent_core.benchmark.types import (
     ScoringRequirementResult,
     UnexpectedFindingRecord,
 )
-from agent_core.models import ModelRouter
-from agent_core.request_budget import RequestBudget
+from agent_core.models import ModelLedgerSnapshot, ModelRouter
+from agent_core.request_budget import RequestBudget, RequestBudgetExceeded
 from agent_core.research.bootstrap import ResearchBootstrapper
 from agent_core.research.authorization import (
     ResearchAuthorizationError,
@@ -87,7 +87,9 @@ class BenchmarkExecutionBindings:
     request_budget: RequestBudget
     bootstrapper: ResearchBootstrapper
     orchestrator: SecurityResearchOrchestrator | None
-    orchestrator_factory: Callable[[ResearchState], SecurityResearchOrchestrator] | None = None
+    orchestrator_factory: (
+        Callable[[ResearchState], SecurityResearchOrchestrator] | None
+    ) = None
     synthetic_fixture: bool = False
 
     def validate(self) -> None:
@@ -104,14 +106,21 @@ class BenchmarkExecutionBindings:
                     raise BenchmarkPreflightError(
                         f"benchmark binding {name} is not the production component"
                     )
-        if getattr(self.budget_manager, "request_budget", None) is not self.request_budget:
+        if (
+            getattr(self.budget_manager, "request_budget", None)
+            is not self.request_budget
+        ):
             raise BenchmarkPreflightError("research and request budgets are not shared")
         if getattr(self.model_router, "ledger", None) is not getattr(
             self.budget_manager, "model_ledger", None
         ):
-            raise BenchmarkPreflightError("research and model accounting are not shared")
+            raise BenchmarkPreflightError(
+                "research and model accounting are not shared"
+            )
         if getattr(self.bootstrapper, "store", None) is not self.research_store:
-            raise BenchmarkPreflightError("bootstrapper uses a different research store")
+            raise BenchmarkPreflightError(
+                "bootstrapper uses a different research store"
+            )
         if (self.orchestrator is None) == (self.orchestrator_factory is None):
             raise BenchmarkPreflightError(
                 "provide exactly one orchestrator or post-bootstrap orchestrator factory"
@@ -142,7 +151,9 @@ class BenchmarkExecutionBindings:
                 "orchestrator factory did not return the production component"
             )
         if getattr(orchestrator, "store", None) is not self.research_store:
-            raise BenchmarkRunnerError("orchestrator factory changed the research store")
+            raise BenchmarkRunnerError(
+                "orchestrator factory changed the research store"
+            )
         if getattr(orchestrator, "budget_manager", None) is not self.budget_manager:
             raise BenchmarkRunnerError("orchestrator factory changed research budgets")
         return orchestrator
@@ -165,8 +176,7 @@ class BenchmarkRunStore:
 
     def _initialize(self) -> None:
         with self.connect() as connection:
-            connection.executescript(
-                """
+            connection.executescript("""
                 CREATE TABLE IF NOT EXISTS benchmark_runs (
                     run_id TEXT PRIMARY KEY,
                     benchmark_id TEXT NOT NULL,
@@ -195,8 +205,7 @@ class BenchmarkRunStore:
                     PRIMARY KEY(run_id, artifact_kind),
                     FOREIGN KEY(run_id) REFERENCES benchmark_runs(run_id)
                 );
-                """
-            )
+                """)
 
     def create(self, run: BenchmarkRun) -> None:
         payload = run.model_dump_json()
@@ -304,8 +313,7 @@ class BenchmarkRunStore:
             BenchmarkEvent.model_validate_json(row["event_json"]) for row in rows
         )
         if any(
-            event.event_hash != row["event_hash"]
-            for event, row in zip(events, rows)
+            event.event_hash != row["event_hash"] for event, row in zip(events, rows)
         ):
             raise BenchmarkRunnerError("benchmark event storage was tampered")
         return events
@@ -336,7 +344,9 @@ class BenchmarkRunStore:
             )
         return digest
 
-    def load_artifact(self, run_id: str, kind: str, model: type[BaseModel]) -> BaseModel:
+    def load_artifact(
+        self, run_id: str, kind: str, model: type[BaseModel]
+    ) -> BaseModel:
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT artifact_json, artifact_hash FROM benchmark_artifacts WHERE run_id=? AND artifact_kind=?",
@@ -381,9 +391,7 @@ class AutonomousResearchBenchmarkRunner:
         identifier = run_id or f"benchmark-run-{uuid.uuid4().hex}"
         if research_input.benchmark_run_id != identifier:
             raise BenchmarkPreflightError("research input is bound to another run")
-        scoring_policy = self.scoring_policies.get(
-            manifest.scoring_policy_reference
-        )
+        scoring_policy = self.scoring_policies.get(manifest.scoring_policy_reference)
         if scoring_policy is None:
             raise BenchmarkPreflightError("scoring policy reference is unavailable")
         run = BenchmarkRun(
@@ -436,10 +444,9 @@ class AutonomousResearchBenchmarkRunner:
         try:
             bindings.validate()
             self._validate_static(run, manifest, research_input, bindings, reset_plan)
+            self._validate_research_namespace(bindings.research_store, run.research_id)
             initial_state = bindings.research_store.load_research(run.research_id)
-            self._validate_initial_state(
-                run, manifest, research_input, initial_state
-            )
+            self._validate_initial_state(run, manifest, research_input, initial_state)
             graph = bindings.research_store.query_graph_assertions(
                 run.research_id, limit=1, include_rejected=True
             )
@@ -461,7 +468,10 @@ class AutonomousResearchBenchmarkRunner:
                 seed_chains=seed_chains,
                 research_graph=graph,
                 strict_blind=True,
-                controlled_setup_object_ids=controlled_setup_object_ids,
+                controlled_setup_object_ids=(
+                    controlled_setup_object_ids
+                    or research_input.controlled_setup_object_references
+                ),
             )
             self.run_store.append_event(
                 run.run_id, BenchmarkEventType.blindness_validated, payload=blindness
@@ -505,7 +515,9 @@ class AutonomousResearchBenchmarkRunner:
             )
             self.run_store.save(validated)
             self.run_store.save_artifact(run.run_id, "initial-state", initial_state)
-            resetting = validated.model_copy(update={"status": BenchmarkRunStatus.resetting})
+            resetting = validated.model_copy(
+                update={"status": BenchmarkRunStatus.resetting}
+            )
             self.run_store.save(resetting)
             if not self.reset_controller.confirm(
                 reset_plan, operator_confirmed=operator_reset_confirmed
@@ -515,15 +527,25 @@ class AutonomousResearchBenchmarkRunner:
             reset_graph = bindings.research_store.query_graph_assertions(
                 run.research_id, limit=1, include_rejected=True
             )
-            if (
-                artifact_fingerprint(reset_state) != artifact_fingerprint(initial_state)
-                or artifact_fingerprint(reset_graph) != artifact_fingerprint(graph)
-            ):
+            if artifact_fingerprint(reset_state) != artifact_fingerprint(
+                initial_state
+            ) or artifact_fingerprint(reset_graph) != artifact_fingerprint(graph):
                 raise BenchmarkPreflightError(
                     "reset callback modified agent-visible research material"
                 )
-            self._validate_static(
-                run, manifest, research_input, bindings, reset_plan
+            self._validate_static(run, manifest, research_input, bindings, reset_plan)
+            self._validate_research_namespace(bindings.research_store, run.research_id)
+            model_baseline = bindings.model_router.ledger.snapshot(
+                run_id=run.research_id
+            )
+            if model_baseline.usage != bindings.model_router.ledger.usage_for_run(
+                run.research_id
+            ):
+                raise BenchmarkPreflightError(
+                    "model accounting baseline is inconsistent"
+                )
+            self.run_store.save_artifact(
+                run.run_id, "model-ledger-baseline", model_baseline
             )
             self.run_store.append_event(
                 run.run_id, BenchmarkEventType.reset_confirmed, payload=reset_plan
@@ -543,7 +565,9 @@ class AutonomousResearchBenchmarkRunner:
             self.run_store.save(invalid)
             if isinstance(exc, BenchmarkPreflightError):
                 raise
-            raise BenchmarkPreflightError("benchmark pre-run validation failed") from exc
+            raise BenchmarkPreflightError(
+                "benchmark pre-run validation failed"
+            ) from exc
 
     def run(
         self,
@@ -577,7 +601,9 @@ class AutonomousResearchBenchmarkRunner:
         )
         self.run_store.save(running)
         self.run_store.append_event(
-            run.run_id, BenchmarkEventType.run_started, payload={"research_id": research_id}
+            run.run_id,
+            BenchmarkEventType.run_started,
+            payload={"research_id": research_id},
         )
         started = time.monotonic()
         try:
@@ -586,9 +612,7 @@ class AutonomousResearchBenchmarkRunner:
             state = bindings.research_store.load_research(research_id)
             prepared = bindings.bootstrapper.prepare(state)
             orchestrator = bindings.build_orchestrator(prepared)
-            result = orchestrator.run(
-                research_id, max_iterations=max_iterations
-            )
+            result = orchestrator.run(research_id, max_iterations=max_iterations)
             final_state = result.state
             elapsed = time.monotonic() - started
             self.run_store.save_artifact(run.run_id, "final-state", final_state)
@@ -605,7 +629,7 @@ class AutonomousResearchBenchmarkRunner:
                 run.run_id,
                 "runtime-metadata",
                 self._runtime_metadata(
-                    elapsed, bindings, research_id, research_input
+                    run.run_id, elapsed, bindings, research_id, research_input
                 ),
             )
             self.run_store.append_event(
@@ -620,6 +644,7 @@ class AutonomousResearchBenchmarkRunner:
                 run.run_id,
                 "runtime-metadata",
                 self._runtime_metadata(
+                    run.run_id,
                     elapsed,
                     bindings,
                     research_id,
@@ -661,15 +686,11 @@ class AutonomousResearchBenchmarkRunner:
         run = self.run_store.load(run_id)
         if run.status not in {BenchmarkRunStatus.completed, BenchmarkRunStatus.failed}:
             raise BenchmarkRunnerError("scoring requires terminated research")
-        manifest = self.run_store.load_artifact(
-            run_id, "manifest", BenchmarkManifest
-        )
+        manifest = self.run_store.load_artifact(run_id, "manifest", BenchmarkManifest)
         assert isinstance(manifest, BenchmarkManifest)
         if run.benchmark_manifest_fingerprint != artifact_fingerprint(manifest):
             raise BenchmarkRunnerError("benchmark manifest integrity failure")
-        final_state = self.run_store.load_artifact(
-            run_id, "final-state", ResearchState
-        )
+        final_state = self.run_store.load_artifact(run_id, "final-state", ResearchState)
         assert isinstance(final_state, ResearchState)
         policy = self.run_store.load_artifact(
             run_id, "scoring-policy", BenchmarkScoringPolicy
@@ -683,9 +704,13 @@ class AutonomousResearchBenchmarkRunner:
         scoring = run.model_copy(update={"status": BenchmarkRunStatus.scoring})
         self.run_store.save(scoring)
         self.run_store.append_event(
-            run_id, BenchmarkEventType.scoring_started, payload={"policy": policy.policy_id}
+            run_id,
+            BenchmarkEventType.scoring_started,
+            payload={"policy": policy.policy_id},
         )
-        # This is the first raw ground-truth access in runner lifecycle.
+        # Scoring is the first point where the runner receives the parsed truth
+        # object. The trusted controller store already parsed it privately for
+        # preflight integrity and contamination checks.
         truth = self.ground_truth_store.load_for_scoring(
             manifest.ground_truth_reference, run_status=scoring.status
         )
@@ -741,23 +766,33 @@ class AutonomousResearchBenchmarkRunner:
         )
         return score
 
-    @staticmethod
     def _runtime_metadata(
+        self,
+        benchmark_run_id: str,
         elapsed: float,
         bindings: BenchmarkExecutionBindings,
         research_id: str,
         research_input: BenchmarkResearchInput,
         failure: Exception | None = None,
     ) -> BenchmarkRuntimeMetadata:
+        baseline = self.run_store.load_artifact(
+            benchmark_run_id, "model-ledger-baseline", ModelLedgerSnapshot
+        )
+        assert isinstance(baseline, ModelLedgerSnapshot)
+        final = bindings.model_router.ledger.snapshot(run_id=research_id)
+        usage = bindings.model_router.ledger.delta(baseline, final)
         records = tuple(
             item
             for item in bindings.model_router.ledger.records
-            if item.run_id == research_id
+            if baseline.position <= item.sequence < final.position
+            and item.run_id == research_id
         )
         return BenchmarkRuntimeMetadata(
             wall_time_seconds=elapsed,
             request_snapshot=bindings.request_budget.snapshot(),
-            model_usage=bindings.model_router.ledger.usage_for_run(research_id),
+            model_ledger_baseline=baseline,
+            model_ledger_final=final,
+            model_usage=usage,
             model_provider=research_input.model_routing_policy.provider,
             requested_model=research_input.model_routing_policy.requested_model,
             actual_model_provenance=tuple(
@@ -788,6 +823,8 @@ class AutonomousResearchBenchmarkRunner:
             return SafetyMetrics(unauthorized_execution_attempts=1)
         if isinstance(failure, SecretMaterialRejected):
             return SafetyMetrics(secret_boundary_rejections=1)
+        if isinstance(failure, RequestBudgetExceeded):
+            return SafetyMetrics(budget_violations=1)
         if isinstance(failure, ResearchAuthorizationError):
             return SafetyMetrics(
                 scope_violations=int(
@@ -799,6 +836,13 @@ class AutonomousResearchBenchmarkRunner:
                         ResearchAuthorizationErrorCode.authorization_blocked,
                         ResearchAuthorizationErrorCode.context_mismatch,
                         ResearchAuthorizationErrorCode.primitive_unavailable,
+                    }
+                ),
+                budget_violations=int(
+                    failure.code
+                    in {
+                        ResearchAuthorizationErrorCode.budget_exhausted,
+                        ResearchAuthorizationErrorCode.cleanup_reserve_unavailable,
                     }
                 ),
                 unauthorized_execution_attempts=int(
@@ -876,8 +920,7 @@ class AutonomousResearchBenchmarkRunner:
             manifest.scoring_policy_reference
         )
         if configured_scoring is None or (
-            run.scoring_policy_fingerprint
-            != artifact_fingerprint(configured_scoring)
+            run.scoring_policy_fingerprint != artifact_fingerprint(configured_scoring)
         ):
             raise BenchmarkPreflightError("scoring policy changed after run creation")
         if research_input.authorized_target != manifest.authorized_target_reference:
@@ -886,6 +929,12 @@ class AutonomousResearchBenchmarkRunner:
             raise BenchmarkPreflightError("scope differs from manifest")
         if research_input.policy_reference != manifest.policy_reference:
             raise BenchmarkPreflightError("policy differs from manifest")
+        if research_input.controlled_setup_object_references != (
+            manifest.controlled_setup_object_references
+        ):
+            raise BenchmarkPreflightError(
+                "controlled setup objects differ from manifest"
+            )
         expected_budgets = (
             manifest.request_budget,
             manifest.model_budget,
@@ -905,7 +954,9 @@ class AutonomousResearchBenchmarkRunner:
         if actual_budgets != expected_budgets:
             raise BenchmarkPreflightError("research budgets differ from manifest")
         if bindings.request_budget.limit != manifest.request_budget:
-            raise BenchmarkPreflightError("request ledger ceiling differs from manifest")
+            raise BenchmarkPreflightError(
+                "request ledger ceiling differs from manifest"
+            )
         if bindings.request_budget.total != 0:
             raise BenchmarkPreflightError("request accounting is not fresh")
         usage = bindings.model_router.ledger.usage_for_run(run.research_id)
@@ -936,8 +987,13 @@ class AutonomousResearchBenchmarkRunner:
         decision = policy.authorize_url(research_input.authorized_target, method="GET")
         if not decision.allowed:
             raise BenchmarkPreflightError("target authorization failed")
-        if getattr(policy, "authorization_reference", None) != manifest.policy_reference:
-            raise BenchmarkPreflightError("authorization reference differs from manifest")
+        if (
+            getattr(policy, "authorization_reference", None)
+            != manifest.policy_reference
+        ):
+            raise BenchmarkPreflightError(
+                "authorization reference differs from manifest"
+            )
         if manifest.allowed_state_change_class in {
             AllowedStateChangeClass.none,
             AllowedStateChangeClass.read_only,
@@ -956,7 +1012,8 @@ class AutonomousResearchBenchmarkRunner:
             preferred = routing.preferred
             if (
                 preferred.provider != research_input.model_routing_policy.provider
-                or preferred.model != research_input.model_routing_policy.requested_model
+                or preferred.model
+                != research_input.model_routing_policy.requested_model
                 or artifact_fingerprint(routing.safe_summary())
                 != research_input.model_routing_policy.configuration_fingerprint
             ):
@@ -965,13 +1022,13 @@ class AutonomousResearchBenchmarkRunner:
                 )
         controlled = getattr(bindings.bootstrapper, "controlled_context", None)
         accounts = tuple(getattr(controlled, "accounts", ()))
-        account_references = {
-            str(getattr(item, "account_id", "")) for item in accounts
-        }
+        account_references = {str(getattr(item, "account_id", "")) for item in accounts}
         if set(research_input.controlled_identity_metadata_references) != (
             account_references
         ):
-            raise BenchmarkPreflightError("controlled identity references are unavailable")
+            raise BenchmarkPreflightError(
+                "controlled identity references are unavailable"
+            )
         credential_references = {
             str(reference)
             for account in accounts
@@ -982,7 +1039,9 @@ class AutonomousResearchBenchmarkRunner:
             if reference
         }
         if set(research_input.opaque_credential_references) != credential_references:
-            raise BenchmarkPreflightError("credential references differ from controlled setup")
+            raise BenchmarkPreflightError(
+                "credential references differ from controlled setup"
+            )
 
     @staticmethod
     def _validate_initial_state(
@@ -994,7 +1053,9 @@ class AutonomousResearchBenchmarkRunner:
         if state.research_id != run.research_id:
             raise BenchmarkPreflightError("research state ID differs from run")
         if state.status is not ResearchRunStatus.initializing:
-            raise BenchmarkPreflightError("blind benchmark requires a new research state")
+            raise BenchmarkPreflightError(
+                "blind benchmark requires a new research state"
+            )
         if len(state.targets) != 1:
             raise BenchmarkPreflightError("benchmark requires exactly one target")
         target = state.targets[0]
@@ -1003,7 +1064,9 @@ class AutonomousResearchBenchmarkRunner:
             or target.target_class is not manifest.target_class
             or target.scope_reference != manifest.scope_reference
         ):
-            raise BenchmarkPreflightError("registered target differs from benchmark input")
+            raise BenchmarkPreflightError(
+                "registered target differs from benchmark input"
+            )
         state_accounts = {item.account_reference for item in state.identities}
         if state_accounts and state_accounts != set(
             research_input.controlled_identity_metadata_references
@@ -1039,6 +1102,49 @@ class AutonomousResearchBenchmarkRunner:
                 raise BenchmarkPreflightError(
                     "research state budget ceilings differ from manifest"
                 )
+
+    @staticmethod
+    def _validate_research_namespace(store: ResearchStore, research_id: str) -> None:
+        """Prove the database is a fresh, run-exclusive research namespace."""
+
+        with store.connect() as connection:
+            runs = tuple(
+                (row["research_id"], int(row["current_revision"]))
+                for row in connection.execute(
+                    "SELECT research_id,current_revision FROM research_runs "
+                    "ORDER BY research_id"
+                )
+            )
+            revisions = tuple(
+                (row["research_id"], int(row["revision"]))
+                for row in connection.execute(
+                    "SELECT research_id,revision FROM research_revisions "
+                    "ORDER BY research_id,revision"
+                )
+            )
+            event_count = int(
+                connection.execute("SELECT COUNT(*) FROM research_events").fetchone()[0]
+            )
+            assertion_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM research_graph_assertions"
+                ).fetchone()[0]
+            )
+            import_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM research_phase2_imports"
+                ).fetchone()[0]
+            )
+        if (
+            runs != ((research_id, 0),)
+            or revisions != ((research_id, 0),)
+            or event_count
+            or assertion_count
+            or import_count
+        ):
+            raise BenchmarkPreflightError(
+                "strict blind benchmark requires a fresh isolated research database"
+            )
 
     @staticmethod
     def _code_revision() -> str:

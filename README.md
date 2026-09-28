@@ -417,6 +417,7 @@ archive/
 - [Installation Guide](docs/INSTALL.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security Tools](docs/TOOLS.md)
+- [Blind Benchmark Framework](docs/BENCHMARKS.md)
 - [Project Roadmap](docs/ROADMAP.md)
 
 ---

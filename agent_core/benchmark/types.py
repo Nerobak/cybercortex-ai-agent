@@ -25,7 +25,7 @@ from pydantic import (
 )
 
 from agent_core.result_normalizer import sanitize_document_text
-from agent_core.models import ModelUsageDelta
+from agent_core.models import ModelLedgerSnapshot, ModelUsageDelta
 from agent_core.research.types import TargetClass
 
 
@@ -37,9 +37,13 @@ def _public(value: str) -> str:
 
 Identifier = Annotated[
     StrictStr,
-    Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$"),
+    Field(
+        min_length=1, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$"
+    ),
 ]
 Digest = Annotated[StrictStr, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+
+
 def _timestamp(value: str) -> str:
     candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
@@ -201,6 +205,9 @@ class BenchmarkManifest(BenchmarkContract):
     controlled_account_metadata_references: tuple[Identifier, ...] = Field(
         default=(), max_length=100
     )
+    controlled_setup_object_references: tuple[Identifier, ...] = Field(
+        default=(), max_length=100
+    )
     policy_reference: Identifier
     request_budget: StrictInt = Field(ge=1, le=10_000_000)
     model_budget: StrictInt = Field(ge=0, le=1_000_000)
@@ -217,7 +224,11 @@ class BenchmarkManifest(BenchmarkContract):
 
     @model_validator(mode="after")
     def canonicalize(self) -> "BenchmarkManifest":
-        for name in ("controlled_account_metadata_references", "benchmark_tags"):
+        for name in (
+            "controlled_account_metadata_references",
+            "controlled_setup_object_references",
+            "benchmark_tags",
+        ):
             values = getattr(self, name)
             if len(values) != len(set(values)):
                 raise ValueError(f"{name} must not contain duplicates")
@@ -245,6 +256,9 @@ class BenchmarkResearchInput(BenchmarkContract):
     controlled_identity_metadata_references: tuple[Identifier, ...] = Field(
         default=(), max_length=100
     )
+    controlled_setup_object_references: tuple[Identifier, ...] = Field(
+        default=(), max_length=100
+    )
     opaque_credential_references: tuple[Identifier, ...] = Field(
         default=(), max_length=100
     )
@@ -260,6 +274,7 @@ class BenchmarkResearchInput(BenchmarkContract):
     def canonicalize(self) -> "BenchmarkResearchInput":
         for name in (
             "controlled_identity_metadata_references",
+            "controlled_setup_object_references",
             "opaque_credential_references",
         ):
             values = getattr(self, name)
@@ -306,9 +321,7 @@ class GroundTruthFinding(BenchmarkContract):
     )
     notes_safe_for_post_run_scoring_only: PublicText | None = Field(
         default=None,
-        validation_alias=AliasChoices(
-            "notes_safe_for_post_run_scoring_only", "notes"
-        ),
+        validation_alias=AliasChoices("notes_safe_for_post_run_scoring_only", "notes"),
     )
 
 
@@ -333,9 +346,10 @@ class GroundTruthChain(BenchmarkContract):
             set(self.component_ground_truth_ids)
         ):
             raise ValueError("ground-truth chain components must be unique")
-        if len(self.ordered_relationship_classes) != len(
-            self.component_ground_truth_ids
-        ) - 1:
+        if (
+            len(self.ordered_relationship_classes)
+            != len(self.component_ground_truth_ids) - 1
+        ):
             raise ValueError("a chain requires one relationship between each component")
         return self
 
@@ -363,8 +377,16 @@ class BenchmarkGroundTruth(BenchmarkContract):
         }
         if unknown:
             raise ValueError("ground-truth chains contain unknown findings")
-        object.__setattr__(self, "findings", tuple(sorted(self.findings, key=lambda x: x.ground_truth_id)))
-        object.__setattr__(self, "chains", tuple(sorted(self.chains, key=lambda x: x.chain_ground_truth_id)))
+        object.__setattr__(
+            self,
+            "findings",
+            tuple(sorted(self.findings, key=lambda x: x.ground_truth_id)),
+        )
+        object.__setattr__(
+            self,
+            "chains",
+            tuple(sorted(self.chains, key=lambda x: x.chain_ground_truth_id)),
+        )
         return self
 
 
@@ -408,7 +430,9 @@ class BenchmarkObservedChain(BenchmarkContract):
     chain_id: Identifier
     status: Identifier
     component_finding_ids: tuple[Identifier, ...] = Field(min_length=2, max_length=20)
-    ordered_relationship_classes: tuple[Identifier, ...] = Field(default=(), max_length=19)
+    ordered_relationship_classes: tuple[Identifier, ...] = Field(
+        default=(), max_length=19
+    )
     surface_classes: tuple[Identifier, ...] = Field(default=(), max_length=20)
     combined_security_property: PublicText | None = None
     combined_impact: PublicText | None = None
@@ -456,8 +480,11 @@ class BenchmarkScoringPolicy(BenchmarkContract):
     maximum_wall_time_seconds: StrictFloat | None = Field(default=None, ge=0.0)
     zero_scope_violations: StrictBool = True
     zero_policy_violations: StrictBool = True
+    zero_budget_violations: StrictBool = True
     zero_unauthorized_execution: StrictBool = True
     zero_secret_leakage: StrictBool = True
+    zero_cleanup_failures: StrictBool = False
+    zero_alternate_transport_attempts: StrictBool = True
     required_chain_recall: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     score_profile: ScoreProfile = ScoreProfile.balanced
     unexpected_findings_are_false_positives: StrictBool = False
@@ -708,16 +735,12 @@ class BenchmarkRun(BenchmarkContract):
             BenchmarkRunStatus.completed,
             BenchmarkRunStatus.scoring,
             BenchmarkRunStatus.scored,
-        } and (
-            self.final_state_fingerprint is None or self.result_reference is None
-        ):
+        } and (self.final_state_fingerprint is None or self.result_reference is None):
             raise ValueError("completed benchmark status requires a final result")
         if self.status is BenchmarkRunStatus.scored and self.scoring_reference is None:
             raise ValueError("scored benchmark status requires a scoring reference")
         if self.start_timestamp is not None and self.end_timestamp is not None:
-            start = datetime.fromisoformat(
-                self.start_timestamp.replace("Z", "+00:00")
-            )
+            start = datetime.fromisoformat(self.start_timestamp.replace("Z", "+00:00"))
             end = datetime.fromisoformat(self.end_timestamp.replace("Z", "+00:00"))
             if end < start:
                 raise ValueError("benchmark end timestamp precedes its start")
@@ -736,7 +759,9 @@ class BenchmarkEvent(BenchmarkContract):
     event_type: BenchmarkEventType
     occurred_at: Timestamp
     previous_event_hash: Digest | None = None
-    research_event_references: tuple[Identifier, ...] = Field(default=(), max_length=100)
+    research_event_references: tuple[Identifier, ...] = Field(
+        default=(), max_length=100
+    )
     payload_fingerprint: Digest | None = None
     event_hash: Digest
 
@@ -760,6 +785,8 @@ class ReproducibilityMetadata(BenchmarkContract):
 class BenchmarkRuntimeMetadata(BenchmarkContract):
     wall_time_seconds: StrictFloat = Field(ge=0.0)
     request_snapshot: dict[Identifier, StrictInt]
+    model_ledger_baseline: ModelLedgerSnapshot
+    model_ledger_final: ModelLedgerSnapshot
     model_usage: ModelUsageDelta
     model_provider: Identifier
     requested_model: Identifier
@@ -820,6 +847,11 @@ class BenchmarkMetricDelta(BenchmarkContract):
     safety_events: StrictInt
 
 
+class UnknownCostBehavior(str, Enum):
+    fail = "fail"
+    ignore = "ignore"
+
+
 class BenchmarkComparison(BenchmarkContract):
     benchmark_id: Identifier
     benchmark_version: Identifier
@@ -834,6 +866,20 @@ class BenchmarkRegressionTolerances(BenchmarkContract):
     request_increase: StrictInt = Field(default=0, ge=0)
     model_call_increase: StrictInt = Field(default=0, ge=0)
     chain_recall_decrease: StrictFloat = Field(default=0.0, ge=0.0, le=1.0)
+    maximum_absolute_estimated_cost_increase_usd: StrictFloat | None = Field(
+        default=0.0, ge=0.0
+    )
+    maximum_relative_estimated_cost_increase: StrictFloat | None = Field(
+        default=None, ge=0.0
+    )
+    unknown_cost_behavior: UnknownCostBehavior = UnknownCostBehavior.fail
+    scope_violation_increase: StrictInt = Field(default=0, ge=0)
+    policy_violation_increase: StrictInt = Field(default=0, ge=0)
+    budget_violation_increase: StrictInt = Field(default=0, ge=0)
+    unauthorized_execution_attempt_increase: StrictInt = Field(default=0, ge=0)
+    secret_boundary_rejection_increase: StrictInt = Field(default=0, ge=0)
+    cleanup_failure_increase: StrictInt = Field(default=0, ge=0)
+    alternate_transport_attempt_increase: StrictInt = Field(default=0, ge=0)
 
 
 class BenchmarkRegressionResult(BenchmarkContract):
@@ -869,17 +915,47 @@ class BenchmarkSuite(BenchmarkContract):
         selected = self.manifests
         if tags:
             wanted = set(tags)
-            selected = tuple(m for m in selected if wanted.intersection(m.benchmark_tags))
-        return tuple(sorted(selected, key=lambda item: (item.benchmark_id, item.benchmark_version)))
+            selected = tuple(
+                m for m in selected if wanted.intersection(m.benchmark_tags)
+            )
+        return tuple(
+            sorted(
+                selected, key=lambda item: (item.benchmark_id, item.benchmark_version)
+            )
+        )
 
 
-__all__ = [name for name in tuple(globals()) if name.startswith("Benchmark") or name in {
-    "AllowedStateChangeClass", "ResetStrategy", "IntegrityStatus",
-    "FindingMatchClassification", "UnexpectedFindingStatus", "ScoreProfile",
-    "ScoreComponentWeights",
-    "GroundTruthFinding", "GroundTruthChain", "FindingEquivalenceRules",
-    "FindingMatch", "FindingMatchDimensions", "ChainMatch", "DiscoveryMetrics",
-    "ConfirmationMetrics", "HypothesisMetrics", "ExperimentMetrics", "PivotMetrics",
-    "ChainMetrics", "ResourceMetrics", "TimeMetrics", "SafetyMetrics",
-    "ReproducibilityMetadata", "UnexpectedFindingRecord", "ScoringRequirementResult",
-}]
+__all__ = [
+    name
+    for name in tuple(globals())
+    if name.startswith("Benchmark")
+    or name
+    in {
+        "AllowedStateChangeClass",
+        "ResetStrategy",
+        "IntegrityStatus",
+        "FindingMatchClassification",
+        "UnexpectedFindingStatus",
+        "ScoreProfile",
+        "UnknownCostBehavior",
+        "ScoreComponentWeights",
+        "GroundTruthFinding",
+        "GroundTruthChain",
+        "FindingEquivalenceRules",
+        "FindingMatch",
+        "FindingMatchDimensions",
+        "ChainMatch",
+        "DiscoveryMetrics",
+        "ConfirmationMetrics",
+        "HypothesisMetrics",
+        "ExperimentMetrics",
+        "PivotMetrics",
+        "ChainMetrics",
+        "ResourceMetrics",
+        "TimeMetrics",
+        "SafetyMetrics",
+        "ReproducibilityMetadata",
+        "UnexpectedFindingRecord",
+        "ScoringRequirementResult",
+    }
+]

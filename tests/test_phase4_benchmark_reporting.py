@@ -10,7 +10,13 @@ from agent_core.benchmark import (
     IntegrityStatus,
     ScoreProfile,
 )
-from tests.phase4_benchmark_helpers import DIGEST, empty_state, manifest, scoring_policy, truth
+from tests.phase4_benchmark_helpers import (
+    DIGEST,
+    empty_state,
+    manifest,
+    scoring_policy,
+    truth,
+)
 
 
 def test_json_report_has_stable_order_and_human_summary_is_credential_free():

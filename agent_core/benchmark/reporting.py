@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent_core.benchmark.integrity import BenchmarkIntegrityVerifier, artifact_fingerprint
+from agent_core.benchmark.integrity import (
+    BenchmarkIntegrityVerifier,
+    artifact_fingerprint,
+)
 from agent_core.benchmark.types import (
     BenchmarkGroundTruth,
     BenchmarkManifest,
@@ -164,9 +167,7 @@ class BenchmarkReporter:
             allow_nan=False,
         )
 
-    def export_json(
-        self, report: BenchmarkReport, destination: str | Path
-    ) -> Path:
+    def export_json(self, report: BenchmarkReport, destination: str | Path) -> Path:
         path = Path(destination)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.to_json(report) + "\n", encoding="utf-8")

@@ -1,8 +1,8 @@
 """Operator CLI for blind autonomous-security research benchmarks.
 
-Execution wiring is supplied by an explicit ``module:function`` factory.  The
-factory must return ``(BenchmarkResearchInput, BenchmarkExecutionBindings,
-BenchmarkResetPlan)`` and therefore cannot receive private ground truth.
+Execution wiring is supplied by an explicit trusted ``module:function`` factory.
+The factory must return ``(BenchmarkResearchInput, BenchmarkExecutionBindings,
+BenchmarkResetPlan)``. It runs in-process and is not a security sandbox.
 """
 
 from __future__ import annotations
@@ -50,7 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="Run one benchmark using production wiring")
     run.add_argument("--manifest", required=True)
-    run.add_argument("--factory", required=True, help="module:function execution factory")
+    run.add_argument(
+        "--factory",
+        required=True,
+        help="trusted operator execution factory (module:function; not sandboxed)",
+    )
     run.add_argument("--run-store", required=True)
     run.add_argument("--ground-truth-store", required=True)
     run.add_argument("--scoring-policy", required=True)
@@ -170,7 +174,9 @@ def _execute_run(args: argparse.Namespace) -> dict[str, Any]:
         "research_id": run.research_id,
         "status": run.status.value,
         "target_requests": bindings.request_budget.total,
-        "model_calls": bindings.model_router.ledger.usage_for_run(run.research_id).attempted_calls,
+        "model_calls": bindings.model_router.ledger.usage_for_run(
+            run.research_id
+        ).attempted_calls,
     }
 
 

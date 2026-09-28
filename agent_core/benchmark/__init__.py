@@ -32,6 +32,7 @@ from agent_core.benchmark.metrics import (
 )
 from agent_core.benchmark.fixtures import (
     SyntheticBenchmarkFixture,
+    SyntheticReproductionResult,
     synthetic_benchmark_fixtures,
 )
 from agent_core.benchmark.reporting import BenchmarkReporter
@@ -87,6 +88,7 @@ __all__ = [
     "FindingMatcher",
     "GroundTruthAccessError",
     "SyntheticBenchmarkFixture",
+    "SyntheticReproductionResult",
     "artifact_fingerprint",
     "build_research_input",
     "calculate_benchmark_metrics",

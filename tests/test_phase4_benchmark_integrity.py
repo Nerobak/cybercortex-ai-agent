@@ -20,6 +20,4 @@ def test_canonical_hash_is_stable_and_tampering_is_detected():
         score_report={"passed": False},
     )
     assert verifier.verify(report, manifest=manifest())
-    assert not verifier.verify(
-        report, manifest=manifest(title="Tampered benchmark")
-    )
+    assert not verifier.verify(report, manifest=manifest(title="Tampered benchmark"))

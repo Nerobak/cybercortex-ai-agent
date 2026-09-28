@@ -24,7 +24,11 @@ def _plain(value: Any) -> Any:
         return {str(key): _plain(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         values = [_plain(item) for item in value]
-        return sorted(values, key=lambda item: json.dumps(item, sort_keys=True)) if isinstance(value, (set, frozenset)) else values
+        return (
+            sorted(values, key=lambda item: json.dumps(item, sort_keys=True))
+            if isinstance(value, (set, frozenset))
+            else values
+        )
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise TypeError(f"unsupported benchmark artifact type: {type(value).__name__}")
@@ -69,7 +73,9 @@ class BenchmarkIntegrityVerifier:
         }
         expected = expected_fingerprints or values
         mismatches = tuple(
-            sorted(name for name, digest in values.items() if expected.get(name) != digest)
+            sorted(
+                name for name, digest in values.items() if expected.get(name) != digest
+            )
         )
         return BenchmarkIntegrityReport(
             run_id=run_id,

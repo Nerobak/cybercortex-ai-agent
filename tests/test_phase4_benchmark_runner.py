@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import inspect
 import json
 
 import pytest
@@ -13,22 +14,31 @@ from agent_core.benchmark import (
     BenchmarkEventType,
     BenchmarkGroundTruthStore,
     BenchmarkResetPlan,
+    BenchmarkReporter,
+    BenchmarkRuntimeMetadata,
     BenchmarkRun,
     BenchmarkRunStatus,
     BenchmarkRunStore,
     BenchmarkScoringPolicy,
     IntegrityStatus,
     ResetStrategy,
+    SafetyMetrics,
 )
-from agent_core.models import ModelUsageDelta
+from agent_core.models import ModelCallLedger, ModelErrorCode, ModelRouter
 from agent_core.research import (
+    PublicSafeCandidatePacket,
+    PublicSafeChainPacket,
     ProvenanceProducerType,
+    ResearchBootstrapper,
+    ResearchEvidencePacket,
+    ResearchGraphRepository,
     ProvenanceRecord,
     ResearchRunStatus,
     ResearchState,
     ResearchStore,
     TargetAsset,
     TargetClass,
+    SecurityResearchOrchestrator,
 )
 from tests.phase4_benchmark_helpers import (
     DIGEST,
@@ -76,13 +86,6 @@ def test_artifact_hash_is_verified_on_load(tmp_path):
     digest = store.save_artifact("run-1", "run", run_record())
     assert digest.startswith("sha256:")
     assert store.load_artifact("run-1", "run", BenchmarkRun) == run_record()
-
-
-class _Ledger:
-    records = ()
-
-    def usage_for_run(self, _run_id):
-        return ModelUsageDelta()
 
 
 class _RequestBudget:
@@ -141,14 +144,19 @@ class _Orchestrator:
 class _TrackingTruthStore(BenchmarkGroundTruthStore):
     def __init__(self, root):
         super().__init__(root)
+        self.controller_private_loads = 0
         self.scoring_loads = 0
+
+    def _load_private(self, reference):
+        self.controller_private_loads += 1
+        return super()._load_private(reference)
 
     def load_for_scoring(self, reference, *, run_status):
         self.scoring_loads += 1
         return super().load_for_scoring(reference, run_status=run_status)
 
 
-def _bindings(tmp_path):
+def _bindings(tmp_path, *, ledger=None):
     research_store = ResearchStore(tmp_path / "research.sqlite3")
     provenance = ProvenanceRecord(
         provenance_id="provenance-1",
@@ -177,10 +185,8 @@ def _bindings(tmp_path):
         )
     )
     request_budget = _RequestBudget()
-    ledger = _Ledger()
-    budget_manager = SimpleNamespace(
-        request_budget=request_budget, model_ledger=ledger
-    )
+    ledger = ledger or ModelCallLedger()
+    budget_manager = SimpleNamespace(request_budget=request_budget, model_ledger=ledger)
     bootstrapper = _Bootstrapper(research_store)
     orchestrator = _Orchestrator(research_store, budget_manager)
     bindings = BenchmarkExecutionBindings(
@@ -195,13 +201,51 @@ def _bindings(tmp_path):
     return bindings, bootstrapper, orchestrator
 
 
+def test_run_scoped_model_baseline_excludes_unrelated_prior_usage(tmp_path):
+    ledger = ModelCallLedger()
+    ledger.record_pre_call_failure(
+        provider="fixture-provider",
+        model="fixture-model",
+        latency_seconds=0.0,
+        task_type="unrelated-task",
+        run_id="unrelated-research",
+        hypothesis_id=None,
+        fallback_depth=0,
+        outcome=ModelErrorCode.configuration_error,
+    )
+    private = _TrackingTruthStore(tmp_path / "truth")
+    private.put("truth-1", truth())
+    bindings, _, _ = _bindings(tmp_path, ledger=ledger)
+    framework = _framework(tmp_path, private)
+    public = research_input(persistence_location=str(bindings.research_store.database))
+
+    framework.run(
+        manifest(),
+        public,
+        bindings,
+        BenchmarkResetPlan(
+            strategy=ResetStrategy.stateless_target,
+            reset_reference="stateless-reset-1",
+        ),
+        research_id="research-1",
+        run_id="run-1",
+    )
+    runtime = framework.run_store.load_artifact(
+        "run-1", "runtime-metadata", BenchmarkRuntimeMetadata
+    )
+    assert isinstance(runtime, BenchmarkRuntimeMetadata)
+    assert runtime.model_ledger_baseline.position == 1
+    assert runtime.model_ledger_final.position == 1
+    assert runtime.model_usage.attempted_calls == 0
+    assert runtime.model_usage.estimated_cost_usd == 0.0
+    assert framework.score_run("run-1").metrics.resources.model_calls == 0
+
+
 def _framework(tmp_path, ground_truth_store):
     return AutonomousResearchBenchmarkRunner(
         run_store=BenchmarkRunStore(tmp_path / "runs.sqlite3"),
         ground_truth_store=ground_truth_store,
-        scoring_policies={
-            "scoring-1": BenchmarkScoringPolicy(policy_id="scoring-1")
-        },
+        scoring_policies={"scoring-1": BenchmarkScoringPolicy(policy_id="scoring-1")},
     )
 
 
@@ -210,9 +254,7 @@ def test_contamination_blocks_before_research_or_model_activity(tmp_path):
     private.put("truth-1", truth())
     bindings, bootstrapper, orchestrator = _bindings(tmp_path)
     framework = _framework(tmp_path, private)
-    public = research_input(
-        persistence_location=str(bindings.research_store.database)
-    )
+    public = research_input(persistence_location=str(bindings.research_store.database))
     with pytest.raises(BenchmarkContaminationError):
         framework.run(
             manifest(),
@@ -233,14 +275,14 @@ def test_contamination_blocks_before_research_or_model_activity(tmp_path):
     assert private.scoring_loads == 0
 
 
-def test_ground_truth_load_occurs_only_after_research_termination(tmp_path):
+def test_controller_preflight_parse_is_private_and_scoring_load_is_terminated(
+    tmp_path,
+):
     private = _TrackingTruthStore(tmp_path / "truth")
     private.put("truth-1", truth())
     bindings, bootstrapper, orchestrator = _bindings(tmp_path)
     framework = _framework(tmp_path, private)
-    public = research_input(
-        persistence_location=str(bindings.research_store.database)
-    )
+    public = research_input(persistence_location=str(bindings.research_store.database))
     completed = framework.run(
         manifest(),
         public,
@@ -254,11 +296,116 @@ def test_ground_truth_load_occurs_only_after_research_termination(tmp_path):
     )
     assert completed.status is BenchmarkRunStatus.completed
     assert private.scoring_loads == 0
+    assert private.controller_private_loads > 0
     framework.score_run("run-1")
     assert private.scoring_loads == 1
     assert bootstrapper.calls == 1
     assert orchestrator.calls == 1
-    assert all("hidden-sentinel-4f9c" not in item for item in bootstrapper.visible_states)
+    assert all(
+        "hidden-sentinel-4f9c" not in item for item in bootstrapper.visible_states
+    )
     assert "hidden-sentinel-4f9c" not in json.dumps(
         [item.model_dump(mode="json") for item in framework.run_store.events("run-1")]
     )
+    research_material = json.dumps(
+        {
+            "bootstrapper": bootstrapper.visible_states,
+            "research_store": bindings.research_store.load_research(
+                "research-1"
+            ).model_dump(mode="json"),
+            "model_records": [
+                item.model_dump(mode="json")
+                for item in bindings.model_router.ledger.records
+            ],
+        },
+        sort_keys=True,
+    )
+    assert "hidden-sentinel-4f9c" not in research_material
+    assert "truth-1" not in research_material
+
+
+def test_research_component_contracts_have_no_ground_truth_channel():
+    for contract in (
+        ResearchState,
+        ResearchEvidencePacket,
+        PublicSafeCandidatePacket,
+        PublicSafeChainPacket,
+    ):
+        assert not any(
+            "ground_truth" in field_name or "scoring_answer" in field_name
+            for field_name in contract.model_fields
+        )
+
+    for component in (
+        ResearchBootstrapper,
+        SecurityResearchOrchestrator,
+        ResearchStore,
+        ResearchGraphRepository,
+        ModelRouter,
+    ):
+        parameters = inspect.signature(component.__init__).parameters
+        assert not any(
+            "ground_truth" in name or "scoring_answer" in name for name in parameters
+        )
+
+
+def test_complete_strict_blind_benchmark_pipeline_is_offline_and_deterministic(
+    tmp_path,
+):
+    private = _TrackingTruthStore(tmp_path / "truth")
+    private.put("truth-1", truth())
+    bindings, bootstrapper, orchestrator = _bindings(tmp_path)
+    framework = _framework(tmp_path, private)
+    benchmark_manifest = manifest()
+    public = research_input(persistence_location=str(bindings.research_store.database))
+
+    completed = framework.run(
+        benchmark_manifest,
+        public,
+        bindings,
+        BenchmarkResetPlan(
+            strategy=ResetStrategy.stateless_target,
+            reset_reference="stateless-reset-1",
+        ),
+        research_id="research-1",
+        run_id="run-1",
+    )
+    assert completed.status is BenchmarkRunStatus.completed
+    assert bootstrapper.calls == orchestrator.calls == 1
+    assert bindings.request_budget.total == 0
+    assert bindings.model_router.ledger.usage_for_run("research-1").attempted_calls == 0
+
+    score = framework.score_run("run-1", safety=SafetyMetrics(budget_violations=1))
+    assert not score.passed
+    assert any(
+        item.requirement == "zero-budget-violations" and not item.passed
+        for item in score.requirements
+    )
+
+    scored_run = framework.run_store.load("run-1")
+    initial = framework.run_store.load_artifact("run-1", "initial-state", ResearchState)
+    final = framework.run_store.load_artifact("run-1", "final-state", ResearchState)
+    runtime = framework.run_store.load_artifact(
+        "run-1", "runtime-metadata", BenchmarkRuntimeMetadata
+    )
+    policy = BenchmarkScoringPolicy(policy_id="scoring-1")
+    report = BenchmarkReporter().build(
+        run=scored_run,
+        manifest=benchmark_manifest,
+        ground_truth=truth(),
+        scoring_policy=policy,
+        score=score,
+        initial_state=initial,
+        final_state=final,
+        research_input=public,
+        model_provider=runtime.model_provider,
+        requested_model=runtime.requested_model,
+        actual_model_provenance=runtime.actual_model_provenance,
+        policy_fingerprint=runtime.policy_fingerprint,
+        generated_at=NOW,
+    )
+    assert report.integrity.valid
+    assert "zero-budget-violations" in BenchmarkReporter.to_json(report)
+    framework.run_store.save_artifact("run-1", "report", report)
+    verified = framework.record_integrity("run-1", report.integrity)
+    assert verified.integrity_status is IntegrityStatus.verified
