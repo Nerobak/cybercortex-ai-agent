@@ -91,7 +91,12 @@ IdentityId = OpaqueIdentifier
 SessionRefId = OpaqueIdentifier
 TokenRefId = OpaqueIdentifier
 ResearchObjectId = OpaqueIdentifier
+GraphQLSurfaceId = OpaqueIdentifier
+GraphQLTypeId = OpaqueIdentifier
+GraphQLFieldId = OpaqueIdentifier
+GraphQLArgumentId = OpaqueIdentifier
 GraphQLOperationId = OpaqueIdentifier
+GraphQLVariableId = OpaqueIdentifier
 UploadArtifactId = OpaqueIdentifier
 WorkflowId = OpaqueIdentifier
 ObservationId = OpaqueIdentifier
@@ -327,6 +332,19 @@ class EvidenceKind(str, Enum):
     schema = "schema"
     differential = "differential"
     imported = "imported"
+    graphql_introspection = "graphql_introspection"
+    graphql_introspection_result = "graphql_introspection_result"
+    graphql_request_capture = "graphql_request_capture"
+    graphql_response_capture = "graphql_response_capture"
+    captured_graphql_request = "captured_graphql_request"
+    captured_graphql_response = "captured_graphql_response"
+    graphql_document = "graphql_document"
+    browser_capture = "browser_capture"
+    deterministic_discovery = "deterministic_discovery"
+    deterministic_discovery_observation = "deterministic_discovery_observation"
+    controlled_account_observation = "controlled_account_observation"
+    cross_surface_reference = "cross_surface_reference"
+    openapi_rest_cross_reference = "openapi_rest_cross_reference"
 
 
 class ExperimentRuntimeStatus(str, Enum):
@@ -404,7 +422,12 @@ class EntityKind(str, Enum):
     session = "session"
     token = "token"
     object = "object"
+    graphql_surface = "graphql_surface"
+    graphql_type = "graphql_type"
+    graphql_field = "graphql_field"
+    graphql_argument = "graphql_argument"
     graphql_operation = "graphql_operation"
+    graphql_variable = "graphql_variable"
     upload = "upload"
     workflow = "workflow"
     observation = "observation"
@@ -459,6 +482,22 @@ class ResearchPredicate(str, Enum):
     chain_refuted_by = "CHAIN_REFUTED_BY"
     chain_reproduced_by = "CHAIN_REPRODUCED_BY"
     chain_confirmed_by = "CHAIN_CONFIRMED_BY"
+    # P4-1A GraphQL semantic topology. Assertions using these predicates are
+    # still evidence-backed research graph claims, never executable queries.
+    graphql_has_type = "GRAPHQL_HAS_TYPE"
+    graphql_has_field = "GRAPHQL_HAS_FIELD"
+    graphql_has_argument = "GRAPHQL_HAS_ARGUMENT"
+    graphql_has_operation = "GRAPHQL_HAS_OPERATION"
+    graphql_has_variable = "GRAPHQL_HAS_VARIABLE"
+    graphql_returns_type = "GRAPHQL_RETURNS_TYPE"
+    graphql_references_type = "GRAPHQL_REFERENCES_TYPE"
+    graphql_implements_interface = "GRAPHQL_IMPLEMENTS_INTERFACE"
+    graphql_possible_type = "GRAPHQL_POSSIBLE_TYPE"
+    graphql_selects_field = "GRAPHQL_SELECTS_FIELD"
+    graphql_operation_uses_argument = "GRAPHQL_OPERATION_USES_ARGUMENT"
+    graphql_variable_binds_argument = "GRAPHQL_VARIABLE_BINDS_ARGUMENT"
+    graphql_references_object = "GRAPHQL_REFERENCES_OBJECT"
+    graphql_modifies_object = "GRAPHQL_MODIFIES_OBJECT"
 
 
 class MetadataEntry(ResearchContract):

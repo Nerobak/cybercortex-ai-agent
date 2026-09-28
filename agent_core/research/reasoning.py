@@ -505,7 +505,7 @@ class PublicSafeResearchPacketBuilder:
                     "evidence_references": list(item.evidence_references),
                 }
                 for item in state.graphql_operations
-                if item.endpoint_id in endpoint_ids
+                if hasattr(item, "endpoint_id") and item.endpoint_id in endpoint_ids
             ),
             workflows=tuple(
                 {

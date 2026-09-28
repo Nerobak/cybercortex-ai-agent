@@ -51,6 +51,8 @@ SECURITY_CRITICAL_RELATIONS = frozenset(
         ResearchPredicate.crosses_identity_boundary,
         ResearchPredicate.crosses_tenant_boundary,
         ResearchPredicate.produces_context_for,
+        ResearchPredicate.graphql_references_object,
+        ResearchPredicate.graphql_modifies_object,
     }
 )
 
@@ -98,6 +100,20 @@ for _chain_relation_name in (
     "chain_refuted_by",
     "chain_reproduced_by",
     "chain_confirmed_by",
+    "graphql_has_type",
+    "graphql_has_field",
+    "graphql_has_argument",
+    "graphql_has_operation",
+    "graphql_has_variable",
+    "graphql_returns_type",
+    "graphql_references_type",
+    "graphql_implements_interface",
+    "graphql_possible_type",
+    "graphql_selects_field",
+    "graphql_operation_uses_argument",
+    "graphql_variable_binds_argument",
+    "graphql_references_object",
+    "graphql_modifies_object",
 ):
     setattr(
         GraphRelation,
@@ -191,6 +207,83 @@ class GraphAssertion(ResearchContract):
             raise ValueError("only a superseded assertion may name its replacement")
         if self.superseded_by_assertion_id == self.assertion_id:
             raise ValueError("a graph assertion cannot supersede itself")
+        graphql_shapes = {
+            ResearchPredicate.graphql_has_type: (
+                EntityKind.graphql_surface,
+                EntityKind.graphql_type,
+            ),
+            ResearchPredicate.graphql_has_field: (
+                EntityKind.graphql_type,
+                EntityKind.graphql_field,
+            ),
+            ResearchPredicate.graphql_has_argument: (
+                EntityKind.graphql_field,
+                EntityKind.graphql_argument,
+            ),
+            ResearchPredicate.graphql_has_operation: (
+                EntityKind.graphql_surface,
+                EntityKind.graphql_operation,
+            ),
+            ResearchPredicate.graphql_has_variable: (
+                EntityKind.graphql_operation,
+                EntityKind.graphql_variable,
+            ),
+            ResearchPredicate.graphql_returns_type: (
+                EntityKind.graphql_field,
+                EntityKind.graphql_type,
+            ),
+            ResearchPredicate.graphql_implements_interface: (
+                EntityKind.graphql_type,
+                EntityKind.graphql_type,
+            ),
+            ResearchPredicate.graphql_possible_type: (
+                EntityKind.graphql_type,
+                EntityKind.graphql_type,
+            ),
+            ResearchPredicate.graphql_selects_field: (
+                EntityKind.graphql_operation,
+                EntityKind.graphql_field,
+            ),
+            ResearchPredicate.graphql_operation_uses_argument: (
+                EntityKind.graphql_operation,
+                EntityKind.graphql_argument,
+            ),
+            ResearchPredicate.graphql_variable_binds_argument: (
+                EntityKind.graphql_variable,
+                EntityKind.graphql_argument,
+            ),
+        }
+        expected_shape = graphql_shapes.get(self.relation)
+        if (
+            expected_shape is not None
+            and (
+                self.source.entity_kind,
+                self.target.entity_kind,
+            )
+            != expected_shape
+        ):
+            raise ValueError("GraphQL graph relation has incompatible entity kinds")
+        if self.relation is ResearchPredicate.graphql_references_type and (
+            self.source.entity_kind
+            not in {EntityKind.graphql_field, EntityKind.graphql_argument}
+            or self.target.entity_kind is not EntityKind.graphql_type
+        ):
+            raise ValueError(
+                "GraphQL type reference relation has incompatible entities"
+            )
+        if self.relation in {
+            ResearchPredicate.graphql_references_object,
+            ResearchPredicate.graphql_modifies_object,
+        } and (
+            self.source.entity_kind
+            not in {
+                EntityKind.graphql_field,
+                EntityKind.graphql_argument,
+                EntityKind.graphql_operation,
+            }
+            or self.target.entity_kind is not EntityKind.object
+        ):
+            raise ValueError("GraphQL object relation has incompatible entity kinds")
         return self
 
 
@@ -544,7 +637,9 @@ class ResearchGraphRepository:
         operations.update(
             operation.operation_id
             for operation in state.graphql_operations
-            if parameter_ids.intersection(operation.variable_parameter_ids)
+            if parameter_ids.intersection(
+                getattr(operation, "variable_parameter_ids", ())
+            )
         )
         return tuple(sorted(operations)[:bounded_limit])
 

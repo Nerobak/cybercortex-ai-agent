@@ -1447,7 +1447,11 @@ class _StateIndexes:
 
     def operation(self, value: str):
         return self._required(
-            self.state.graphql_operations,
+            tuple(
+                item
+                for item in self.state.graphql_operations
+                if hasattr(item, "endpoint_id")
+            ),
             "operation_id",
             value,
             CompilerErrorCode.unknown_operation,

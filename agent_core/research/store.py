@@ -407,8 +407,19 @@ class ResearchStore:
             EntityKind.session: {item.session_ref_id for item in state.session_refs},
             EntityKind.token: {item.token_ref_id for item in state.token_refs},
             EntityKind.object: {item.object_id for item in state.objects},
+            EntityKind.graphql_surface: {
+                item.graphql_surface_id for item in state.graphql_surfaces
+            },
+            EntityKind.graphql_type: {item.type_id for item in state.graphql_types},
+            EntityKind.graphql_field: {item.field_id for item in state.graphql_fields},
+            EntityKind.graphql_argument: {
+                item.argument_id for item in state.graphql_arguments
+            },
             EntityKind.graphql_operation: {
                 item.operation_id for item in state.graphql_operations
+            },
+            EntityKind.graphql_variable: {
+                item.variable_id for item in state.graphql_variables
             },
             EntityKind.upload: {item.upload_id for item in state.uploads},
             EntityKind.workflow: {item.workflow_id for item in state.workflows},

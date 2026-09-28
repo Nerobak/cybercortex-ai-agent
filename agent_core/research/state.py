@@ -19,6 +19,25 @@ from pydantic import (
 from agent_core.models import ModelUsageDelta
 from agent_core.phase2_result_status import Phase2ResultStatus
 from agent_core.request_budget import RequestDelta
+from agent_core.research.graphql import (
+    MAX_GRAPHQL_ARGUMENTS_PER_FIELD,
+    MAX_GRAPHQL_ARGUMENTS,
+    MAX_GRAPHQL_FIELDS,
+    MAX_GRAPHQL_FIELDS_PER_TYPE,
+    MAX_GRAPHQL_OPERATIONS,
+    MAX_GRAPHQL_SURFACES,
+    MAX_GRAPHQL_TYPES_PER_SURFACE,
+    MAX_GRAPHQL_TYPES,
+    MAX_GRAPHQL_VARIABLES_PER_OPERATION,
+    MAX_GRAPHQL_VARIABLES,
+    GraphQLArgumentRecord,
+    GraphQLFieldRecord,
+    GraphQLOperationRecord,
+    GraphQLSurface,
+    GraphQLTypeKind,
+    GraphQLTypeRecord,
+    GraphQLVariableRecord,
+)
 from agent_core.research.primitives import PrimitiveStepProposal
 from agent_core.research.chains import (
     AttackChainCandidate,
@@ -1576,8 +1595,23 @@ class ResearchState(ResearchContract):
     session_refs: tuple[SessionRef, ...] = Field(default=(), max_length=1_000)
     token_refs: tuple[TokenRef, ...] = Field(default=(), max_length=1_000)
     objects: tuple[ResearchObject, ...] = Field(default=(), max_length=5_000)
-    graphql_operations: tuple[GraphQLOperation, ...] = Field(
-        default=(), max_length=5_000
+    graphql_surfaces: tuple[GraphQLSurface, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_SURFACES
+    )
+    graphql_types: tuple[GraphQLTypeRecord, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_TYPES
+    )
+    graphql_fields: tuple[GraphQLFieldRecord, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_FIELDS
+    )
+    graphql_arguments: tuple[GraphQLArgumentRecord, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_ARGUMENTS
+    )
+    graphql_operations: tuple[GraphQLOperation | GraphQLOperationRecord, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_OPERATIONS
+    )
+    graphql_variables: tuple[GraphQLVariableRecord, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_VARIABLES
     )
     uploads: tuple[UploadArtifact, ...] = Field(default=(), max_length=2_000)
     workflows: tuple[Workflow, ...] = Field(default=(), max_length=2_000)
@@ -1644,7 +1678,12 @@ class ResearchState(ResearchContract):
             ("session_refs", "session_ref_id"),
             ("token_refs", "token_ref_id"),
             ("objects", "object_id"),
+            ("graphql_surfaces", "graphql_surface_id"),
+            ("graphql_types", "type_id"),
+            ("graphql_fields", "field_id"),
+            ("graphql_arguments", "argument_id"),
             ("graphql_operations", "operation_id"),
+            ("graphql_variables", "variable_id"),
             ("uploads", "upload_id"),
             ("workflows", "workflow_id"),
             ("observations", "observation_id"),
@@ -1719,6 +1758,18 @@ class ResearchState(ResearchContract):
         }
         observation_ids = {item.observation_id for item in self.observations}
         provenance_ids = {item.provenance_id for item in self.provenance}
+        graphql_surface_ids = {
+            item.graphql_surface_id for item in self.graphql_surfaces
+        }
+        graphql_type_ids = {item.type_id for item in self.graphql_types}
+        graphql_field_ids = {item.field_id for item in self.graphql_fields}
+        graphql_argument_ids = {item.argument_id for item in self.graphql_arguments}
+        graphql_semantic_operation_ids = {
+            item.operation_id
+            for item in self.graphql_operations
+            if isinstance(item, GraphQLOperationRecord)
+        }
+        graphql_variable_ids = {item.variable_id for item in self.graphql_variables}
 
         for item in self.provenance:
             _require_optional_reference(
@@ -1814,16 +1865,388 @@ class ResearchState(ResearchContract):
                 item.parameter_references, parameter_ids, "object parameters"
             )
             _require_reference(item.provenance_id, provenance_ids, "object provenance")
-        for item in self.graphql_operations:
-            _require_reference(item.surface_id, surface_ids, "GraphQL surface")
+
+        graphql_surface_by_id = {
+            item.graphql_surface_id: item for item in self.graphql_surfaces
+        }
+        surface_by_id = {item.surface_id: item for item in self.surfaces}
+        endpoint_by_id = {item.endpoint_id: item for item in self.endpoints}
+        types_by_id = {item.type_id: item for item in self.graphql_types}
+        fields_by_id = {item.field_id: item for item in self.graphql_fields}
+        arguments_by_id = {item.argument_id: item for item in self.graphql_arguments}
+        variables_by_id = {item.variable_id: item for item in self.graphql_variables}
+        type_by_surface_name: dict[tuple[str, str], GraphQLTypeRecord] = {}
+        root_roles: set[tuple[str, str]] = set()
+
+        for item in self.graphql_surfaces:
+            if item.research_id != self.research_id:
+                raise ValueError("GraphQL surface research_id mismatch")
+            _require_reference(item.target_id, target_ids, "GraphQL surface target")
+            _require_reference(item.surface_id, surface_ids, "GraphQL base surface")
             _require_reference(item.endpoint_id, endpoint_ids, "GraphQL endpoint")
+            surface = surface_by_id[item.surface_id]
+            endpoint = endpoint_by_id[item.endpoint_id]
+            if surface.target_id != item.target_id:
+                raise ValueError("GraphQL surface target does not match base surface")
+            if surface.surface_type is not SurfaceType.graphql:
+                raise ValueError(
+                    "GraphQL semantic surface requires a GraphQL base surface"
+                )
+            if (
+                endpoint.target_id != item.target_id
+                or endpoint.surface_id != item.surface_id
+            ):
+                raise ValueError("GraphQL endpoint does not match its semantic surface")
             _require_references(
-                item.variable_parameter_ids, parameter_ids, "GraphQL variables"
+                item.evidence_references, evidence_ids, "GraphQL surface evidence"
             )
+            _require_reference(
+                item.provenance_id, provenance_ids, "GraphQL surface provenance"
+            )
+
+        type_counts: dict[str, int] = {}
+        for item in self.graphql_types:
+            _require_reference(
+                item.graphql_surface_id,
+                graphql_surface_ids,
+                "GraphQL type surface",
+            )
+            type_counts[item.graphql_surface_id] = (
+                type_counts.get(item.graphql_surface_id, 0) + 1
+            )
+            if type_counts[item.graphql_surface_id] > MAX_GRAPHQL_TYPES_PER_SURFACE:
+                raise ValueError("GraphQL type-per-surface limit exceeded")
+            name_key = (item.graphql_surface_id, item.name)
+            if name_key in type_by_surface_name:
+                raise ValueError("duplicate GraphQL type name within a surface")
+            type_by_surface_name[name_key] = item
+            if item.root_role is not None:
+                root_key = (item.graphql_surface_id, item.root_role.value)
+                if root_key in root_roles:
+                    raise ValueError("duplicate GraphQL root role within a surface")
+                root_roles.add(root_key)
+            _require_references(
+                item.field_ids, graphql_field_ids, "GraphQL type fields"
+            )
+            _require_references(
+                item.possible_type_ids,
+                graphql_type_ids,
+                "GraphQL possible types",
+            )
+            _require_references(
+                item.interface_ids, graphql_type_ids, "GraphQL interfaces"
+            )
+            for field_id in item.field_ids:
+                if fields_by_id[field_id].type_id != item.type_id:
+                    raise ValueError(
+                        "GraphQL type contains a field owned by another type"
+                    )
+            for possible_id in item.possible_type_ids:
+                possible = types_by_id[possible_id]
+                if (
+                    possible.graphql_surface_id != item.graphql_surface_id
+                    or possible.kind is not GraphQLTypeKind.object
+                ):
+                    raise ValueError(
+                        "GraphQL possible type must be an object on the same surface"
+                    )
+            for interface_id in item.interface_ids:
+                interface = types_by_id[interface_id]
+                if (
+                    interface.graphql_surface_id != item.graphql_surface_id
+                    or interface.kind is not GraphQLTypeKind.interface
+                ):
+                    raise ValueError("GraphQL interface must exist on the same surface")
+            _require_references(
+                item.evidence_references, evidence_ids, "GraphQL type evidence"
+            )
+            _require_reference(
+                item.provenance_id, provenance_ids, "GraphQL type provenance"
+            )
+
+        field_counts: dict[str, int] = {}
+        for item in self.graphql_fields:
+            _require_reference(item.type_id, graphql_type_ids, "GraphQL field type")
+            field_counts[item.type_id] = field_counts.get(item.type_id, 0) + 1
+            if field_counts[item.type_id] > MAX_GRAPHQL_FIELDS_PER_TYPE:
+                raise ValueError("GraphQL field-per-type limit exceeded")
+            owner = types_by_id[item.type_id]
+            _require_references(
+                item.argument_ids, graphql_argument_ids, "GraphQL field arguments"
+            )
+            for argument_id in item.argument_ids:
+                if arguments_by_id[argument_id].field_id != item.field_id:
+                    raise ValueError(
+                        "GraphQL field contains an argument owned by another field"
+                    )
+            return_key = (owner.graphql_surface_id, item.return_type.named_type)
+            if (
+                return_key not in type_by_surface_name
+                and not item.return_type.unresolved_external
+            ):
+                raise ValueError(
+                    f"dangling GraphQL return type reference: {item.return_type.named_type}"
+                )
+            for hint in item.relationship_hints:
+                _require_optional_reference(
+                    hint.graphql_type_id,
+                    graphql_type_ids,
+                    "GraphQL relationship type",
+                )
+                if hint.graphql_type_id is not None and (
+                    types_by_id[hint.graphql_type_id].graphql_surface_id
+                    != owner.graphql_surface_id
+                ):
+                    raise ValueError(
+                        "GraphQL relationship type crosses semantic surfaces"
+                    )
+                _require_optional_reference(
+                    hint.research_object_id,
+                    {value.object_id for value in self.objects},
+                    "GraphQL relationship object",
+                )
+                if hint.research_object_id is not None:
+                    related_object = next(
+                        value
+                        for value in self.objects
+                        if value.object_id == hint.research_object_id
+                    )
+                    semantic_surface = graphql_surface_by_id[owner.graphql_surface_id]
+                    if related_object.target_id != semantic_surface.target_id:
+                        raise ValueError(
+                            "GraphQL relationship object belongs to another target"
+                        )
+                _require_references(
+                    hint.evidence_references,
+                    evidence_ids,
+                    "GraphQL relationship evidence",
+                )
+            auth = item.authorization_semantics
+            _require_references(
+                auth.identity_references,
+                identity_ids,
+                "GraphQL authorization identities",
+            )
+            _require_references(
+                auth.evidence_references,
+                evidence_ids,
+                "GraphQL authorization evidence",
+            )
+            _require_reference(
+                auth.provenance_id,
+                provenance_ids,
+                "GraphQL authorization provenance",
+            )
+            _require_references(
+                item.evidence_references, evidence_ids, "GraphQL field evidence"
+            )
+            _require_reference(
+                item.provenance_id, provenance_ids, "GraphQL field provenance"
+            )
+
+        argument_counts: dict[str, int] = {}
+        for item in self.graphql_arguments:
+            _require_reference(
+                item.field_id, graphql_field_ids, "GraphQL argument field"
+            )
+            argument_counts[item.field_id] = argument_counts.get(item.field_id, 0) + 1
+            if argument_counts[item.field_id] > MAX_GRAPHQL_ARGUMENTS_PER_FIELD:
+                raise ValueError("GraphQL argument-per-field limit exceeded")
+            field = fields_by_id[item.field_id]
+            owner = types_by_id[field.type_id]
+            input_key = (owner.graphql_surface_id, item.input_type.named_type)
+            if (
+                input_key not in type_by_surface_name
+                and not item.input_type.unresolved_external
+            ):
+                raise ValueError(
+                    f"dangling GraphQL input type reference: {item.input_type.named_type}"
+                )
+            _require_references(
+                item.semantic_role_evidence_references,
+                evidence_ids,
+                "GraphQL argument semantic-role evidence",
+            )
+            semantics = item.object_reference_semantics
+            _require_optional_reference(
+                semantics.graphql_type_id,
+                graphql_type_ids,
+                "GraphQL argument object type",
+            )
+            if semantics.graphql_type_id is not None and (
+                types_by_id[semantics.graphql_type_id].graphql_surface_id
+                != owner.graphql_surface_id
+            ):
+                raise ValueError(
+                    "GraphQL argument object type crosses semantic surfaces"
+                )
+            _require_optional_reference(
+                semantics.research_object_id,
+                {value.object_id for value in self.objects},
+                "GraphQL argument research object",
+            )
+            if semantics.research_object_id is not None:
+                related_object = next(
+                    value
+                    for value in self.objects
+                    if value.object_id == semantics.research_object_id
+                )
+                semantic_surface = graphql_surface_by_id[owner.graphql_surface_id]
+                if related_object.target_id != semantic_surface.target_id:
+                    raise ValueError(
+                        "GraphQL argument object belongs to another target"
+                    )
+            _require_optional_reference(
+                item.parameter_id, parameter_ids, "GraphQL argument parameter"
+            )
+            if item.parameter_id is not None:
+                parameter = next(
+                    value
+                    for value in self.parameters
+                    if value.parameter_id == item.parameter_id
+                )
+                parameter_endpoint = endpoint_by_id[parameter.endpoint_id]
+                semantic_surface = graphql_surface_by_id[owner.graphql_surface_id]
+                if parameter_endpoint.target_id != semantic_surface.target_id:
+                    raise ValueError(
+                        "GraphQL argument parameter belongs to another target"
+                    )
+            _require_references(
+                item.evidence_references, evidence_ids, "GraphQL argument evidence"
+            )
+            _require_reference(
+                item.provenance_id, provenance_ids, "GraphQL argument provenance"
+            )
+
+        for item in self.graphql_operations:
+            if isinstance(item, GraphQLOperationRecord):
+                _require_reference(
+                    item.graphql_surface_id,
+                    graphql_surface_ids,
+                    "GraphQL operation surface",
+                )
+                semantic_surface = graphql_surface_by_id[item.graphql_surface_id]
+                _require_references(
+                    item.root_field_ids,
+                    graphql_field_ids,
+                    "GraphQL operation root fields",
+                )
+                for field_id in item.root_field_ids:
+                    root_field = fields_by_id[field_id]
+                    root_type = types_by_id[root_field.type_id]
+                    if (
+                        root_type.graphql_surface_id != item.graphql_surface_id
+                        or root_type.root_role is None
+                        or root_type.root_role.value != item.operation_type.value
+                    ):
+                        raise ValueError(
+                            "GraphQL operation field is not on its matching root type"
+                        )
+                _require_references(
+                    item.variable_ids,
+                    graphql_variable_ids,
+                    "GraphQL operation variables",
+                )
+                for variable_id in item.variable_ids:
+                    if variables_by_id[variable_id].operation_id != item.operation_id:
+                        raise ValueError(
+                            "GraphQL operation contains a variable owned by another operation"
+                        )
+                _require_optional_reference(
+                    item.workflow_id,
+                    {value.workflow_id for value in self.workflows},
+                    "GraphQL operation workflow",
+                )
+                if item.operation_type not in semantic_surface.operation_capabilities:
+                    raise ValueError(
+                        "GraphQL operation type is absent from surface capabilities"
+                    )
+            else:
+                _require_reference(item.surface_id, surface_ids, "GraphQL surface")
+                _require_reference(item.endpoint_id, endpoint_ids, "GraphQL endpoint")
+                _require_references(
+                    item.variable_parameter_ids, parameter_ids, "GraphQL variables"
+                )
             _require_references(
                 item.evidence_references, evidence_ids, "GraphQL evidence"
             )
             _require_reference(item.provenance_id, provenance_ids, "GraphQL provenance")
+
+        variable_counts: dict[str, int] = {}
+        for item in self.graphql_variables:
+            _require_reference(
+                item.operation_id,
+                graphql_semantic_operation_ids,
+                "GraphQL variable operation",
+            )
+            variable_counts[item.operation_id] = (
+                variable_counts.get(item.operation_id, 0) + 1
+            )
+            if variable_counts[item.operation_id] > MAX_GRAPHQL_VARIABLES_PER_OPERATION:
+                raise ValueError("GraphQL variable-per-operation limit exceeded")
+            _require_optional_reference(
+                item.linked_argument_id,
+                graphql_argument_ids,
+                "GraphQL variable argument",
+            )
+            if item.linked_argument_id is not None:
+                argument = arguments_by_id[item.linked_argument_id]
+                if item.input_type != argument.input_type:
+                    raise ValueError(
+                        "GraphQL variable and linked argument types differ"
+                    )
+            _require_references(
+                item.semantic_role_evidence_references,
+                evidence_ids,
+                "GraphQL variable semantic-role evidence",
+            )
+            _require_references(
+                item.evidence_references, evidence_ids, "GraphQL variable evidence"
+            )
+            _require_reference(
+                item.provenance_id, provenance_ids, "GraphQL variable provenance"
+            )
+
+        evidence_by_id = {item.evidence_id: item for item in self.evidence}
+        provenance_by_id = {item.provenance_id: item for item in self.provenance}
+
+        def require_non_model_evidence(
+            references: tuple[str, ...], description: str
+        ) -> None:
+            producers = {
+                provenance_by_id[evidence_by_id[reference].provenance_id].producer_type
+                for reference in references
+                if reference in evidence_by_id
+                and evidence_by_id[reference].provenance_id in provenance_by_id
+            }
+            if producers and producers == {ProvenanceProducerType.model}:
+                raise ValueError(f"{description} cannot rely on model-only evidence")
+
+        semantic_records = (
+            *self.graphql_surfaces,
+            *self.graphql_types,
+            *self.graphql_fields,
+            *self.graphql_arguments,
+            *(
+                item
+                for item in self.graphql_operations
+                if isinstance(item, GraphQLOperationRecord)
+            ),
+            *self.graphql_variables,
+        )
+        for item in semantic_records:
+            require_non_model_evidence(
+                item.evidence_references, "GraphQL semantic record"
+            )
+        for item in self.graphql_fields:
+            require_non_model_evidence(
+                item.authorization_semantics.evidence_references,
+                "GraphQL authorization semantics",
+            )
+            for hint in item.relationship_hints:
+                require_non_model_evidence(
+                    hint.evidence_references, "GraphQL relationship semantics"
+                )
         for item in self.uploads:
             _require_reference(item.surface_id, surface_ids, "upload surface")
             _require_reference(item.endpoint_id, endpoint_ids, "upload endpoint")
@@ -2331,8 +2754,19 @@ def _entity_ids(state: ResearchState) -> dict[EntityKind, set[str]]:
         EntityKind.session: {item.session_ref_id for item in state.session_refs},
         EntityKind.token: {item.token_ref_id for item in state.token_refs},
         EntityKind.object: {item.object_id for item in state.objects},
+        EntityKind.graphql_surface: {
+            item.graphql_surface_id for item in state.graphql_surfaces
+        },
+        EntityKind.graphql_type: {item.type_id for item in state.graphql_types},
+        EntityKind.graphql_field: {item.field_id for item in state.graphql_fields},
+        EntityKind.graphql_argument: {
+            item.argument_id for item in state.graphql_arguments
+        },
         EntityKind.graphql_operation: {
             item.operation_id for item in state.graphql_operations
+        },
+        EntityKind.graphql_variable: {
+            item.variable_id for item in state.graphql_variables
         },
         EntityKind.upload: {item.upload_id for item in state.uploads},
         EntityKind.workflow: {item.workflow_id for item in state.workflows},
