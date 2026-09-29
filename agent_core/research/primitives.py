@@ -10,12 +10,15 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import Field, StrictBool, StrictInt, model_validator
 
+from agent_core.research.graphql import GraphQLCandidateKind, GraphQLVariableBinding
 from agent_core.research.types import (
     EndpointId,
     EvidenceArtifactId,
+    GraphQLArgumentId,
     GraphQLOperationId,
+    GraphQLVariableId,
     IdentityId,
     OpaqueIdentifier,
     ParameterId,
@@ -54,6 +57,7 @@ class IdentityRelationship(str, Enum):
     same_tenant_different_account = "same_tenant_different_account"
     different_controlled_tenant = "different_controlled_tenant"
     user_admin = "user_admin"
+    different_controlled_role = "different_controlled_role"
     owner_non_owner = "owner_non_owner"
     same_identity = "same_identity"
 
@@ -291,15 +295,69 @@ class StateDifferentialInput(ResearchContract):
 class GraphQLOperationInput(ResearchContract):
     primitive: Literal["graphql_operation"] = "graphql_operation"
     operation_id: GraphQLOperationId
+    operation_template_id: OpaqueIdentifier | None = None
+    candidate_kind: GraphQLCandidateKind | None = None
     identity_id: IdentityId | None = None
+    identity_role: Literal["primary", "comparison"] = "primary"
+    anonymous: StrictBool = False
+    variable_bindings: tuple[GraphQLVariableBinding, ...] = Field(
+        default=(), max_length=64
+    )
+    selected_field_ids: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=64)
+
+    @model_validator(mode="after")
+    def validate_identity_mode(self) -> "GraphQLOperationInput":
+        if self.anonymous and self.identity_id is not None:
+            raise ValueError("anonymous GraphQL operation cannot bind an identity")
+        if self.anonymous and self.identity_role != "primary":
+            raise ValueError("anonymous GraphQL comparison has no identity role")
+        pairs = tuple(
+            (item.variable_id, item.argument_id) for item in self.variable_bindings
+        )
+        if len(pairs) != len(set(pairs)):
+            raise ValueError("GraphQL operation variable bindings must be unique")
+        if len(self.selected_field_ids) != len(set(self.selected_field_ids)):
+            raise ValueError("GraphQL selected fields must be unique")
+        return self
 
 
 class GraphQLVariableMutationInput(ResearchContract):
     primitive: Literal["graphql_variable_mutation"] = "graphql_variable_mutation"
     operation_id: GraphQLOperationId
-    parameter_id: ParameterId
+    operation_template_id: OpaqueIdentifier | None = None
+    candidate_kind: GraphQLCandidateKind | None = None
+    parameter_id: ParameterId | None = None
+    variable_id: GraphQLVariableId | None = None
+    argument_id: GraphQLArgumentId | None = None
     mutation_kind: MutationKind
     value_source_reference: OpaqueIdentifier | None = None
+    safe_mutation_id: OpaqueIdentifier | None = None
+    binding: GraphQLVariableBinding | None = None
+
+    @model_validator(mode="after")
+    def validate_registered_mutation(self) -> "GraphQLVariableMutationInput":
+        typed = (
+            self.operation_template_id,
+            self.candidate_kind,
+            self.variable_id,
+            self.argument_id,
+            self.safe_mutation_id,
+            self.binding,
+        )
+        if self.parameter_id is None and any(item is None for item in typed):
+            raise ValueError(
+                "GraphQL variable mutation requires a legacy parameter or a fully "
+                "registered typed mutation"
+            )
+        if self.parameter_id is not None and any(item is not None for item in typed):
+            raise ValueError("GraphQL variable mutation modes cannot be mixed")
+        if self.binding is not None and (
+            self.binding.variable_id != self.variable_id
+            or self.binding.argument_id != self.argument_id
+            or self.binding.value_reference != self.value_source_reference
+        ):
+            raise ValueError("GraphQL variable mutation binding is inconsistent")
+        return self
 
 
 class TokenMutationInput(ResearchContract):

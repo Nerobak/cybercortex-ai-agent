@@ -1238,6 +1238,16 @@ class GraphQLHypothesisGenerator:
                             entity_id=field.field_id,
                         ),
                         *(
+                            (
+                                EntityReference(
+                                    entity_kind=EntityKind.graphql_operation,
+                                    entity_id=operation_by_field[field.field_id],
+                                ),
+                            )
+                            if field.field_id in operation_by_field
+                            else ()
+                        ),
+                        *(
                             EntityReference(
                                 entity_kind=EntityKind.identity,
                                 entity_id=identity_id,
@@ -1304,7 +1314,26 @@ class GraphQLHypothesisGenerator:
                 if owner_type is not None
                 else None
             )
-            if semantic_surface is None:
+            parent_operation = next(
+                (
+                    operation
+                    for operation in state.graphql_operations
+                    if isinstance(operation, GraphQLOperationRecord)
+                    and operation.graphql_surface_id
+                    == getattr(owner_type, "graphql_surface_id", None)
+                    and any(
+                        root_field_id == field.field_id
+                        or (
+                            (root_field := fields.get(root_field_id)) is not None
+                            and owner_type is not None
+                            and root_field.return_type.named_type == owner_type.name
+                        )
+                        for root_field_id in operation.root_field_ids
+                    )
+                ),
+                None,
+            )
+            if semantic_surface is None or parent_operation is None:
                 continue
             for parent_id in sorted(parent_ids):
                 for child_id in sorted(child_ids):
@@ -1372,6 +1401,10 @@ class GraphQLHypothesisGenerator:
                                     entity_id=field.field_id,
                                 ),
                                 EntityReference(
+                                    entity_kind=EntityKind.graphql_operation,
+                                    entity_id=parent_operation.operation_id,
+                                ),
+                                EntityReference(
                                     entity_kind=EntityKind.object,
                                     entity_id=parent_id,
                                 ),
@@ -1392,6 +1425,7 @@ class GraphQLHypothesisGenerator:
                             object_relationship_key=tuple(
                                 sorted((parent_id, child_id))
                             ),
+                            operation_id=parent_operation.operation_id,
                         )
                     )
                 if len(output) >= MAX_GRAPHQL_HYPOTHESIS_CANDIDATES:

@@ -231,6 +231,194 @@ class GraphQLStateChangeClass(str, Enum):
     state_change_observed = "state_change_observed"
 
 
+class GraphQLExperimentStateChangeClass(str, Enum):
+    """Compiler-owned effect class for a registered operation template."""
+
+    read_only = "read_only"
+    reversible_state_change = "reversible_state_change"
+    irreversible_or_disallowed = "irreversible_or_disallowed"
+
+
+class GraphQLVariableValueSource(str, Enum):
+    """Closed set of reference-only value sources accepted by P4-1D."""
+
+    controlled_object = "controlled_object"
+    controlled_identity = "controlled_identity"
+    registered_safe_constant = "registered_safe_constant"
+    registered_pagination_bound = "registered_pagination_bound"
+    registered_workflow_value = "registered_workflow_value"
+    opaque_controlled_value = "opaque_controlled_value"
+
+
+class GraphQLSafeMutationClass(str, Enum):
+    """Bounded non-injection mutation families registered by deterministic code."""
+
+    nullable_omission = "nullable_omission"
+    scalar_type_boundary = "scalar_type_boundary"
+    pagination_boundary = "pagination_boundary"
+    registered_alternative = "registered_alternative"
+
+
+class GraphQLCandidateKind(str, Enum):
+    object_authorization = "object_authorization"
+    authentication = "authentication"
+    field_authorization = "field_authorization"
+    role_bound = "role_bound"
+    tenant_bound = "tenant_bound"
+    ownership = "ownership"
+    mutation_authorization = "mutation_authorization"
+    cross_surface = "cross_surface"
+    nested_resolver = "nested_resolver"
+    input_validation = "input_validation"
+    workflow_mutation = "workflow_mutation"
+
+
+class GraphQLArgumentBinding(ResearchContract):
+    argument_id: GraphQLArgumentId
+    variable_id: GraphQLVariableId
+
+
+class GraphQLVariableBinding(ResearchContract):
+    """A typed reference to a controlled value; never the value itself."""
+
+    variable_id: GraphQLVariableId
+    argument_id: GraphQLArgumentId
+    value_source: GraphQLVariableValueSource
+    value_reference: OpaqueIdentifier
+
+    @field_validator("value_reference")
+    @classmethod
+    def reject_credential_material(cls, value: str) -> str:
+        from agent_core.research.provenance import reject_secret_material
+
+        reject_secret_material(value, location="GraphQL variable binding")
+        return value
+
+
+class GraphQLSelectionPath(ResearchContract):
+    """One registered, non-recursive path through known GraphQL fields."""
+
+    field_ids: tuple[GraphQLFieldId, ...] = Field(
+        min_length=1, max_length=MAX_GRAPHQL_SELECTION_DEPTH
+    )
+
+    @model_validator(mode="after")
+    def require_unique_path_nodes(self) -> "GraphQLSelectionPath":
+        if len(self.field_ids) != len(set(self.field_ids)):
+            raise ValueError("GraphQL selection path cannot recurse")
+        return self
+
+
+class GraphQLNormalizedOperationStructure(ResearchContract):
+    """Bounded structural input from which a later runtime may render source."""
+
+    root_field_ids: tuple[GraphQLFieldId, ...] = Field(min_length=1, max_length=100)
+    selection_paths: tuple[GraphQLSelectionPath, ...] = Field(
+        min_length=1, max_length=MAX_GRAPHQL_SELECTION_NODES
+    )
+
+    @model_validator(mode="after")
+    def validate_structure(self) -> "GraphQLNormalizedOperationStructure":
+        roots = tuple(sorted(set(self.root_field_ids)))
+        paths = _canonical_models(self.selection_paths, "GraphQL selection paths")
+        if len(roots) != len(self.root_field_ids):
+            raise ValueError("GraphQL root fields must not contain duplicates")
+        if any(path.field_ids[0] not in roots for path in paths):
+            raise ValueError("GraphQL selection path must start at a root field")
+        node_count = sum(len(path.field_ids) for path in paths)
+        if node_count > MAX_GRAPHQL_SELECTION_NODES:
+            raise ValueError("GraphQL selection node bound exceeded")
+        object.__setattr__(self, "root_field_ids", roots)
+        object.__setattr__(self, "selection_paths", paths)
+        return self
+
+
+class RegisteredGraphQLOperationTemplate(ResearchContract):
+    """Executable-in-the-future operation structure registered outside the model."""
+
+    template_id: OpaqueIdentifier
+    graphql_surface_id: GraphQLSurfaceId
+    endpoint_id: EndpointId
+    operation_id: GraphQLOperationId
+    operation_type: GraphQLOperationType
+    normalized_structure: GraphQLNormalizedOperationStructure
+    variable_bindings: tuple[GraphQLVariableBinding, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_VARIABLES_PER_OPERATION
+    )
+    argument_bindings: tuple[GraphQLArgumentBinding, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_VARIABLES_PER_OPERATION
+    )
+    selection_fingerprint: Sha256Digest
+    authentication_requirement: GraphQLAuthenticationRequirement
+    state_change_class: GraphQLExperimentStateChangeClass
+    workflow_id: WorkflowId | None = None
+    evidence_references: tuple[EvidenceArtifactId, ...] = Field(
+        min_length=1, max_length=100
+    )
+    provenance_id: ProvenanceRecordId
+
+    @model_validator(mode="after")
+    def validate_template(self) -> "RegisteredGraphQLOperationTemplate":
+        if (
+            self.operation_type is GraphQLOperationType.query
+            and self.state_change_class
+            is not GraphQLExperimentStateChangeClass.read_only
+        ):
+            raise ValueError("GraphQL query template must be read-only")
+        if (
+            self.operation_type is GraphQLOperationType.mutation
+            and self.state_change_class is GraphQLExperimentStateChangeClass.read_only
+        ):
+            raise ValueError("GraphQL mutation template cannot be read-only")
+        argument_pairs = tuple(
+            (item.argument_id, item.variable_id) for item in self.argument_bindings
+        )
+        variable_pairs = tuple(
+            (item.argument_id, item.variable_id) for item in self.variable_bindings
+        )
+        if len(argument_pairs) != len(set(argument_pairs)):
+            raise ValueError("GraphQL argument bindings must be unique")
+        if len(variable_pairs) != len(set(variable_pairs)):
+            raise ValueError("GraphQL variable bindings must be unique")
+        if variable_pairs and not set(variable_pairs).issubset(set(argument_pairs)):
+            raise ValueError("GraphQL variable binding lacks an argument binding")
+        object.__setattr__(
+            self,
+            "evidence_references",
+            _canonical_references(self.evidence_references, "template evidence"),
+        )
+        return self
+
+
+class RegisteredGraphQLSafeMutation(ResearchContract):
+    """One pre-registered safe value substitution for input-validation research."""
+
+    mutation_id: OpaqueIdentifier
+    operation_template_id: OpaqueIdentifier
+    variable_id: GraphQLVariableId
+    argument_id: GraphQLArgumentId
+    mutation_class: GraphQLSafeMutationClass
+    binding: GraphQLVariableBinding
+    evidence_references: tuple[EvidenceArtifactId, ...] = Field(
+        min_length=1, max_length=100
+    )
+    provenance_id: ProvenanceRecordId
+
+    @model_validator(mode="after")
+    def validate_mutation(self) -> "RegisteredGraphQLSafeMutation":
+        if (
+            self.binding.variable_id != self.variable_id
+            or self.binding.argument_id != self.argument_id
+        ):
+            raise ValueError("safe mutation binding does not match its references")
+        object.__setattr__(
+            self,
+            "evidence_references",
+            _canonical_references(self.evidence_references, "safe mutation evidence"),
+        )
+        return self
+
+
 class GraphQLTypeWrapper(str, Enum):
     non_null = "non_null"
     list = "list"

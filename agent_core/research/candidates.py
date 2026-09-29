@@ -26,6 +26,11 @@ from agent_core.research.experiments import (
     ExperimentProposal,
     MutationIntent,
 )
+from agent_core.research.graphql import (
+    GraphQLCandidateKind,
+    GraphQLExperimentStateChangeClass,
+    GraphQLVariableBinding,
+)
 from agent_core.research.primitives import (
     AuthenticationDifferentialInput,
     DifferentialSelector,
@@ -47,6 +52,10 @@ from agent_core.research.state import (
     ResearchState,
 )
 from agent_core.research.types import (
+    GraphQLArgumentId,
+    GraphQLFieldId,
+    GraphQLSurfaceId,
+    GraphQLVariableId,
     HypothesisResearchStatus,
     IdentityEligibility,
     OpaqueIdentifier,
@@ -64,12 +73,19 @@ MAX_EXPERIMENT_CANDIDATES = 200
 class CandidateBaselineKind(str, Enum):
     registered_request = "registered_request"
     primary_identity = "primary_identity"
+    registered_graphql_operation = "registered_graphql_operation"
+    before_state = "before_state"
 
 
 class CandidateMutationKind(str, Enum):
     authentication_differential = "authentication_differential"
     controlled_object_substitution = "controlled_object_substitution"
     remove_parameter = "remove_parameter"
+    graphql_identity_differential = "graphql_identity_differential"
+    graphql_object_substitution = "graphql_object_substitution"
+    graphql_field_differential = "graphql_field_differential"
+    graphql_safe_argument_mutation = "graphql_safe_argument_mutation"
+    graphql_state_transition = "graphql_state_transition"
 
 
 class ExperimentCandidate(ResearchContract):
@@ -81,13 +97,17 @@ class ExperimentCandidate(ResearchContract):
     hypothesis_id: OpaqueIdentifier
     capability: OpaqueIdentifier
     primitive_kind: Literal[
-        "authentication_differential", "object_substitution", "parameter_mutation"
+        "authentication_differential",
+        "object_substitution",
+        "parameter_mutation",
+        "graphql_operation",
+        "graphql_variable_mutation",
     ]
     target_id: OpaqueIdentifier
     surface_id: OpaqueIdentifier | None = None
     endpoint_id: OpaqueIdentifier
     operation_id: OpaqueIdentifier | None = None
-    request_template_id: OpaqueIdentifier
+    request_template_id: OpaqueIdentifier | None = None
     parameter_id: OpaqueIdentifier | None = None
     primary_identity_id: OpaqueIdentifier | None = None
     comparison_identity_id: OpaqueIdentifier | None = None
@@ -96,6 +116,21 @@ class ExperimentCandidate(ResearchContract):
     ownership_evidence_references: tuple[OpaqueIdentifier, ...] = Field(
         default=(), max_length=20
     )
+    graphql_candidate_kind: GraphQLCandidateKind | None = None
+    graphql_surface_id: GraphQLSurfaceId | None = None
+    graphql_operation_template_id: OpaqueIdentifier | None = None
+    graphql_field_id: GraphQLFieldId | None = None
+    graphql_argument_id: GraphQLArgumentId | None = None
+    graphql_variable_id: GraphQLVariableId | None = None
+    graphql_variable_bindings: tuple[GraphQLVariableBinding, ...] = Field(
+        default=(), max_length=64
+    )
+    selection_fingerprint: Sha256Digest | None = None
+    graphql_state_change_class: GraphQLExperimentStateChangeClass | None = None
+    workflow_id: OpaqueIdentifier | None = None
+    safe_mutation_id: OpaqueIdentifier | None = None
+    cleanup_required: StrictBool = False
+    cleanup_reference: OpaqueIdentifier | None = None
     baseline_kind: CandidateBaselineKind
     mutation_kind: CandidateMutationKind
     expected_evidence_class: DifferentialSelector
@@ -119,6 +154,70 @@ class ExperimentCandidate(ResearchContract):
         if public_result(payload) != payload:
             raise ValueError("experiment candidate is outside the public boundary")
         reject_secret_material(payload, location="experiment candidate")
+        graphql = self.primitive_kind in {
+            "graphql_operation",
+            "graphql_variable_mutation",
+        }
+        if graphql:
+            required = (
+                self.operation_id,
+                self.graphql_candidate_kind,
+                self.graphql_surface_id,
+                self.graphql_operation_template_id,
+                self.selection_fingerprint,
+                self.graphql_state_change_class,
+            )
+            if any(item is None for item in required):
+                raise ValueError("GraphQL candidate bindings are incomplete")
+            if self.request_template_id is not None:
+                raise ValueError("GraphQL candidate cannot contain a request template")
+            if not self.graphql_variable_bindings and self.graphql_candidate_kind in {
+                GraphQLCandidateKind.object_authorization,
+                GraphQLCandidateKind.ownership,
+                GraphQLCandidateKind.tenant_bound,
+                GraphQLCandidateKind.cross_surface,
+                GraphQLCandidateKind.input_validation,
+            }:
+                raise ValueError("GraphQL candidate requires a typed variable binding")
+            if self.primitive_kind == "graphql_variable_mutation" and (
+                self.safe_mutation_id is None
+                or self.graphql_variable_id is None
+                or self.graphql_argument_id is None
+            ):
+                raise ValueError("GraphQL input mutation is not fully registered")
+            state_changing = self.graphql_state_change_class is (
+                GraphQLExperimentStateChangeClass.reversible_state_change
+            )
+            if self.cleanup_required != state_changing:
+                raise ValueError("GraphQL reversible state change requires cleanup")
+            if self.cleanup_required != (self.cleanup_reference is not None):
+                raise ValueError("GraphQL cleanup binding is inconsistent")
+            if self.graphql_state_change_class is (
+                GraphQLExperimentStateChangeClass.irreversible_or_disallowed
+            ):
+                raise ValueError(
+                    "irreversible GraphQL operation is candidate-ineligible"
+                )
+            if self.worst_case_requests < self.minimum_requests:
+                raise ValueError("candidate request estimate is invalid")
+            return self
+
+        if self.request_template_id is None:
+            raise ValueError("generic candidate requires a request template")
+        if (
+            any(
+                item is not None
+                for item in (
+                    self.graphql_candidate_kind,
+                    self.graphql_surface_id,
+                    self.graphql_operation_template_id,
+                    self.selection_fingerprint,
+                    self.graphql_state_change_class,
+                )
+            )
+            or self.graphql_variable_bindings
+        ):
+            raise ValueError("generic candidate contains GraphQL bindings")
         object_fields = (
             self.parameter_id,
             self.primary_identity_id,
@@ -164,17 +263,25 @@ class CandidateHypothesisSummary(ResearchContract):
 class PublicSafeCandidateSummary(ResearchContract):
     candidate_id: OpaqueIdentifier
     hypothesis_id: OpaqueIdentifier
+    hypothesis_summary: str = Field(min_length=1, max_length=300)
     capability: OpaqueIdentifier
     primitive_kind: OpaqueIdentifier
     endpoint_id: OpaqueIdentifier
     parameter_id: OpaqueIdentifier | None = None
+    operation_id: OpaqueIdentifier | None = None
+    field_id: OpaqueIdentifier | None = None
+    argument_id: OpaqueIdentifier | None = None
+    graphql_candidate_kind: GraphQLCandidateKind | None = None
     has_identity_context: StrictBool
     identity_relationship: IdentityRelationship | None = None
     has_controlled_object: StrictBool
+    object_relationship: OpaqueIdentifier | None = None
     expected_evidence_class: DifferentialSelector
     minimum_requests: StrictInt = Field(ge=0, le=10_000)
     worst_case_requests: StrictInt = Field(ge=0, le=10_000)
     risk_class: RiskLevel
+    state_change_class: GraphQLExperimentStateChangeClass | None = None
+    cleanup_required: StrictBool = False
     information_predicates: tuple[OpaqueIdentifier, ...] = Field(
         min_length=1, max_length=20
     )
@@ -676,17 +783,31 @@ class PublicSafeCandidatePacketBuilder:
                 PublicSafeCandidateSummary(
                     candidate_id=item.candidate_id,
                     hypothesis_id=item.hypothesis_id,
+                    hypothesis_summary=(
+                        hypothesis_index[item.hypothesis_id].title[:300]
+                    ),
                     capability=item.capability,
                     primitive_kind=item.primitive_kind,
                     endpoint_id=item.endpoint_id,
                     parameter_id=item.parameter_id,
+                    operation_id=item.operation_id,
+                    field_id=item.graphql_field_id,
+                    argument_id=item.graphql_argument_id,
+                    graphql_candidate_kind=item.graphql_candidate_kind,
                     has_identity_context=item.primary_identity_id is not None,
                     identity_relationship=item.identity_relationship,
                     has_controlled_object=item.controlled_object_id is not None,
+                    object_relationship=(
+                        "test-owned-controlled-object"
+                        if item.controlled_object_id is not None
+                        else None
+                    ),
                     expected_evidence_class=item.expected_evidence_class,
                     minimum_requests=item.minimum_requests,
                     worst_case_requests=item.worst_case_requests,
                     risk_class=item.risk_class,
+                    state_change_class=item.graphql_state_change_class,
+                    cleanup_required=item.cleanup_required,
                     information_predicates=item.information_predicates,
                     evidence_references=item.evidence_references,
                 )
@@ -728,6 +849,18 @@ def materialize_candidate(
         raise ValueError("candidate is stale or belongs to another research run")
     if candidate.hypothesis_id not in {item.hypothesis_id for item in state.hypotheses}:
         raise ValueError("candidate hypothesis is unavailable")
+
+    if candidate.primitive_kind in {
+        "graphql_operation",
+        "graphql_variable_mutation",
+    }:
+        from agent_core.research.graphql_candidates import (
+            materialize_graphql_candidate,
+        )
+
+        return materialize_graphql_candidate(
+            candidate, state, model_decision_id=model_decision_id
+        )
 
     step_input: object
     if candidate.primitive_kind == "authentication_differential":

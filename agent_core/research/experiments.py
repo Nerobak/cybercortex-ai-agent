@@ -69,6 +69,7 @@ _RAW_CREDENTIAL = re.compile(
 
 class BaselineKind(str, Enum):
     registered_request = "registered_request"
+    registered_graphql_operation = "registered_graphql_operation"
     primary_identity = "primary_identity"
     prior_evidence = "prior_evidence"
     prior_outcome = "prior_outcome"
@@ -282,10 +283,12 @@ class PreconditionCode(str, Enum):
     surface_registered = "surface_registered"
     endpoint_registered = "endpoint_registered"
     request_template_registered = "request_template_registered"
+    graphql_operation_template_registered = "graphql_operation_template_registered"
     controlled_identity = "controlled_identity"
     controlled_session = "controlled_session"
     test_owned_object = "test_owned_object"
     ownership_evidence_present = "ownership_evidence_present"
+    state_change_authorization_required = "state_change_authorization_required"
     cleanup_reserved = "cleanup_reserved"
 
 

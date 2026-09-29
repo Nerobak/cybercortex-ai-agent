@@ -883,6 +883,7 @@ _RESEARCH_PRIMITIVE_ADAPTERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         ),
         "authentication_enforcement": (
             "authentication_differential",
+            "graphql_operation",
             "request_replay",
             "cookie_mutation",
             "response_differential",
@@ -893,11 +894,13 @@ _RESEARCH_PRIMITIVE_ADAPTERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "state_differential",
         ),
         "tenant_isolation": (
+            "graphql_operation",
             "identity_switch",
             "object_substitution",
             "response_differential",
         ),
         "vertical_authorization": (
+            "graphql_operation",
             "identity_switch",
             "request_replay",
             "response_differential",
@@ -927,6 +930,15 @@ _RESEARCH_PRIMITIVE_ADAPTERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "graphql_mutation_authorization": (
             "graphql_operation",
             "graphql_variable_mutation",
+            "state_differential",
+        ),
+        "graphql_authorization": (
+            "graphql_operation",
+            "graphql_variable_mutation",
+            "response_differential",
+        ),
+        "business_logic_state_enforcement": (
+            "graphql_operation",
             "state_differential",
         ),
         "jwt_enforcement": (

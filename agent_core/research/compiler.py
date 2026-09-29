@@ -36,6 +36,21 @@ from agent_core.research.experiments import (
     TypedTargetReference,
 )
 from agent_core.research.fingerprint import experiment_fingerprint
+from agent_core.research.graphql import (
+    GraphQLArgumentRecord,
+    GraphQLAuthenticationRequirement,
+    GraphQLCandidateKind,
+    GraphQLExperimentStateChangeClass,
+    GraphQLFieldRecord,
+    GraphQLOperationRecord,
+    GraphQLStateChangeClass,
+    GraphQLSurface,
+    GraphQLVariableBinding,
+    GraphQLVariableRecord,
+    GraphQLVariableValueSource,
+    RegisteredGraphQLOperationTemplate,
+    RegisteredGraphQLSafeMutation,
+)
 from agent_core.research.primitives import (
     AuthenticationDifferentialInput,
     CompiledPrimitiveStep,
@@ -126,6 +141,16 @@ class CompilerErrorCode(str, Enum):
     unknown_endpoint = "unknown_endpoint"
     unknown_parameter = "unknown_parameter"
     unknown_operation = "unknown_operation"
+    unknown_graphql_operation_template = "unknown_graphql_operation_template"
+    unknown_graphql_surface = "unknown_graphql_surface"
+    unknown_graphql_field = "unknown_graphql_field"
+    unknown_graphql_argument = "unknown_graphql_argument"
+    unknown_graphql_variable = "unknown_graphql_variable"
+    unknown_graphql_safe_mutation = "unknown_graphql_safe_mutation"
+    graphql_template_mismatch = "graphql_template_mismatch"
+    graphql_binding_mismatch = "graphql_binding_mismatch"
+    graphql_selection_invalid = "graphql_selection_invalid"
+    graphql_state_change_disallowed = "graphql_state_change_disallowed"
     unknown_identity = "unknown_identity"
     uncontrolled_identity = "uncontrolled_identity"
     ineligible_identity = "ineligible_identity"
@@ -140,6 +165,7 @@ class CompilerErrorCode(str, Enum):
     unknown_safe_header = "unknown_safe_header"
     credential_header_prohibited = "credential_header_prohibited"
     unknown_evidence = "unknown_evidence"
+    unknown_provenance = "unknown_provenance"
     unknown_outcome = "unknown_outcome"
     unknown_state_reference = "unknown_state_reference"
     unknown_workflow = "unknown_workflow"
@@ -236,6 +262,12 @@ class ExperimentCompilerContext(ResearchContract):
     cleanup_definitions: tuple[CleanupDefinition, ...] = Field(
         default=(), max_length=200
     )
+    graphql_operation_templates: tuple[RegisteredGraphQLOperationTemplate, ...] = Field(
+        default=(), max_length=2_000
+    )
+    graphql_safe_mutations: tuple[RegisteredGraphQLSafeMutation, ...] = Field(
+        default=(), max_length=2_000
+    )
     policy_reference: OpaqueIdentifier | None = None
     context_reference: OpaqueIdentifier | None = None
     reproduction_of: OpaqueIdentifier | None = None
@@ -248,6 +280,8 @@ class ExperimentCompilerContext(ResearchContract):
             (self.request_templates, "template_id"),
             (self.safe_headers, "header_definition_id"),
             (self.cleanup_definitions, "cleanup_reference"),
+            (self.graphql_operation_templates, "template_id"),
+            (self.graphql_safe_mutations, "mutation_id"),
         ):
             identifiers = tuple(getattr(item, attribute) for item in values)
             if len(identifiers) != len(set(identifiers)):
@@ -304,6 +338,10 @@ class ExperimentCompiler:
         indexes = _StateIndexes(state)
         target = indexes.target(proposal.target_id)
         hypothesis = indexes.hypothesis(proposal.hypothesis_id)
+        indexes.provenance(proposal.provenance_id)
+        indexes.provenance(hypothesis.provenance_id)
+        for evidence_id in hypothesis.supporting_evidence:
+            indexes.evidence(evidence_id)
         if hypothesis.target_id != target.target_id:
             _fail(CompilerErrorCode.endpoint_target_mismatch)
 
@@ -320,14 +358,37 @@ class ExperimentCompiler:
         endpoint = indexes.optional_endpoint(proposal.endpoint_id)
         self._validate_endpoint(endpoint, target.target_id, proposal.surface_id)
         operation = indexes.optional_operation(proposal.operation_id)
-        self._validate_operation(operation, endpoint, proposal.surface_id)
-        if operation is not None:
-            operation_endpoint = indexes.endpoint(operation.endpoint_id)
+        graphql_template: RegisteredGraphQLOperationTemplate | None = None
+        if isinstance(operation, GraphQLOperationRecord):
+            referenced_template_ids = {
+                value
+                for step in proposal.primitive_steps
+                if (value := getattr(step.input, "operation_template_id", None))
+                is not None
+            }
+            if len(referenced_template_ids) != 1:
+                _fail(CompilerErrorCode.unknown_graphql_operation_template)
+            graphql_template = _graphql_template(
+                compiler_context, next(iter(referenced_template_ids))
+            )
+            self._validate_graphql_template(
+                graphql_template, operation, proposal, indexes
+            )
+            operation_endpoint = indexes.endpoint(graphql_template.endpoint_id)
             self._validate_endpoint(
                 operation_endpoint, target.target_id, proposal.surface_id
             )
             if endpoint is None:
                 endpoint = operation_endpoint
+        else:
+            self._validate_operation(operation, endpoint, proposal.surface_id)
+            if operation is not None:
+                operation_endpoint = indexes.endpoint(operation.endpoint_id)
+                self._validate_endpoint(
+                    operation_endpoint, target.target_id, proposal.surface_id
+                )
+                if endpoint is None:
+                    endpoint = operation_endpoint
 
         adapter = self._resolve_capability(proposal.capability)
         definitions = []
@@ -422,7 +483,7 @@ class ExperimentCompiler:
                 indexes,
                 proposal.mutation_intent.controlled_object_id,
                 proposal.target_id,
-                proposal.surface_id,
+                None if graphql_template is not None else proposal.surface_id,
             )
             if (
                 proposal.primary_identity_id is not None
@@ -450,13 +511,29 @@ class ExperimentCompiler:
         self._validate_baseline(proposal, indexes, compiler_context)
         if proposal.capability == "authentication_enforcement" and not any(
             isinstance(item.input, AuthenticationDifferentialInput)
+            or (
+                isinstance(item.input, GraphQLOperationInput)
+                and item.input.candidate_kind is GraphQLCandidateKind.authentication
+            )
             for item in compiled_steps
         ):
             _fail(CompilerErrorCode.incomplete_authentication_differential)
-        self._validate_legacy_surface(
-            adapter, endpoint, parameters, target.target_class
-        )
-        self._validate_legacy_requirements(adapter, identities, objects)
+        if graphql_template is not None:
+            self._validate_graphql_candidate_shape(
+                proposal,
+                hypothesis,
+                graphql_template,
+                compiled_steps,
+                identities,
+                objects,
+                indexes,
+                compiler_context,
+            )
+        else:
+            self._validate_legacy_surface(
+                adapter, endpoint, parameters, target.target_class
+            )
+            self._validate_legacy_requirements(adapter, identities, objects)
 
         resolved_endpoint = _single_endpoint(endpoint, endpoints)
         resolved_surface_id = proposal.surface_id or (
@@ -474,6 +551,15 @@ class ExperimentCompiler:
         state_changing = self._derive_state_changing(
             definitions, compiled_steps, resolved_endpoint, adapter, indexes
         )
+        if state_changing and graphql_template is not None:
+            if compiler_context.policy_reference is None:
+                _fail(CompilerErrorCode.graphql_state_change_disallowed)
+            preconditions.append(
+                Precondition(
+                    code=PreconditionCode.state_change_authorization_required,
+                    reference_id=compiler_context.policy_reference,
+                )
+            )
         cleanup = self._derive_cleanup(
             state_changing,
             proposal.capability,
@@ -491,7 +577,10 @@ class ExperimentCompiler:
             )
 
         request_estimate = self._derive_request_estimate(
-            definitions, compiled_steps, adapter, cleanup
+            definitions,
+            compiled_steps,
+            None if graphql_template is not None else adapter,
+            cleanup,
         )
         if (
             request_estimate.total_reservation
@@ -633,6 +722,104 @@ class ExperimentCompiler:
             _fail(CompilerErrorCode.operation_endpoint_mismatch)
         if surface_id is not None and operation.surface_id != surface_id:
             _fail(CompilerErrorCode.endpoint_surface_mismatch)
+
+    @staticmethod
+    def _validate_graphql_template(
+        template: RegisteredGraphQLOperationTemplate,
+        operation: GraphQLOperationRecord,
+        proposal: ExperimentProposal,
+        indexes: "_StateIndexes",
+    ) -> None:
+        semantic_surface = indexes.graphql_surface(template.graphql_surface_id)
+        if (
+            template.operation_id != operation.operation_id
+            or template.graphql_surface_id != operation.graphql_surface_id
+            or template.operation_type is not operation.operation_type
+            or template.selection_fingerprint != operation.selection_fingerprint
+            or template.normalized_structure.root_field_ids != operation.root_field_ids
+            or semantic_surface.endpoint_id != template.endpoint_id
+            or semantic_surface.surface_id != proposal.surface_id
+            or semantic_surface.target_id != proposal.target_id
+        ):
+            _fail(CompilerErrorCode.graphql_template_mismatch)
+        if template.state_change_class is (
+            GraphQLExperimentStateChangeClass.irreversible_or_disallowed
+        ):
+            _fail(CompilerErrorCode.graphql_state_change_disallowed)
+        effective_authentication = operation.authentication_requirement
+        if effective_authentication is GraphQLAuthenticationRequirement.unknown:
+            effective_authentication = semantic_surface.authentication_requirement
+        if template.authentication_requirement is not effective_authentication:
+            _fail(CompilerErrorCode.graphql_template_mismatch)
+        if (
+            operation.state_change_class is GraphQLStateChangeClass.read_only
+            and template.state_change_class
+            is not GraphQLExperimentStateChangeClass.read_only
+        ):
+            _fail(CompilerErrorCode.graphql_template_mismatch)
+        if (
+            operation.state_change_class
+            in {
+                GraphQLStateChangeClass.potential_state_change,
+                GraphQLStateChangeClass.state_change_observed,
+            }
+            and template.state_change_class
+            is GraphQLExperimentStateChangeClass.read_only
+        ):
+            _fail(CompilerErrorCode.graphql_template_mismatch)
+        if template.workflow_id != operation.workflow_id:
+            _fail(CompilerErrorCode.graphql_template_mismatch)
+        if template.provenance_id not in {
+            item.provenance_id for item in indexes.state.provenance
+        } or not set(template.evidence_references).issubset(
+            {item.evidence_id for item in indexes.state.evidence}
+        ):
+            _fail(CompilerErrorCode.missing_required_evidence)
+        fields = {item.field_id: item for item in indexes.state.graphql_fields}
+        types = {item.type_id: item for item in indexes.state.graphql_types}
+        for path in template.normalized_structure.selection_paths:
+            previous: GraphQLFieldRecord | None = None
+            for field_id in path.field_ids:
+                field = fields.get(field_id)
+                if field is None:
+                    _fail(CompilerErrorCode.unknown_graphql_field)
+                if previous is None:
+                    if field_id not in operation.root_field_ids:
+                        _fail(CompilerErrorCode.graphql_selection_invalid)
+                else:
+                    owner = types.get(field.type_id)
+                    previous_owner = types.get(previous.type_id)
+                    if (
+                        owner is None
+                        or previous_owner is None
+                        or owner.graphql_surface_id
+                        != semantic_surface.graphql_surface_id
+                        or previous.return_type.named_type != owner.name
+                    ):
+                        _fail(CompilerErrorCode.graphql_selection_invalid)
+                previous = field
+        expected_pairs = {
+            (item.argument_id, item.variable_id) for item in template.argument_bindings
+        }
+        for argument_id, variable_id in expected_pairs:
+            argument = indexes.graphql_argument(argument_id)
+            variable = indexes.graphql_variable(variable_id)
+            if (
+                variable.operation_id != operation.operation_id
+                or variable.linked_argument_id != argument.argument_id
+                or variable.input_type != argument.input_type
+                or argument.field_id not in fields
+                or argument.field_id
+                not in {
+                    field_id
+                    for path in template.normalized_structure.selection_paths
+                    for field_id in path.field_ids
+                }
+            ):
+                _fail(CompilerErrorCode.graphql_binding_mismatch)
+        for binding in template.variable_bindings:
+            if (binding.argument_id, binding.variable_id) not in expected_pairs:
+                _fail(CompilerErrorCode.graphql_binding_mismatch)
 
     def _resolve_capability(
         self, capability_name: str
@@ -813,26 +1000,109 @@ class ExperimentCompiler:
                     _fail(CompilerErrorCode.unknown_state_reference)
         elif isinstance(primitive, GraphQLOperationInput):
             operation = indexes.operation(primitive.operation_id)
-            self._validate_operation(operation, endpoint, proposal.surface_id)
-            endpoints.append(indexes.endpoint(operation.endpoint_id))
+            if isinstance(operation, GraphQLOperationRecord):
+                if (
+                    primitive.operation_template_id is None
+                    or primitive.candidate_kind is None
+                ):
+                    _fail(CompilerErrorCode.unknown_graphql_operation_template)
+                graphql_template = _graphql_template(
+                    context, primitive.operation_template_id
+                )
+                preconditions.append(
+                    Precondition(
+                        code=PreconditionCode.graphql_operation_template_registered,
+                        reference_id=graphql_template.template_id,
+                    )
+                )
+                self._validate_graphql_template(
+                    graphql_template, operation, proposal, indexes
+                )
+                operation_endpoint = indexes.endpoint(graphql_template.endpoint_id)
+                endpoints.append(operation_endpoint)
+                bindings = (
+                    primitive.variable_bindings or graphql_template.variable_bindings
+                )
+                registered_fields = {
+                    field_id
+                    for path in graphql_template.normalized_structure.selection_paths
+                    for field_id in path.field_ids
+                }
+                if not set(primitive.selected_field_ids).issubset(registered_fields):
+                    _fail(CompilerErrorCode.graphql_selection_invalid)
+                for binding in bindings:
+                    self._validate_graphql_variable_binding(
+                        binding,
+                        template=graphql_template,
+                        proposal=proposal,
+                        indexes=indexes,
+                        context=context,
+                        objects=objects,
+                        identities=identities,
+                    )
+            else:
+                self._validate_operation(operation, endpoint, proposal.surface_id)
+                endpoints.append(indexes.endpoint(operation.endpoint_id))
             if primitive.identity_id is not None:
                 identities.append(
                     self._controlled_identity(indexes, primitive.identity_id)
                 )
         elif isinstance(primitive, GraphQLVariableMutationInput):
             operation = indexes.operation(primitive.operation_id)
-            operation_endpoint = indexes.endpoint(operation.endpoint_id)
-            self._validate_endpoint(
-                operation_endpoint, proposal.target_id, proposal.surface_id
-            )
-            parameter = indexes.parameter(primitive.parameter_id)
-            if primitive.parameter_id not in operation.variable_parameter_ids:
-                _fail(CompilerErrorCode.parameter_endpoint_mismatch)
-            _validate_parameter(parameter, operation_endpoint, None)
-            endpoints.append(operation_endpoint)
-            parameters.append(parameter)
-            if primitive.value_source_reference is not None:
-                _require_value_source(context, primitive.value_source_reference)
+            if isinstance(operation, GraphQLOperationRecord):
+                graphql_template = _graphql_template(
+                    context, str(primitive.operation_template_id)
+                )
+                preconditions.append(
+                    Precondition(
+                        code=PreconditionCode.graphql_operation_template_registered,
+                        reference_id=graphql_template.template_id,
+                    )
+                )
+                self._validate_graphql_template(
+                    graphql_template, operation, proposal, indexes
+                )
+                safe_mutation = _graphql_safe_mutation(
+                    context, str(primitive.safe_mutation_id)
+                )
+                if (
+                    safe_mutation.operation_template_id != graphql_template.template_id
+                    or safe_mutation.variable_id != primitive.variable_id
+                    or safe_mutation.argument_id != primitive.argument_id
+                    or safe_mutation.binding != primitive.binding
+                    or safe_mutation.binding.value_reference
+                    != primitive.value_source_reference
+                ):
+                    _fail(CompilerErrorCode.graphql_binding_mismatch)
+                self._validate_graphql_variable_binding(
+                    safe_mutation.binding,
+                    template=graphql_template,
+                    proposal=proposal,
+                    indexes=indexes,
+                    context=context,
+                    objects=objects,
+                    identities=identities,
+                )
+                if safe_mutation.provenance_id not in {
+                    item.provenance_id for item in indexes.state.provenance
+                } or not set(safe_mutation.evidence_references).issubset(
+                    {item.evidence_id for item in indexes.state.evidence}
+                ):
+                    _fail(CompilerErrorCode.missing_required_evidence)
+                endpoints.append(indexes.endpoint(graphql_template.endpoint_id))
+            else:
+                operation_endpoint = indexes.endpoint(operation.endpoint_id)
+                self._validate_endpoint(
+                    operation_endpoint, proposal.target_id, proposal.surface_id
+                )
+                parameter = indexes.parameter(str(primitive.parameter_id))
+                if primitive.parameter_id not in operation.variable_parameter_ids:
+                    _fail(CompilerErrorCode.parameter_endpoint_mismatch)
+                _validate_parameter(parameter, operation_endpoint, None)
+                endpoints.append(operation_endpoint)
+                parameters.append(parameter)
+                if primitive.value_source_reference is not None:
+                    _require_value_source(context, primitive.value_source_reference)
         elif isinstance(primitive, TokenMutationInput):
             token = indexes.token(primitive.token_ref_id)
             if token.lifecycle is not TokenLifecycle.active:
@@ -936,7 +1206,12 @@ class ExperimentCompiler:
                     comparison_session, primitive.replacement_session_ref_id
                 )
             elif isinstance(primitive, GraphQLOperationInput):
-                primary_identity = merge(primary_identity, primitive.identity_id)
+                if primitive.identity_role == "comparison":
+                    comparison_identity = merge(
+                        comparison_identity, primitive.identity_id
+                    )
+                else:
+                    primary_identity = merge(primary_identity, primitive.identity_id)
 
         if primary_session is not None:
             primary_identity = merge(
@@ -1010,6 +1285,60 @@ class ExperimentCompiler:
             _fail(CompilerErrorCode.uncontrolled_identity)
         return identity
 
+    @classmethod
+    def _validate_graphql_variable_binding(
+        cls,
+        binding: GraphQLVariableBinding,
+        *,
+        template: RegisteredGraphQLOperationTemplate,
+        proposal: ExperimentProposal,
+        indexes: "_StateIndexes",
+        context: ExperimentCompilerContext,
+        objects: list[ResearchObject],
+        identities: list[Identity],
+    ) -> None:
+        if (binding.argument_id, binding.variable_id) not in {
+            (item.argument_id, item.variable_id) for item in template.argument_bindings
+        }:
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+        variable = indexes.graphql_variable(binding.variable_id)
+        argument = indexes.graphql_argument(binding.argument_id)
+        if (
+            variable.operation_id != template.operation_id
+            or variable.linked_argument_id != argument.argument_id
+            or argument.field_id
+            not in {
+                field_id
+                for path in template.normalized_structure.selection_paths
+                for field_id in path.field_ids
+            }
+            or variable.input_type != argument.input_type
+        ):
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+        source = binding.value_source
+        reference = binding.value_reference
+        if source is GraphQLVariableValueSource.controlled_object:
+            owned = cls._owned_object(indexes, reference, proposal.target_id, None)
+            semantics = argument.object_reference_semantics
+            if semantics.research_object_id != owned.object_id:
+                _fail(CompilerErrorCode.object_binding_mismatch)
+            objects.append(owned)
+        elif source is GraphQLVariableValueSource.controlled_identity:
+            identities.append(cls._controlled_identity(indexes, reference))
+        elif source is GraphQLVariableValueSource.registered_workflow_value:
+            if template.workflow_id is None:
+                _fail(CompilerErrorCode.graphql_binding_mismatch)
+            indexes.workflow(template.workflow_id)
+            _require_value_source(context, reference)
+        elif source in {
+            GraphQLVariableValueSource.registered_safe_constant,
+            GraphQLVariableValueSource.registered_pagination_bound,
+            GraphQLVariableValueSource.opaque_controlled_value,
+        }:
+            _require_value_source(context, reference)
+        else:  # pragma: no cover - enum validation closes the value set
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+
     @staticmethod
     def _validate_identity_relationship(
         primary: Identity,
@@ -1041,6 +1370,13 @@ class ExperimentCompiler:
                 and comparison_role
                 and "admin" not in primary_role
                 and "admin" in comparison_role
+            )
+        elif relationship is IdentityRelationship.different_controlled_role:
+            valid = bool(
+                primary.identity_id != comparison.identity_id
+                and primary.role_reference is not None
+                and comparison.role_reference is not None
+                and primary.role_reference != comparison.role_reference
             )
         elif relationship is IdentityRelationship.owner_non_owner:
             valid = primary.identity_id != comparison.identity_id
@@ -1085,6 +1421,8 @@ class ExperimentCompiler:
         baseline = proposal.baseline
         if baseline.kind is BaselineKind.registered_request:
             _template(context, baseline.reference_id)
+        elif baseline.kind is BaselineKind.registered_graphql_operation:
+            _graphql_template(context, baseline.reference_id)
         elif baseline.kind is BaselineKind.primary_identity:
             identity = indexes.identity(baseline.reference_id)
             if not identity.controlled:
@@ -1134,6 +1472,130 @@ class ExperimentCompiler:
             _fail(CompilerErrorCode.uncontrolled_identity)
         if adapter.requires_test_owned_resource and not objects:
             _fail(CompilerErrorCode.unowned_object)
+
+    @classmethod
+    def _validate_graphql_candidate_shape(
+        cls,
+        proposal: ExperimentProposal,
+        hypothesis: object,
+        template: RegisteredGraphQLOperationTemplate,
+        steps: list[CompiledPrimitiveStep],
+        identities: list[Identity],
+        objects: list[ResearchObject],
+        indexes: "_StateIndexes",
+        context: ExperimentCompilerContext,
+    ) -> None:
+        graphql_inputs = [
+            item.input
+            for item in steps
+            if isinstance(
+                item.input, (GraphQLOperationInput, GraphQLVariableMutationInput)
+            )
+        ]
+        kinds = {
+            item.candidate_kind
+            for item in graphql_inputs
+            if item.candidate_kind is not None
+        }
+        if len(kinds) != 1:
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+        kind = next(iter(kinds))
+        expected_properties = {
+            GraphQLCandidateKind.object_authorization: "object-authorization",
+            GraphQLCandidateKind.authentication: "authentication-enforcement",
+            GraphQLCandidateKind.field_authorization: "field-level-authorization",
+            GraphQLCandidateKind.role_bound: "role-bound-access",
+            GraphQLCandidateKind.tenant_bound: "tenant-bound-access",
+            GraphQLCandidateKind.ownership: "object-authorization",
+            GraphQLCandidateKind.mutation_authorization: "mutation-authorization",
+            GraphQLCandidateKind.cross_surface: "cross-surface-authorization",
+            GraphQLCandidateKind.nested_resolver: (
+                "relationship-traversal-authorization"
+            ),
+            GraphQLCandidateKind.input_validation: "argument-input-validation",
+            GraphQLCandidateKind.workflow_mutation: "workflow-bound-mutation",
+        }
+        if getattr(hypothesis, "security_property", None) != expected_properties[kind]:
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+        entity_ids = {
+            item.entity_id for item in getattr(hypothesis, "entity_references", ())
+        }
+        if template.operation_id not in entity_ids:
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+        identity_ids = {item.identity_id for item in identities}
+        object_ids = {item.object_id for item in objects}
+        operation_steps = [
+            item for item in graphql_inputs if isinstance(item, GraphQLOperationInput)
+        ]
+        if kind is GraphQLCandidateKind.authentication:
+            if (
+                len(operation_steps) != 2
+                or not any(item.anonymous for item in operation_steps)
+                or not any(item.identity_id is not None for item in operation_steps)
+            ):
+                _fail(CompilerErrorCode.incomplete_authentication_differential)
+        if kind in {
+            GraphQLCandidateKind.object_authorization,
+            GraphQLCandidateKind.ownership,
+            GraphQLCandidateKind.tenant_bound,
+            GraphQLCandidateKind.cross_surface,
+        } and (len(identity_ids) < 2 or not object_ids):
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+        if kind is GraphQLCandidateKind.role_bound and len(identity_ids) < 2:
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+        if kind is GraphQLCandidateKind.input_validation and not any(
+            isinstance(item, GraphQLVariableMutationInput) for item in graphql_inputs
+        ):
+            _fail(CompilerErrorCode.graphql_binding_mismatch)
+        selected_fields = {
+            field_id for item in operation_steps for field_id in item.selected_field_ids
+        }
+        if kind in {
+            GraphQLCandidateKind.field_authorization,
+            GraphQLCandidateKind.nested_resolver,
+        } and (not selected_fields or not selected_fields.issubset(entity_ids)):
+            _fail(CompilerErrorCode.graphql_selection_invalid)
+        if kind in {
+            GraphQLCandidateKind.mutation_authorization,
+            GraphQLCandidateKind.workflow_mutation,
+        } and template.state_change_class is not (
+            GraphQLExperimentStateChangeClass.reversible_state_change
+        ):
+            _fail(CompilerErrorCode.graphql_state_change_disallowed)
+        if kind is GraphQLCandidateKind.workflow_mutation:
+            if template.workflow_id is None:
+                _fail(CompilerErrorCode.unknown_workflow)
+            workflow = indexes.workflow(template.workflow_id)
+            controlled_states = set()
+            for step in workflow.steps:
+                if not step.state_changing:
+                    continue
+                controlled_states.update(
+                    reference
+                    for reference in (
+                        step.state_before_reference,
+                        step.state_after_reference,
+                    )
+                    if reference is not None
+                )
+            if len(controlled_states) < 2 or not controlled_states.issubset(
+                set(context.state_references)
+            ):
+                _fail(CompilerErrorCode.unknown_state_reference)
+        protected = template.authentication_requirement in {
+            GraphQLAuthenticationRequirement.authenticated_observed,
+            GraphQLAuthenticationRequirement.authentication_required,
+            GraphQLAuthenticationRequirement.role_bound,
+            GraphQLAuthenticationRequirement.tenant_bound,
+        }
+        if (
+            protected
+            and kind is not GraphQLCandidateKind.authentication
+            and not (identity_ids)
+        ):
+            _fail(CompilerErrorCode.uncontrolled_identity)
+        for evidence_id in getattr(hypothesis, "supporting_evidence", ()):
+            indexes.evidence(evidence_id)
 
     @staticmethod
     def _derive_state_changing(
@@ -1447,11 +1909,7 @@ class _StateIndexes:
 
     def operation(self, value: str):
         return self._required(
-            tuple(
-                item
-                for item in self.state.graphql_operations
-                if hasattr(item, "endpoint_id")
-            ),
+            self.state.graphql_operations,
             "operation_id",
             value,
             CompilerErrorCode.unknown_operation,
@@ -1460,12 +1918,52 @@ class _StateIndexes:
     def optional_operation(self, value: str | None):
         return None if value is None else self.operation(value)
 
+    def graphql_surface(self, value: str) -> GraphQLSurface:
+        return self._required(
+            self.state.graphql_surfaces,
+            "graphql_surface_id",
+            value,
+            CompilerErrorCode.unknown_graphql_surface,
+        )
+
+    def graphql_field(self, value: str) -> GraphQLFieldRecord:
+        return self._required(
+            self.state.graphql_fields,
+            "field_id",
+            value,
+            CompilerErrorCode.unknown_graphql_field,
+        )
+
+    def graphql_argument(self, value: str) -> GraphQLArgumentRecord:
+        return self._required(
+            self.state.graphql_arguments,
+            "argument_id",
+            value,
+            CompilerErrorCode.unknown_graphql_argument,
+        )
+
+    def graphql_variable(self, value: str) -> GraphQLVariableRecord:
+        return self._required(
+            self.state.graphql_variables,
+            "variable_id",
+            value,
+            CompilerErrorCode.unknown_graphql_variable,
+        )
+
     def evidence(self, value: str):
         return self._required(
             self.state.evidence,
             "evidence_id",
             value,
             CompilerErrorCode.unknown_evidence,
+        )
+
+    def provenance(self, value: str):
+        return self._required(
+            self.state.provenance,
+            "provenance_id",
+            value,
+            CompilerErrorCode.unknown_provenance,
         )
 
     def outcome(self, value: str):
@@ -1538,6 +2036,24 @@ def _template(
         if item.template_id == template_id:
             return item
     _fail(CompilerErrorCode.unknown_request_template)
+
+
+def _graphql_template(
+    context: ExperimentCompilerContext, template_id: str
+) -> RegisteredGraphQLOperationTemplate:
+    for item in context.graphql_operation_templates:
+        if item.template_id == template_id:
+            return item
+    _fail(CompilerErrorCode.unknown_graphql_operation_template)
+
+
+def _graphql_safe_mutation(
+    context: ExperimentCompilerContext, mutation_id: str
+) -> RegisteredGraphQLSafeMutation:
+    for item in context.graphql_safe_mutations:
+        if item.mutation_id == mutation_id:
+            return item
+    _fail(CompilerErrorCode.unknown_graphql_safe_mutation)
 
 
 def _safe_header(
