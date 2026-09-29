@@ -64,6 +64,11 @@ from agent_core.research.graphql_discovery import (
     GraphQLDiscoverySession,
     GraphQLSemanticAcquirer,
 )
+from agent_core.research.graphql_hypotheses import (
+    GraphQLHypothesisGenerator,
+    GraphQLHypothesisLimits,
+)
+from agent_core.research.graph import GraphAssertion, ResearchGraphRepository
 from agent_core.research.reasoning import (
     PublicSafeResearchPacketBuilder,
     ResearchReasoningEngine,
@@ -106,6 +111,15 @@ class ResearchBootstrapLimits(ResearchContract):
     maximum_parameters_imported: StrictInt = Field(default=1_000, ge=1, le=10_000)
     maximum_request_templates: StrictInt = Field(default=500, ge=1, le=5_000)
     maximum_initial_hypotheses: StrictInt = Field(default=200, ge=1, le=5_000)
+    maximum_graphql_hypotheses_per_surface: StrictInt = Field(default=12, ge=1, le=200)
+    maximum_graphql_hypotheses_per_operation: StrictInt = Field(default=6, ge=1, le=100)
+    maximum_graphql_hypotheses_per_object_relationship: StrictInt = Field(
+        default=4, ge=1, le=50
+    )
+    maximum_cross_surface_graphql_hypotheses: StrictInt = Field(default=6, ge=0, le=100)
+    maximum_graphql_hypotheses_per_bootstrap: StrictInt = Field(
+        default=40, ge=1, le=500
+    )
     maximum_bootstrap_model_calls: StrictInt = Field(default=1, ge=0, le=20)
     wall_time_seconds: StrictFloat = Field(default=120.0, ge=1.0, le=3_600.0)
 
@@ -177,6 +191,7 @@ class ResearchBootstrapper:
             ControlledAccountDiscoveryAdapter | None
         ) = None,
         graphql_discovery_config: GraphQLDiscoveryConfig | None = None,
+        graphql_hypothesis_generator: GraphQLHypothesisGenerator | None = None,
         reasoning_engine: ResearchReasoningEngine | None = None,
         routing_policy: ModelRoutingPolicy | None = None,
         packet_builder: PublicSafeResearchPacketBuilder | None = None,
@@ -292,6 +307,29 @@ class ResearchBootstrapper:
             and vault is not None
             and profile == "authenticated"
             else None
+        )
+        self.graphql_hypothesis_generator = graphql_hypothesis_generator or (
+            GraphQLHypothesisGenerator(
+                GraphQLHypothesisLimits(
+                    max_hypotheses_per_surface=(
+                        self.limits.maximum_graphql_hypotheses_per_surface
+                    ),
+                    max_hypotheses_per_operation=(
+                        self.limits.maximum_graphql_hypotheses_per_operation
+                    ),
+                    max_hypotheses_per_object_relationship=(
+                        self.limits.maximum_graphql_hypotheses_per_object_relationship
+                    ),
+                    max_cross_surface_hypotheses=(
+                        self.limits.maximum_cross_surface_graphql_hypotheses
+                    ),
+                    max_total_new_hypotheses=(
+                        self.limits.maximum_graphql_hypotheses_per_bootstrap
+                    ),
+                ),
+                confirmation_policy_reference=self.confirmation_policy_reference,
+                allowed_categories=self.allowed_hypothesis_categories,
+            )
         )
         self.authenticated_discovery_adapter = authenticated_discovery_adapter
         if (
@@ -738,22 +776,50 @@ class ResearchBootstrapper:
                 "resume-experiment-selection",
             )
         target = self._target(state)
+        graphql_remaining = max(
+            0, self.limits.maximum_initial_hypotheses - len(state.hypotheses)
+        )
+        graphql_generation = self.graphql_hypothesis_generator.generate_result(
+            state,
+            ResearchGraphRepository(self.store, state.research_id),
+            occurred_at=self._now(state),
+            max_new_hypotheses=graphql_remaining,
+        )
+        adapted = self._merge_hypotheses(
+            state,
+            graphql_generation.hypotheses,
+            graphql_generation.provenance,
+        )
+        if graphql_generation.truncated:
+            adapted = ResearchState.model_validate(
+                {
+                    **adapted.model_dump(mode="python"),
+                    "diagnostic_codes": tuple(
+                        sorted(
+                            {
+                                *adapted.diagnostic_codes,
+                                "graphql-hypothesis-generation-truncated",
+                            }
+                        )
+                    ),
+                }
+            )
         canonical = self._surface_adapter.to_canonical_surface(
-            state, target_id=target.target_id
+            adapted, target_id=target.target_id
         )
         graphql_surface_ids = {
             item.surface_id
-            for item in state.surfaces
+            for item in adapted.surfaces
             if item.target_id == target.target_id
             and item.surface_type is SurfaceType.graphql
         } | {
             item.surface_id
-            for item in state.graphql_surfaces
+            for item in adapted.graphql_surfaces
             if item.target_id == target.target_id
         }
         graphql_endpoint_keys = {
             (item.method.value, item.route_template)
-            for item in state.endpoints
+            for item in adapted.endpoints
             if item.surface_id in graphql_surface_ids
         }
 
@@ -781,23 +847,27 @@ class ResearchBootstrapper:
         )
         generated = generate_surface_hypotheses(canonical)
         remaining = max(
-            0, self.limits.maximum_initial_hypotheses - len(state.hypotheses)
+            0, self.limits.maximum_initial_hypotheses - len(adapted.hypotheses)
         )
         hypotheses, provenance = adapt_surface_hypotheses(
             generated,
-            state,
+            adapted,
             target_id=target.target_id,
             confirmation_policy_reference=self.confirmation_policy_reference,
             max_hypotheses=remaining,
             occurred_at=self._now(state),
         )
-        adapted = self._merge_hypotheses(state, hypotheses, provenance)
+        adapted = self._merge_hypotheses(adapted, hypotheses, provenance)
         model_delta = ModelUsageDelta()
         model_limitations: tuple[str, ...] = ()
         attempted = progress.model_usage_delta.attempted_calls if progress else 0
-        deterministic_candidate_sufficient = False
+        # P4-1D, not model expansion, will convert deterministic GraphQL
+        # hypotheses into experiment candidates. Their presence is sufficient
+        # for this hypothesis-only milestone and requires no model call.
+        deterministic_candidate_sufficient = bool(graphql_generation.hypotheses)
         if (
-            self.candidate_builder is not None
+            not deterministic_candidate_sufficient
+            and self.candidate_builder is not None
             and self.candidate_compiler_context is not None
             and any(
                 item.derivation_type.value == "deterministic"
@@ -876,12 +946,14 @@ class ResearchBootstrapper:
                 ResearchRunStatus.stopped,
                 BootstrapStopReason.wall_time_exhausted.value,
                 replacement=adapted,
+                graph_assertions=graphql_generation.graph_assertions,
             )
         return self._transition(
             state,
             ResearchRunStatus.selecting_experiment,
             "evidence-backed-initial-hypotheses-complete",
             replacement=adapted,
+            graph_assertions=graphql_generation.graph_assertions,
         )
 
     def _acquire_objects(
@@ -1020,6 +1092,7 @@ class ResearchBootstrapper:
         reason: str,
         *,
         replacement: ResearchState | None = None,
+        graph_assertions: Sequence[GraphAssertion] = (),
     ) -> ResearchState:
         timestamp = self._now(state)
         machine = ResearchStateMachine(state)
@@ -1041,7 +1114,7 @@ class ResearchBootstrapper:
                 updated_at=lifecycle.updated_at,
             )
             lifecycle = ResearchState.model_validate(payload)
-        graph_assertions = []
+        pending_assertions = {item.assertion_id: item for item in graph_assertions}
         for assertion in build_graphql_graph_assertions(
             lifecycle, asserted_at=timestamp
         ):
@@ -1050,13 +1123,19 @@ class ResearchBootstrapper:
                     lifecycle.research_id, assertion.assertion_id
                 )
             except KeyError:
-                graph_assertions.append(assertion)
+                pending_assertions.setdefault(assertion.assertion_id, assertion)
+        new_assertions = []
+        for assertion_id in sorted(pending_assertions):
+            try:
+                self.store.load_graph_assertion(lifecycle.research_id, assertion_id)
+            except KeyError:
+                new_assertions.append(pending_assertions[assertion_id])
         return self.store.commit_revision(
             state.research_id,
             expected_revision=state.revision,
             state=lifecycle,
             events=(event,),
-            graph_assertions=tuple(graph_assertions),
+            graph_assertions=tuple(new_assertions),
         )
 
     def _updated_progress(

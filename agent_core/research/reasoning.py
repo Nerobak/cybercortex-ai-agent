@@ -30,6 +30,7 @@ from agent_core.research.evaluation import (
     NewHypothesisProposal,
 )
 from agent_core.research.experiments import ExperimentProposal
+from agent_core.research.graphql import GraphQLOperationRecord
 from agent_core.research.pivot import PivotDimension
 from agent_core.research.primitives import PrimitiveCapabilityState
 from agent_core.research.provenance import reject_secret_material
@@ -424,6 +425,17 @@ class PublicSafeResearchPacketBuilder:
                     "refuting_evidence": list(item.refuting_evidence),
                     "attempt_count": item.attempt_count,
                     "pivot_count": item.pivot_count,
+                    "security_property": item.security_property,
+                    "entity_references": [
+                        {
+                            "entity_kind": reference.entity_kind.value,
+                            "entity_id": reference.entity_id,
+                        }
+                        for reference in item.entity_references
+                    ],
+                    "missing_evidence": list(item.missing_evidence),
+                    "required_preconditions": list(item.required_preconditions),
+                    "requires_state_change": item.requires_state_change,
                 }
                 for item in state.hypotheses
                 if item.hypothesis_id in unresolved
@@ -494,18 +506,48 @@ class PublicSafeResearchPacketBuilder:
                 if item.endpoint_id in endpoint_ids
             ),
             graphql_operations=tuple(
-                {
-                    "operation_id": item.operation_id,
-                    "surface_id": item.surface_id,
-                    "endpoint_id": item.endpoint_id,
-                    "operation_name": item.operation_name,
-                    "operation_type": item.operation_type.value,
-                    "root_fields": list(item.root_fields),
-                    "variable_parameter_ids": list(item.variable_parameter_ids),
-                    "evidence_references": list(item.evidence_references),
-                }
+                (
+                    {
+                        "operation_id": item.operation_id,
+                        "graphql_surface_id": item.graphql_surface_id,
+                        "operation_name": item.operation_name,
+                        "operation_type": item.operation_type.value,
+                        "root_field_ids": list(item.root_field_ids),
+                        "variable_ids": list(item.variable_ids),
+                        "selection_fingerprint": item.selection_fingerprint,
+                        "authentication_requirement": (
+                            item.authentication_requirement.value
+                        ),
+                        "state_change_class": item.state_change_class.value,
+                        "workflow_id": item.workflow_id,
+                        "evidence_references": list(item.evidence_references),
+                    }
+                    if isinstance(item, GraphQLOperationRecord)
+                    else {
+                        "operation_id": item.operation_id,
+                        "surface_id": item.surface_id,
+                        "endpoint_id": item.endpoint_id,
+                        "operation_name": item.operation_name,
+                        "operation_type": item.operation_type.value,
+                        "root_fields": list(item.root_fields),
+                        "variable_parameter_ids": list(item.variable_parameter_ids),
+                        "evidence_references": list(item.evidence_references),
+                    }
+                )
                 for item in state.graphql_operations
-                if hasattr(item, "endpoint_id") and item.endpoint_id in endpoint_ids
+                if (
+                    isinstance(item, GraphQLOperationRecord)
+                    and item.graphql_surface_id
+                    in {
+                        surface.graphql_surface_id
+                        for surface in state.graphql_surfaces
+                        if surface.surface_id in surface_ids
+                    }
+                )
+                or (
+                    not isinstance(item, GraphQLOperationRecord)
+                    and item.endpoint_id in endpoint_ids
+                )
             ),
             workflows=tuple(
                 {

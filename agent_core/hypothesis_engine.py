@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 import json
-from urllib.parse import urlparse
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -533,6 +532,10 @@ def generate_surface_hypotheses(
         raw_name = str(parameter.get("field_path") or parameter.get("name") or "")
         name = raw_name.lower().replace("-", "_").split(".")[-1]
         location = str(parameter.get("in") or parameter.get("location") or "")
+        if location in {"graphql_variable", "graphql_argument"}:
+            # P4-1C requires registered GraphQL semantic relationships; a
+            # variable or argument name alone cannot seed a hypothesis.
+            continue
         writable = location in {
             "json",
             "form",
@@ -945,6 +948,8 @@ def generate_surface_hypotheses(
         if not fields & sensitive:
             continue
         request = request_by_id.get(request_id) or {}
+        if request.get("graphql_operation"):
+            continue
         add(
             _surface_hypothesis(
                 surface,
@@ -972,52 +977,6 @@ def generate_surface_hypotheses(
                 context=("explicitly supplied controlled lab tokens",),
             )
         )
-
-    operations = surface.graphql.get("operations") or []
-    if not operations and int(surface.graphql.get("operations_observed") or 0) > 0:
-        operations = [{"name": "observed-operation", "type": "unknown"}]
-    for operation in operations:
-        route = {
-            "path": operation.get("path") or urlparse(surface.target).path or "/",
-            "url": operation.get("url") or surface.target,
-            "method": "POST",
-        }
-        for category, title in (
-            (
-                "graphql_object_authorization",
-                "GraphQL object authorization may require controlled comparison",
-            ),
-            (
-                "graphql_field_authorization",
-                "GraphQL field authorization may require role-aware comparison",
-            ),
-        ):
-            add(
-                _surface_hypothesis(
-                    surface,
-                    category=category,
-                    title=title,
-                    route=route,
-                    rationale="A GraphQL operation was observed; no schema-wide amplification is proposed.",
-                    impact="A controlled caller could receive an unauthorized object or protected field.",
-                    context=("two controlled accounts", "captured bounded operation"),
-                )
-            )
-        if str(operation.get("type") or "").lower() == "mutation":
-            add(
-                _surface_hypothesis(
-                    surface,
-                    category="graphql_mutation_authorization",
-                    title="GraphQL mutation authorization may require a reversible controlled comparison",
-                    route=route,
-                    rationale="A captured GraphQL mutation was observed.",
-                    impact="A lower-privileged controlled caller could perform a protected mutation.",
-                    context=("two controlled accounts", "test-owned resource"),
-                    safe=False,
-                    risk=RiskLevel.moderate,
-                    state_changing=True,
-                )
-            )
 
     if surface.uploads.get("surface_observed") or surface.uploads.get("observations"):
         for category, title, impact in (
@@ -1078,6 +1037,10 @@ def generate_hypotheses(bundle: CaptureBundle) -> list[Hypothesis]:
         identity for identity in bundle.identities if identity.controlled
     ]
     for request in bundle.requests:
+        # Phase 4 GraphQL hypotheses require the evidence-backed semantic model.
+        # A captured operation, variable, identifier, or mutation is not enough.
+        if request.graphql_operation:
+            continue
         path_words = {
             word for word in request.path.lower().replace("-", "_").split("/") if word
         }
@@ -1294,23 +1257,6 @@ def generate_hypotheses(bundle: CaptureBundle) -> list[Hypothesis]:
                 requires_credentials=True,
             )
             hypotheses[api_authz.hypothesis_id] = api_authz
-        if request.graphql_operation:
-            gql = _make_hypothesis(
-                request,
-                "graphql_authorization",
-                "GraphQL operation may require object and field authorization checks",
-                "Captured GraphQL variables and operation metadata permit controlled authorization comparison without schema guessing.",
-                tools=("graphql_query_analyzer", "graphql_authz_planner"),
-                requirements=(
-                    EvidenceRequirement(
-                        kind="controlled_identity_differential",
-                        minimum_repetitions=2,
-                        description="Known controlled identities receive repeatable operation or field-level authorization differences.",
-                    ),
-                ),
-                requires_credentials=True,
-            )
-            hypotheses[gql.hypothesis_id] = gql
         cache_headers = request.response.cache_headers if request.response else {}
         cache_control = cache_headers.get("cache-control", "").lower()
         cache_signal = (

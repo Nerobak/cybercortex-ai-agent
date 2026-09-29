@@ -579,9 +579,8 @@ class Relationship(ResearchContract):
             and self.status is not RelationshipStatus.proposed
         ):
             raise ValueError("a model-proposed relationship must remain proposed")
-        if (
-            self.status is RelationshipStatus.confirmed
-            and self.derivation_type is not (DerivationType.deterministic)
+        if self.status is RelationshipStatus.confirmed and self.derivation_type is not (
+            DerivationType.deterministic
         ):
             raise ValueError(
                 "a confirmed relationship requires deterministic derivation"
@@ -624,6 +623,13 @@ class HypothesisRecord(ResearchContract):
     basis_relationship_ids: tuple[RelationshipId, ...] = Field(
         default=(), max_length=100
     )
+    security_property: OpaqueIdentifier | None = None
+    entity_references: tuple[EntityReference, ...] = Field(default=(), max_length=50)
+    missing_evidence: tuple[ShortPublicText, ...] = Field(default=(), max_length=50)
+    required_preconditions: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=50
+    )
+    requires_state_change: StrictBool = False
     semantic_fingerprint: Sha256Digest | None = None
     provenance_id: ProvenanceRecordId
 
@@ -655,6 +661,27 @@ class HypothesisRecord(ResearchContract):
             "basis_relationship_ids",
             _canonical_references(
                 self.basis_relationship_ids, "basis_relationship_ids"
+            ),
+        )
+        rendered_references = tuple(
+            sorted(
+                self.entity_references,
+                key=lambda item: (item.entity_kind.value, item.entity_id),
+            )
+        )
+        if len(rendered_references) != len(
+            {(item.entity_kind, item.entity_id) for item in rendered_references}
+        ):
+            raise ValueError("hypothesis entity references must not contain duplicates")
+        object.__setattr__(self, "entity_references", rendered_references)
+        object.__setattr__(
+            self, "missing_evidence", tuple(sorted(set(self.missing_evidence)))
+        )
+        object.__setattr__(
+            self,
+            "required_preconditions",
+            _canonical_references(
+                self.required_preconditions, "required_preconditions"
             ),
         )
         if self.derivation_type is DerivationType.model_proposed and (
@@ -2324,6 +2351,8 @@ class ResearchState(ResearchContract):
                 relationship_ids,
                 "hypothesis basis relationships",
             )
+            for reference in item.entity_references:
+                _validate_entity_reference(reference, self)
         for item in self.experiment_outcomes:
             _require_references(
                 item.evidence_references, evidence_ids, "outcome evidence"

@@ -64,6 +64,18 @@ from agent_core.result_normalizer import sanitize_document_text
 
 ADAPTER_VERSION = "phase4-bootstrap-adapters-v1"
 
+_GRAPHQL_SECURITY_CATEGORIES = frozenset(
+    {
+        "authentication_enforcement",
+        "graphql_authorization",
+        "graphql_field_authorization",
+        "graphql_mutation_authorization",
+        "graphql_object_authorization",
+        "tenant_isolation",
+        "vertical_authorization",
+    }
+)
+
 
 def stable_research_identifier(prefix: str, *parts: object) -> str:
     encoded = "\x1f".join(str(part) for part in parts).encode("utf-8")
@@ -1039,6 +1051,11 @@ def adapt_model_hypotheses(
     relationship_ids = {item.relationship_id for item in state.relationships}
     target_ids = {item.target_id for item in state.targets}
     surface_ids = {item.surface_id for item in state.surfaces}
+    graphql_surface_ids = {
+        item.surface_id
+        for item in state.surfaces
+        if item.surface_type is SurfaceType.graphql
+    }
     allowed = set(allowed_categories)
     existing = {
         item.semantic_fingerprint
@@ -1056,6 +1073,10 @@ def adapt_model_hypotheses(
             or item.category not in allowed
             or item.target_id not in target_ids
             or (item.surface_id is not None and item.surface_id not in surface_ids)
+            or (
+                item.surface_id in graphql_surface_ids
+                and item.category in _GRAPHQL_SECURITY_CATEGORIES
+            )
             or not set(item.evidence_references).issubset(evidence_ids)
             or not set(item.fact_references).issubset(fact_ids)
             or not set(item.relationship_references).issubset(relationship_ids)
