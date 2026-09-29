@@ -64,6 +64,7 @@ ActionPurpose = Literal[
 
 TransportRequestPurpose = Literal[
     "discovery",
+    "graphql_discovery",
     "oast",
     "session_acquisition",
     "session_termination",
@@ -87,14 +88,23 @@ class TransportRequestContext(StrictModel):
     account_controlled: bool = False
     account_policy_authorized: bool = False
     workflow_category: (
-        Literal["session_invalidation", "rate_limit_enforcement"] | None
+        Literal[
+            "session_invalidation",
+            "rate_limit_enforcement",
+            "graphql_discovery",
+        ]
+        | None
     ) = None
     generated_by: (
         Literal[
             "SessionInvalidationExecutor",
             "AuthenticationLoginRateLimitExecutor",
+            "GraphQLDiscoverySession",
         ]
         | None
+    ) = None
+    graphql_probe_id: (
+        Literal["protocol_confirmation", "typename_probe", "introspection_probe"] | None
     ) = None
     bounded_attempt_limit: int | None = Field(default=None, ge=1, le=5)
     bounded_total_requests: int | None = Field(default=None, ge=3, le=7)

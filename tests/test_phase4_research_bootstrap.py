@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 
 import pytest
+import requests
 
 from agent_core.attack_surface import CanonicalAttackSurface, SurfaceEvidence
 from agent_core.capture_ingest import (
@@ -41,6 +42,7 @@ from agent_core.research import (
     ExperimentProposal,
     ExperimentResultClassification,
     ExperimentSelector,
+    GraphQLOperationRecord,
     IdentityRelationship,
     IdentitySwitchInput,
     InformationGainEstimate,
@@ -60,6 +62,7 @@ from agent_core.research import (
     ResearchConfidence,
     ResearchReasoningEngine,
     ResearchRunStatus,
+    ResearchPredicate,
     ResearchRuntime,
     ResearchStore,
     ResearchStrategyAction,
@@ -67,12 +70,14 @@ from agent_core.research import (
     RuntimeProvenance,
     SecurityResearchOrchestrator,
     TargetClass,
+    build_public_safe_graphql_summary,
 )
 from agent_core.research.outcomes import ExperimentOutcome
 from agent_core.research.evaluation import HypothesisProposalSource
 from agent_core.research.templates import RequestTemplateFactory
 from agent_core.research.types import ExperimentRuntimeStatus, HttpMethod
 from agent_core.research import Parameter, ParameterLocation, ResearchState
+from tools.safe_http import ScopedHTTPClient
 
 NOW = "2026-09-22T12:00:00+00:00"
 TARGET = "https://blind.example"
@@ -82,7 +87,7 @@ DIGEST_B = "sha256:" + "b" * 64
 DIGEST_C = "sha256:" + "c" * 64
 
 
-def policy() -> AssessmentPolicy:
+def policy(*, allow_graphql: bool = False) -> AssessmentPolicy:
     return AssessmentPolicy(
         profile_name="blind-bootstrap",
         authorization_reference="authorization-blind-bootstrap",
@@ -94,7 +99,12 @@ def policy() -> AssessmentPolicy:
                 schemes=["https"],
             )
         ],
-        allowed_methods=["GET", "HEAD", "OPTIONS"],
+        allowed_methods=[
+            "GET",
+            "HEAD",
+            "OPTIONS",
+            *(("POST",) if allow_graphql else ()),
+        ],
         controlled_account_ids=["account-a", "account-b"],
         credentials_allowed=True,
         request_budget=30,
@@ -179,6 +189,44 @@ def capture_bundle() -> CaptureBundle:
             )
         ],
     )
+
+
+def graphql_capture_bundle(
+    vault: CredentialVault, *, identity_id: str | None = None
+) -> CaptureBundle:
+    document_reference = vault.put(
+        "query Viewer($tenantId: ID!) { viewer(tenantId: $tenantId) { id } }",
+        label="bootstrap-graphql-document",
+    )
+    return CaptureBundle(
+        source_format="graphql",
+        source_ref="fake-graphql-capture",
+        requests=[
+            CapturedRequest(
+                request_id="capture-graphql-viewer",
+                source_format="graphql",
+                source_ref="fake-graphql-capture",
+                method="POST",
+                url=f"{TARGET}/api/gql",
+                path="/api/gql",
+                body_type="graphql",
+                graphql_operation="Viewer",
+                graphql_operation_type="query",
+                identity_id=identity_id,
+                execution_body_ref=document_reference,
+            )
+        ],
+    )
+
+
+def graphql_response(payload) -> requests.Response:
+    result = requests.Response()
+    result.status_code = 200
+    result.url = f"{TARGET}/api/gql"
+    result.headers["Content-Type"] = "application/json"
+    result._content = json.dumps(payload).encode("utf-8")
+    result._content_consumed = True
+    return result
 
 
 class FakeDiscoveryRunner:
@@ -377,6 +425,236 @@ def test_blind_bootstrap_discovers_models_hypothesizes_and_compiles(tmp_path):
         assert experiment.expires_at == "2026-09-22T12:15:00+00:00"
         assert experiment.target.endpoint_id == state.endpoints[0].endpoint_id
         assert runner.calls == 1
+    finally:
+        vault.close()
+
+
+def test_blind_bootstrap_passively_populates_graphql_semantics_and_graph(tmp_path):
+    store = ResearchStore(tmp_path / "blind-graphql.sqlite3")
+    request_budget = RequestBudget(10, per_host_limit=10)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    selected_policy = policy()
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-blind-graphql",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-blind-graphql",
+        policy=selected_policy,
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+    vault = CredentialVault()
+    bundle = graphql_capture_bundle(vault)
+    runner = FakeDiscoveryRunner(
+        request_budget,
+        surface=discovery_surface(empty=True),
+        capture=bundle,
+    )
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=selected_policy,
+        controlled_context=ControlledContext(),
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        tool_runner=runner,
+        vault=vault,
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=5,
+            maximum_graphql_discovery_requests=2,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+    try:
+        state = bootstrapper.prepare(initial)
+        operations = tuple(
+            item
+            for item in state.graphql_operations
+            if isinstance(item, GraphQLOperationRecord)
+        )
+        assertions = store.query_graph_assertions(
+            state.research_id,
+            relation=ResearchPredicate.graphql_has_operation,
+            limit=500,
+        )
+        summary = build_public_safe_graphql_summary(
+            state,
+            graph_assertions=store.query_graph_assertions(state.research_id, limit=500),
+        )
+
+        assert state.status is ResearchRunStatus.selecting_experiment
+        assert len(state.graphql_surfaces) == 1
+        assert len(operations) == 1
+        assert operations[0].operation_name == "Viewer"
+        assert summary.operations[0].operation_id == operations[0].operation_id
+        assert assertions
+        assert request_budget.total == 1
+        assert not state.hypotheses
+        assert not state.findings
+        assert store.verify_integrity(state.research_id).valid
+    finally:
+        vault.close()
+
+
+def test_blind_bootstrap_uses_one_registered_probe_for_a_path_only_candidate(
+    tmp_path,
+):
+    store = ResearchStore(tmp_path / "blind-graphql-probe.sqlite3")
+    request_budget = RequestBudget(10, per_host_limit=10)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    selected_policy = policy(allow_graphql=True)
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-blind-graphql-probe",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-blind-graphql-probe",
+        policy=selected_policy,
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+
+    class CandidateRunner(FakeDiscoveryRunner):
+        def run(self, target, **kwargs):
+            result = super().run(target, **kwargs)
+            result["observed_candidates"] = [{"url": f"{TARGET}/graphql"}]
+            return result
+
+    wire_queries: list[str] = []
+
+    def requester(_method, _url, **kwargs):
+        wire_queries.append(kwargs["json"]["query"])
+        return graphql_response({"data": {"__typename": "Query"}})
+
+    client = ScopedHTTPClient(
+        policy=selected_policy,
+        budget=request_budget,
+        requester=requester,
+    )
+    runner = CandidateRunner(
+        request_budget,
+        surface=discovery_surface(empty=True),
+    )
+    runner.http_client = client
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=selected_policy,
+        controlled_context=ControlledContext(),
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        tool_runner=runner,
+        profile="baseline",
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=5,
+            maximum_graphql_discovery_requests=1,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+
+    state = bootstrapper.prepare(initial)
+
+    assert len(wire_queries) == 1
+    assert "__typename" in wire_queries[0]
+    assert request_budget.total == 2
+    assert len(state.graphql_surfaces) == 1
+    assert not state.findings
+
+
+def test_bootstrap_authenticated_graphql_discovery_persists_only_differential_shape(
+    tmp_path,
+):
+    store = ResearchStore(tmp_path / "blind-authenticated-graphql.sqlite3")
+    request_budget = RequestBudget(10, per_host_limit=10)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    selected_policy = policy(allow_graphql=True)
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-blind-authenticated-graphql",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-blind-authenticated-graphql",
+        policy=selected_policy,
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+    vault = CredentialVault()
+    context = controlled(vault)
+    bundle = graphql_capture_bundle(vault, identity_id="account-a")
+    wire_authorization: list[str | None] = []
+
+    def requester(_method, _url, **kwargs):
+        authorization = kwargs["headers"].get("Authorization")
+        wire_authorization.append(authorization)
+        if authorization is None:
+            return graphql_response(
+                {
+                    "errors": [
+                        {
+                            "message": "redacted",
+                            "extensions": {"code": "UNAUTHENTICATED"},
+                        }
+                    ]
+                }
+            )
+        return graphql_response({"data": {"__typename": "Viewer"}})
+
+    client = ScopedHTTPClient(
+        policy=selected_policy,
+        budget=request_budget,
+        requester=requester,
+    )
+    runner = FakeDiscoveryRunner(
+        request_budget,
+        surface=discovery_surface(empty=True),
+        capture=bundle,
+    )
+    runner.http_client = client
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=selected_policy,
+        controlled_context=context,
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        tool_runner=runner,
+        vault=vault,
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=6,
+            maximum_graphql_discovery_requests=3,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+    try:
+        state = bootstrapper.prepare(initial)
+        serialized = state.model_dump_json()
+
+        assert len(wire_authorization) == 3
+        assert wire_authorization[0] is None
+        assert all(value is not None for value in wire_authorization[1:])
+        assert request_budget.total == 4
+        assert any(
+            item.observation_type == "graphql_identity_differential"
+            for item in state.observations
+        )
+        assert SECRET_SENTINEL not in serialized
+        assert not state.findings
     finally:
         vault.close()
 

@@ -157,6 +157,17 @@ def test_strict_blindness_rejects_preseeded_research_artifacts(kind, violation):
         )
 
 
+def test_strict_blindness_rejects_preseeded_graphql_semantics():
+    from test_phase4_graphql_semantics import semantic_state
+
+    with pytest.raises(
+        BenchmarkBlindnessError, match="initial-graphql-surfaces-present"
+    ):
+        BenchmarkBlindnessGuard().validate(
+            research_input(), initial_state=semantic_state()
+        )
+
+
 def test_contamination_report_contains_hashes_not_hidden_material(tmp_path):
     store = BenchmarkGroundTruthStore(tmp_path)
     store.put("truth-1", truth())

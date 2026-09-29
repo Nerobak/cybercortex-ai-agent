@@ -906,6 +906,56 @@ def _merge_scalar(left: Any, right: Any, unknown: Any, description: str) -> Any:
     raise GraphQLSemanticConflict(f"conflicting {description}")
 
 
+def _merge_authentication_requirement(
+    left: GraphQLAuthenticationRequirement,
+    right: GraphQLAuthenticationRequirement,
+    description: str,
+) -> GraphQLAuthenticationRequirement:
+    if left is right:
+        return left
+    if left is GraphQLAuthenticationRequirement.unknown:
+        return right
+    if right is GraphQLAuthenticationRequirement.unknown:
+        return left
+    observed = {
+        GraphQLAuthenticationRequirement.anonymous_observed,
+        GraphQLAuthenticationRequirement.authenticated_observed,
+    }
+    if {left, right} == observed:
+        # The surface was available in both contexts. Identity-differential
+        # observations retain that distinction; this scalar records that an
+        # authenticated observation also exists.
+        return GraphQLAuthenticationRequirement.authenticated_observed
+    precedence = (
+        GraphQLAuthenticationRequirement.tenant_bound,
+        GraphQLAuthenticationRequirement.role_bound,
+        GraphQLAuthenticationRequirement.authentication_required,
+        GraphQLAuthenticationRequirement.authenticated_observed,
+    )
+    if left in precedence and right in precedence:
+        return min((left, right), key=precedence.index)
+    raise GraphQLSemanticConflict(f"conflicting {description}")
+
+
+def _merge_authorization_semantics(
+    left: GraphQLAuthorizationSemantics,
+    right: GraphQLAuthorizationSemantics,
+) -> GraphQLAuthorizationSemantics:
+    observations = set((*left.observations, *right.observations))
+    if len(observations) > 1:
+        observations.discard(GraphQLAuthorizationObservation.unknown)
+    return GraphQLAuthorizationSemantics(
+        observations=tuple(sorted(observations, key=lambda item: item.value)),
+        identity_references=tuple(
+            sorted({*left.identity_references, *right.identity_references})
+        ),
+        evidence_references=tuple(
+            sorted({*left.evidence_references, *right.evidence_references})
+        ),
+        provenance_id=left.provenance_id,
+    )
+
+
 def _merge_tuple(left: tuple[Any, ...], right: tuple[Any, ...]) -> tuple[Any, ...]:
     by_json = {
         (
@@ -937,16 +987,29 @@ def _merge_semantic_record(left: Any, right: Any, identifier: str) -> Any:
         for name in immutable:
             if getattr(left, name) != getattr(right, name):
                 raise GraphQLSemanticConflict(f"conflicting GraphQL surface {name}")
+        capture, introspection = (
+            (left, right)
+            if left.schema_state is GraphQLSchemaState.capture_derived
+            and right.schema_state is GraphQLSchemaState.introspection_observed
+            else (right, left)
+        )
+        if (
+            capture.schema_state is GraphQLSchemaState.capture_derived
+            and introspection.schema_state is GraphQLSchemaState.introspection_observed
+            and not set(capture.operation_capabilities).issubset(
+                introspection.operation_capabilities
+            )
+        ):
+            raise GraphQLSemanticConflict("conflicting GraphQL operation capabilities")
         payload["schema_state"] = _merge_schema_state(
             left.schema_state, right.schema_state
         )
         payload["operation_capabilities"] = _merge_tuple(
             left.operation_capabilities, right.operation_capabilities
         )
-        payload["authentication_requirement"] = _merge_scalar(
+        payload["authentication_requirement"] = _merge_authentication_requirement(
             left.authentication_requirement,
             right.authentication_requirement,
-            GraphQLAuthenticationRequirement.unknown,
             "surface authentication semantics",
         )
     elif isinstance(left, GraphQLTypeRecord):
@@ -977,18 +1040,9 @@ def _merge_semantic_record(left: Any, right: Any, identifier: str) -> Any:
             left.relationship_hints, right.relationship_hints
         )
         if left.authorization_semantics != right.authorization_semantics:
-            left_unknown = left.authorization_semantics.observations == (
-                GraphQLAuthorizationObservation.unknown,
+            payload["authorization_semantics"] = _merge_authorization_semantics(
+                left.authorization_semantics, right.authorization_semantics
             )
-            right_unknown = right.authorization_semantics.observations == (
-                GraphQLAuthorizationObservation.unknown,
-            )
-            if left_unknown:
-                payload["authorization_semantics"] = right.authorization_semantics
-            elif not right_unknown:
-                raise GraphQLSemanticConflict(
-                    "conflicting field authorization semantics"
-                )
     elif isinstance(left, GraphQLArgumentRecord):
         for name in ("field_id", "name", "default_presence", "parameter_id"):
             if getattr(left, name) != getattr(right, name):
@@ -1030,10 +1084,9 @@ def _merge_semantic_record(left: Any, right: Any, identifier: str) -> Any:
             left.root_field_ids, right.root_field_ids
         )
         payload["variable_ids"] = _merge_tuple(left.variable_ids, right.variable_ids)
-        payload["authentication_requirement"] = _merge_scalar(
+        payload["authentication_requirement"] = _merge_authentication_requirement(
             left.authentication_requirement,
             right.authentication_requirement,
-            GraphQLAuthenticationRequirement.unknown,
             "operation authentication semantics",
         )
         payload["state_change_class"] = _merge_scalar(

@@ -419,6 +419,64 @@ class ScopedHTTPClient:
         )
         return base
 
+    def _authorize_graphql_discovery(
+        self,
+        url: str,
+        method: str,
+        request_context: TransportRequestContext | None,
+    ) -> Any:
+        """Authorize one fixed, read-only GraphQL POST produced by the registry."""
+
+        if self.policy is None:
+            raise PolicyViolationError(
+                "GraphQL discovery requires an explicit assessment policy."
+            )
+        reasons: list[str] = []
+        if request_context is None:
+            reasons.append("Typed GraphQL discovery metadata is missing.")
+        else:
+            if request_context.purpose != "graphql_discovery":
+                reasons.append("Request purpose metadata is inconsistent.")
+            if request_context.workflow_category != "graphql_discovery":
+                reasons.append("A typed GraphQL discovery workflow is required.")
+            if request_context.generated_by != "GraphQLDiscoverySession":
+                reasons.append("The registered GraphQL discovery executor is required.")
+            if request_context.graphql_probe_id not in {
+                "protocol_confirmation",
+                "typename_probe",
+                "introspection_probe",
+            }:
+                reasons.append("A registered GraphQL discovery probe is required.")
+            if not request_context.policy_authorized:
+                reasons.append("GraphQL discovery was not policy-authorized.")
+            if not request_context.configured_endpoint_match:
+                reasons.append("The GraphQL endpoint was not deterministically bound.")
+            if (
+                request_context.configured_url != url
+                or request_context.configured_method != method
+            ):
+                reasons.append(
+                    "The GraphQL request does not match its authorized endpoint."
+                )
+            if request_context.controlled_account_id:
+                if not self.policy.credentials_allowed:
+                    reasons.append("Controlled credential use is disabled by policy.")
+                if not request_context.account_controlled:
+                    reasons.append(
+                        "Authenticated GraphQL discovery requires a controlled account."
+                    )
+                if not request_context.account_policy_authorized:
+                    reasons.append("The controlled account is not policy-authorized.")
+                if not self._transport_account_is_eligible(request_context):
+                    reasons.append("The controlled account is not policy-authorized.")
+        if method != "POST":
+            reasons.append("Registered GraphQL discovery permits only POST.")
+        base = self.policy._authorize_url_base(url, method=method)
+        reasons.extend(base.reasons)
+        if reasons:
+            raise PolicyViolationError("; ".join(dict.fromkeys(reasons)))
+        return base
+
     def _authorize(
         self,
         url: str,
@@ -433,6 +491,8 @@ class ScopedHTTPClient:
             raise PolicyViolationError("Request purpose metadata is inconsistent.")
         if purpose == "session_acquisition":
             decision = self._authorize_session_acquisition(url, method, request_context)
+        elif purpose == "graphql_discovery":
+            decision = self._authorize_graphql_discovery(url, method, request_context)
         elif purpose == "cleanup":
             if request_context is not None:
                 decision = self._authorize_session_acquisition(
@@ -495,7 +555,11 @@ class ScopedHTTPClient:
 
     @staticmethod
     def _request_kind(purpose: TransportRequestPurpose | None) -> str:
-        if purpose in {"discovery", "owned_object_acquisition"}:
+        if purpose in {
+            "discovery",
+            "graphql_discovery",
+            "owned_object_acquisition",
+        }:
             return "discovery"
         if purpose in {"session_acquisition", "rate_limit_verification"}:
             return "auth"
@@ -554,6 +618,7 @@ class ScopedHTTPClient:
         method: str,
         url: str,
         *,
+        response_byte_limit: int | None = None,
         purpose: TransportRequestPurpose | None = None,
         request_context: TransportRequestContext | None = None,
         techniques: tuple[str, ...] = (),
@@ -589,11 +654,17 @@ class ScopedHTTPClient:
                 response = self.requester(method, url, **kwargs)
             else:
                 response = self.requester(url, **kwargs)
-            limit = (
+            configured_limit = (
                 self.policy.max_response_bytes
                 if self.policy
                 else self.max_response_bytes or 1_000_000
             )
+            if response_byte_limit is not None:
+                if response_byte_limit < 1:
+                    raise ValueError("response byte limit must be positive")
+                limit = min(configured_limit, response_byte_limit)
+            else:
+                limit = configured_limit
             content_length = getattr(response, "headers", {}).get("Content-Length")
             try:
                 if content_length is not None and int(content_length) > limit:
@@ -651,6 +722,7 @@ class ScopedHTTPClient:
         oast_callback_url: str | None = None,
         allow_session_credentials: bool = True,
         isolate_session_cookies: bool = False,
+        response_byte_limit: int | None = None,
         **kwargs: Any,
     ) -> tuple[requests.Response, list[dict[str, Any]]]:
         method = method.strip().upper()
@@ -663,6 +735,7 @@ class ScopedHTTPClient:
         if purpose not in {
             None,
             "discovery",
+            "graphql_discovery",
             "oast",
             "session_acquisition",
             "session_termination",
@@ -688,7 +761,9 @@ class ScopedHTTPClient:
         limit = (
             max_redirects
             if max_redirects is not None
-            else self.policy.max_redirects if self.policy else 5
+            else self.policy.max_redirects
+            if self.policy
+            else 5
         )
         current = url
         current_method = method
@@ -701,6 +776,7 @@ class ScopedHTTPClient:
                     current,
                     timeout=timeout,
                     headers=headers,
+                    response_byte_limit=response_byte_limit,
                     purpose=purpose,
                     request_context=semantic_context,
                     techniques=tuple(techniques or ()),

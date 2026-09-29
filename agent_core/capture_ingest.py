@@ -57,6 +57,7 @@ class CapturedResponseSummary(StrictModel):
     schema_fields: list[str] = Field(default_factory=list, max_length=500)
     cache_headers: dict[str, str] = Field(default_factory=dict)
     sets_cookie: bool = False
+    graphql: dict[str, Any] = Field(default_factory=dict)
 
 
 class CapturedRequest(StrictModel):
@@ -254,7 +255,9 @@ def _sanitize_headers(
     return sanitized, list(references.values())
 
 
-def _response_summary(response: dict[str, Any]) -> CapturedResponseSummary:
+def _response_summary(
+    response: dict[str, Any], *, request_was_graphql: bool = False
+) -> CapturedResponseSummary:
     content = response.get("content") or {}
     fields: list[str] = []
     text = content.get("text")
@@ -273,6 +276,25 @@ def _response_summary(response: dict[str, Any]) -> CapturedResponseSummary:
         for name in ("cache-control", "vary", "age", "x-cache", "cf-cache-status")
         if name in response_headers
     }
+    graphql: dict[str, Any] = {}
+    if isinstance(text, str):
+        # Imported lazily so capture ingestion remains usable independently of
+        # the Phase 4 research package. The returned model contains structure,
+        # classifications, and digests only; response values are discarded.
+        from agent_core.research.graphql_ingest import analyze_graphql_response
+
+        observation = analyze_graphql_response(
+            text,
+            status_code=(
+                int(response["status"])
+                if isinstance(response.get("status"), int)
+                else None
+            ),
+            content_type=str(content.get("mimeType") or ""),
+            request_was_graphql=request_was_graphql,
+        )
+        if request_was_graphql or observation.is_graphql or observation.truncated:
+            graphql = observation.model_dump(mode="json")
     return CapturedResponseSummary(
         status_code=response.get("status"),
         content_type=content.get("mimeType"),
@@ -280,6 +302,7 @@ def _response_summary(response: dict[str, Any]) -> CapturedResponseSummary:
         schema_fields=fields,
         cache_headers=cache_headers,
         sets_cookie="set-cookie" in response_headers,
+        graphql=graphql,
     )
 
 
@@ -395,7 +418,9 @@ def _request_from_har_entry(
             body_schema=body_schema,
             graphql_operation=graphql_operation,
             graphql_operation_type=graphql_type,
-            response=_response_summary(entry.get("response") or {}),
+            response=_response_summary(
+                entry.get("response") or {}, request_was_graphql=body_type == "graphql"
+            ),
             state_changing=method in STATE_CHANGING_METHODS,
             executable=bool(raw_url),
             execution_url_ref=execution_url_ref,
@@ -485,6 +510,8 @@ def _import_raw_http(
     parsed_body = (parsed.get("body") or {}).get("parsed")
     body_format = str((parsed.get("body") or {}).get("format") or "empty")
     body_parameters: list[CapturedParameter] = []
+    graphql_operation = None
+    graphql_type = None
     if isinstance(parsed_body, dict):
         location: ParameterLocation = "json" if body_format == "json" else "form"
         normalized_body = {
@@ -492,6 +519,18 @@ def _import_raw_http(
             for name, value in parsed_body.items()
         }
         body_parameters = _flatten_parameters(normalized_body, location)
+        if isinstance(normalized_body.get("query"), str):
+            document = normalized_body["query"]
+            graphql_operation = normalized_body.get("operationName") or _graphql_name(
+                document
+            )
+            graphql_type = _graphql_type(document)
+            body_parameters.extend(
+                _flatten_parameters(
+                    normalized_body.get("variables") or {}, "graphql_variable"
+                )
+            )
+            body_format = "graphql"
     request = CapturedRequest(
         request_id=stable_identifier("req", method, url, source),
         source_format="raw_http",
@@ -503,6 +542,8 @@ def _import_raw_http(
         parameters=_deduplicate_parameters(_query_parameters(url) + body_parameters),
         body_type=body_format,
         body_schema={"fields": _schema_fields(parsed_body)},
+        graphql_operation=graphql_operation,
+        graphql_operation_type=graphql_type,
         state_changing=method in STATE_CHANGING_METHODS,
         executable=True,
         execution_url_ref=execution_url_ref,
@@ -688,6 +729,21 @@ def _import_postman(
                 parsed_body = json.loads(body["raw"])
                 parameters.extend(_flatten_parameters(parsed_body, "json"))
                 body_schema = {"fields": _schema_fields(parsed_body)}
+                if isinstance(parsed_body, dict) and isinstance(
+                    parsed_body.get("query"), str
+                ):
+                    document = parsed_body["query"]
+                    graphql_operation = parsed_body.get(
+                        "operationName"
+                    ) or _graphql_name(document)
+                    graphql_type = _graphql_type(document)
+                    parameters.extend(
+                        _flatten_parameters(
+                            parsed_body.get("variables") or {},
+                            "graphql_variable",
+                        )
+                    )
+                    mode = "graphql"
             except json.JSONDecodeError:
                 pass
         elif mode == "urlencoded":
@@ -760,7 +816,12 @@ def _import_postman(
     )
 
 
-def _import_graphql(text: str, source: str, base_url: str | None) -> CaptureBundle:
+def _import_graphql(
+    text: str,
+    source: str,
+    base_url: str | None,
+    vault: CredentialVault,
+) -> CaptureBundle:
     parameters = [
         CapturedParameter(
             name=name,
@@ -788,6 +849,7 @@ def _import_graphql(text: str, source: str, base_url: str | None) -> CaptureBund
         graphql_operation_type=operation_type,
         state_changing=operation_type == "mutation",
         executable=False,
+        execution_body_ref=vault.put(text, label="graphql-document"),
     )
     return CaptureBundle(source_format="graphql", source_ref=source, requests=[request])
 
@@ -845,7 +907,7 @@ def import_capture(
     elif selected == "postman":
         bundle = _import_postman(data, source, secret_vault, default_base_url)
     elif selected == "graphql":
-        bundle = _import_graphql(raw, source, default_base_url)
+        bundle = _import_graphql(raw, source, default_base_url, secret_vault)
     elif selected == "browser":
         bundle = _import_browser(data, source, secret_vault)
     else:  # pragma: no cover - Literal validation protects this route

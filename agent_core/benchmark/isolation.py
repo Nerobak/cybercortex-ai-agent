@@ -163,6 +163,15 @@ class BenchmarkBlindnessGuard:
                 "initial-graphql-operations-present": len(
                     initial_state.graphql_operations
                 ),
+                "initial-graphql-surfaces-present": len(initial_state.graphql_surfaces),
+                "initial-graphql-types-present": len(initial_state.graphql_types),
+                "initial-graphql-fields-present": len(initial_state.graphql_fields),
+                "initial-graphql-arguments-present": len(
+                    initial_state.graphql_arguments
+                ),
+                "initial-graphql-variables-present": len(
+                    initial_state.graphql_variables
+                ),
                 "initial-uploads-present": len(initial_state.uploads),
                 "initial-workflows-present": len(initial_state.workflows),
                 "initial-evidence-present": len(initial_state.evidence),

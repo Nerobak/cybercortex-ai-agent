@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+from urllib.parse import urljoin
 
 from pydantic import Field, StrictFloat, StrictInt
 
@@ -53,6 +54,16 @@ from agent_core.research.authenticated_discovery import (
 from agent_core.research.budgets import ResearchBudgetManager
 from agent_core.research.candidates import ExperimentCandidateBuilder
 from agent_core.research.compiler import ExperimentCompilerContext
+from agent_core.research.graphql import (
+    GraphQLAuthenticationRequirement,
+    build_graphql_graph_assertions,
+)
+from agent_core.research.graphql_discovery import (
+    GraphQLAuthenticatedDiscovery,
+    GraphQLDiscoveryConfig,
+    GraphQLDiscoverySession,
+    GraphQLSemanticAcquirer,
+)
 from agent_core.research.reasoning import (
     PublicSafeResearchPacketBuilder,
     ResearchReasoningEngine,
@@ -71,6 +82,7 @@ from agent_core.research.types import (
     ProvenanceProducerType,
     ResearchContract,
     ResearchRunStatus,
+    SurfaceType,
     TargetClass,
 )
 from agent_core.tool_runner import DEFAULT_TOOL_TIMEOUT, ToolRunner
@@ -89,6 +101,7 @@ class BootstrapStopReason(str, Enum):
 
 class ResearchBootstrapLimits(ResearchContract):
     maximum_discovery_target_requests: StrictInt = Field(default=30, ge=1, le=5_000)
+    maximum_graphql_discovery_requests: StrictInt = Field(default=3, ge=0, le=20)
     maximum_discovered_endpoints: StrictInt = Field(default=500, ge=1, le=5_000)
     maximum_parameters_imported: StrictInt = Field(default=1_000, ge=1, le=10_000)
     maximum_request_templates: StrictInt = Field(default=500, ge=1, le=5_000)
@@ -163,6 +176,7 @@ class ResearchBootstrapper:
         authenticated_discovery_adapter: (
             ControlledAccountDiscoveryAdapter | None
         ) = None,
+        graphql_discovery_config: GraphQLDiscoveryConfig | None = None,
         reasoning_engine: ResearchReasoningEngine | None = None,
         routing_policy: ModelRoutingPolicy | None = None,
         packet_builder: PublicSafeResearchPacketBuilder | None = None,
@@ -197,6 +211,21 @@ class ResearchBootstrapper:
         self.target_id = target_id
         self.profile = profile
         self.limits = limits or ResearchBootstrapLimits()
+        self.graphql_discovery_config = (
+            graphql_discovery_config
+            or GraphQLDiscoveryConfig(
+                maximum_graphql_discovery_requests=(
+                    self.limits.maximum_graphql_discovery_requests
+                )
+            )
+        )
+        if (
+            self.graphql_discovery_config.maximum_graphql_discovery_requests
+            > self.limits.maximum_graphql_discovery_requests
+        ):
+            raise ValueError(
+                "GraphQL discovery request ceiling exceeds the bootstrap ceiling"
+            )
         self.discovery_orchestrator = (
             discovery_orchestrator or AdaptiveAssessmentOrchestrator()
         )
@@ -240,6 +269,30 @@ class ResearchBootstrapper:
         else:
             self.tool_runner = tool_runner
         candidate_transport = getattr(self.tool_runner, "http_client", None)
+        graphql_session = None
+        if isinstance(candidate_transport, ScopedHTTPClient):
+            graphql_session = GraphQLDiscoverySession(
+                client=candidate_transport,
+                policy=policy,
+                request_budget=candidate_transport.budget,  # type: ignore[arg-type]
+                config=self.graphql_discovery_config,
+            )
+        self.graphql_acquirer = GraphQLSemanticAcquirer(
+            config=self.graphql_discovery_config,
+            session=graphql_session,
+        )
+        self.graphql_authenticated_discovery = (
+            GraphQLAuthenticatedDiscovery(
+                session=graphql_session,
+                policy=policy,
+                controlled_context=controlled_context,
+                vault=vault,
+            )
+            if graphql_session is not None
+            and vault is not None
+            and profile == "authenticated"
+            else None
+        )
         self.authenticated_discovery_adapter = authenticated_discovery_adapter
         if (
             self.authenticated_discovery_adapter is None
@@ -479,27 +532,6 @@ class ResearchBootstrapper:
             )
         if not isinstance(result, dict):
             raise ValueError("discovery runner returned an invalid result")
-        after = self.request_budget.snapshot()
-        delta = RequestDelta.from_snapshots(before, after)
-        if (
-            previously_consumed + delta.total
-            > self.limits.maximum_discovery_target_requests
-        ):
-            failure_progress = self._updated_progress(
-                state,
-                progress,
-                request_delta=delta,
-                limitations=(
-                    "Discovery exceeded the configured bootstrap request limit.",
-                ),
-            )
-            accounted = self._with_progress_and_budget(state, failure_progress)
-            return self._transition(
-                state,
-                ResearchRunStatus.stopped,
-                BootstrapStopReason.discovery_request_budget_exhausted.value,
-                replacement=accounted,
-            )
         bundle = self._capture_from_result(result)
         surface = self._canonical_surface(
             target.canonical_reference, result=result, capture_bundle=bundle
@@ -527,6 +559,42 @@ class ResearchBootstrapper:
             occurred_at=self._now(state),
         )
         adapted = self._surface_adapter.apply(state, records)
+        graphql_limitations: set[str] = set()
+        graphql_sources: tuple[Any, ...] = (
+            (bundle, result) if bundle is not None else (result,)
+        )
+        for graphql_source in graphql_sources:
+            graphql_result = self.graphql_acquirer.acquire(
+                adapted,
+                graphql_source,
+                target_id=target.target_id,
+                target_url=target.canonical_reference,
+                vault=self.vault,
+                occurred_at=self._now(adapted),
+            )
+            adapted = graphql_result.delta.apply(adapted)
+            graphql_limitations.update(graphql_result.limitations)
+        after = self.request_budget.snapshot()
+        delta = RequestDelta.from_snapshots(before, after)
+        if (
+            previously_consumed + delta.total
+            > self.limits.maximum_discovery_target_requests
+        ):
+            failure_progress = self._updated_progress(
+                state,
+                progress,
+                request_delta=delta,
+                limitations=(
+                    "Discovery exceeded the configured bootstrap request limit.",
+                ),
+            )
+            accounted = self._with_progress_and_budget(state, failure_progress)
+            return self._transition(
+                state,
+                ResearchRunStatus.stopped,
+                BootstrapStopReason.discovery_request_budget_exhausted.value,
+                replacement=accounted,
+            )
         if bundle is not None:
             self._capture_cache[target.target_id] = bundle
         next_progress = self._updated_progress(
@@ -535,7 +603,7 @@ class ResearchBootstrapper:
             plan_reference=opaque_reference(plan.run_id, "discovery-plan"),
             discovery_completed=True,
             request_delta=delta,
-            limitations=tuple(surface.limitations),
+            limitations=tuple((*surface.limitations, *sorted(graphql_limitations))),
         )
         adapted = self._with_progress_and_budget(adapted, next_progress)
         if self._wall_time_exhausted():
@@ -579,26 +647,6 @@ class ResearchBootstrapper:
         )
         acquired = (*acquired, *authenticated)
         self._register_acquired_objects(acquired)
-        after = self.request_budget.snapshot()
-        delta = RequestDelta.from_snapshots(before, after)
-        if (
-            progress.request_delta.total if progress else 0
-        ) + delta.total > self.limits.maximum_discovery_target_requests:
-            failure_progress = self._updated_progress(
-                state,
-                progress,
-                request_delta=delta,
-                limitations=(
-                    "Controlled object acquisition exceeded the bootstrap request limit.",
-                ),
-            )
-            accounted = self._with_progress_and_budget(state, failure_progress)
-            return self._transition(
-                state,
-                ResearchRunStatus.stopped,
-                BootstrapStopReason.discovery_request_budget_exhausted.value,
-                replacement=accounted,
-            )
         context_records = self._context_adapter.adapt(
             self.controlled_context,
             state,
@@ -609,6 +657,42 @@ class ResearchBootstrapper:
             occurred_at=self._now(state),
         )
         adapted = self._context_adapter.apply(state, context_records)
+        graphql_limitations: tuple[str, ...] = ()
+        if bundle is not None:
+            graphql_result = self.graphql_acquirer.acquire(
+                adapted,
+                bundle,
+                target_id=target.target_id,
+                target_url=target.canonical_reference,
+                vault=self.vault,
+                occurred_at=self._now(adapted),
+            )
+            adapted = graphql_result.delta.apply(adapted)
+            graphql_limitations = graphql_result.limitations
+        adapted, authenticated_graphql_limitations = (
+            self._discover_authenticated_graphql(adapted, target)
+        )
+        after = self.request_budget.snapshot()
+        delta = RequestDelta.from_snapshots(before, after)
+        if (
+            progress.request_delta.total if progress else 0
+        ) + delta.total > self.limits.maximum_discovery_target_requests:
+            failure_progress = self._updated_progress(
+                state,
+                progress,
+                request_delta=delta,
+                limitations=(
+                    "Controlled and GraphQL acquisition exceeded the configured "
+                    "bootstrap request limit.",
+                ),
+            )
+            accounted = self._with_progress_and_budget(state, failure_progress)
+            return self._transition(
+                state,
+                ResearchRunStatus.stopped,
+                BootstrapStopReason.discovery_request_budget_exhausted.value,
+                replacement=accounted,
+            )
         templates = self._template_factory.build_all(
             adapted,
             target_id=target.target_id,
@@ -626,6 +710,8 @@ class ResearchBootstrapper:
                 *context_records.limitations,
                 *acquisition_limitations,
                 *authenticated_limitations,
+                *graphql_limitations,
+                *authenticated_graphql_limitations,
             ),
         )
         adapted = self._with_progress_and_budget(adapted, next_progress)
@@ -654,6 +740,44 @@ class ResearchBootstrapper:
         target = self._target(state)
         canonical = self._surface_adapter.to_canonical_surface(
             state, target_id=target.target_id
+        )
+        graphql_surface_ids = {
+            item.surface_id
+            for item in state.surfaces
+            if item.target_id == target.target_id
+            and item.surface_type is SurfaceType.graphql
+        } | {
+            item.surface_id
+            for item in state.graphql_surfaces
+            if item.target_id == target.target_id
+        }
+        graphql_endpoint_keys = {
+            (item.method.value, item.route_template)
+            for item in state.endpoints
+            if item.surface_id in graphql_surface_ids
+        }
+
+        def is_graphql_route(item: Mapping[str, Any]) -> bool:
+            return (
+                str(item.get("method") or "GET").upper(),
+                str(item.get("path") or "/"),
+            ) in graphql_endpoint_keys
+
+        canonical = canonical.model_copy(
+            update={
+                "routes": [
+                    item for item in canonical.routes if not is_graphql_route(item)
+                ],
+                "parameters": [
+                    item for item in canonical.parameters if not is_graphql_route(item)
+                ],
+                "auth_boundaries": [
+                    item
+                    for item in canonical.auth_boundaries
+                    if not is_graphql_route(item)
+                ],
+                "graphql": {},
+            }
         )
         generated = generate_surface_hypotheses(canonical)
         remaining = max(
@@ -838,6 +962,43 @@ class ResearchBootstrapper:
         )
         return result.objects, result.limitations
 
+    def _discover_authenticated_graphql(
+        self, state: ResearchState, target: TargetAsset
+    ) -> tuple[ResearchState, tuple[str, ...]]:
+        discovery = self.graphql_authenticated_discovery
+        if discovery is None or not self.controlled_context.accounts:
+            return state, ()
+        endpoint_by_id = {item.endpoint_id: item for item in state.endpoints}
+        eligible_requirements = {
+            GraphQLAuthenticationRequirement.authenticated_observed,
+            GraphQLAuthenticationRequirement.authentication_required,
+            GraphQLAuthenticationRequirement.role_bound,
+            GraphQLAuthenticationRequirement.tenant_bound,
+        }
+        current = state
+        limitations: set[str] = set()
+        for surface in state.graphql_surfaces:
+            if (
+                surface.target_id != target.target_id
+                or surface.authentication_requirement not in eligible_requirements
+            ):
+                continue
+            endpoint = endpoint_by_id.get(surface.endpoint_id)
+            if endpoint is None:
+                continue
+            result = discovery.observe(
+                current,
+                target_id=target.target_id,
+                endpoint_url=urljoin(
+                    target.canonical_reference,
+                    endpoint.route_template,
+                ),
+                occurred_at=self._now(current),
+            )
+            current = result.delta.apply(current)
+            limitations.update(result.limitations)
+        return current, tuple(sorted(limitations))
+
     def _register_acquired_objects(self, objects: Sequence[ControlledObject]) -> None:
         """Retain raw values only in the process-local controlled context."""
 
@@ -880,11 +1041,22 @@ class ResearchBootstrapper:
                 updated_at=lifecycle.updated_at,
             )
             lifecycle = ResearchState.model_validate(payload)
+        graph_assertions = []
+        for assertion in build_graphql_graph_assertions(
+            lifecycle, asserted_at=timestamp
+        ):
+            try:
+                self.store.load_graph_assertion(
+                    lifecycle.research_id, assertion.assertion_id
+                )
+            except KeyError:
+                graph_assertions.append(assertion)
         return self.store.commit_revision(
             state.research_id,
             expected_revision=state.revision,
             state=lifecycle,
             events=(event,),
+            graph_assertions=tuple(graph_assertions),
         )
 
     def _updated_progress(
@@ -1011,7 +1183,7 @@ class ResearchBootstrapper:
     def _permitted_tools(self, selected: Sequence[str]) -> list[str]:
         permitted = []
         for name in selected:
-            if name == "ai_report_writer":
+            if name in {"ai_report_writer", "graphql_introspection_checker"}:
                 continue
             metadata = TOOLS.get(name)
             if metadata is None:
