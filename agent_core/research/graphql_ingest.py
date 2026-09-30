@@ -155,15 +155,41 @@ class ParsedGraphQLDocument(ResearchContract):
     token_count: StrictInt = Field(ge=1, le=MAX_GRAPHQL_TOKENS)
 
 
+class GraphQLErrorPathObservation(ResearchContract):
+    """One safe error-path association retained from a GraphQL response."""
+
+    path: tuple[StrictStr | StrictInt, ...] = Field(min_length=1, max_length=32)
+    error_class: GraphQLErrorClass
+
+    @model_validator(mode="after")
+    def validate_path(self) -> "GraphQLErrorPathObservation":
+        if any(
+            (type(component) is int and component < 0)
+            or (
+                isinstance(component, str)
+                and re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]{0,254}", component) is None
+            )
+            for component in self.path
+        ):
+            raise ValueError("GraphQL error paths must contain safe path components")
+        return self
+
+
 class GraphQLResponseObservation(ResearchContract):
     envelope: GraphQLResponseEnvelope
     data_present: StrictBool = False
     errors_present: StrictBool = False
     error_classes: tuple[GraphQLErrorClass, ...] = Field(default=(), max_length=16)
+    error_paths: tuple[GraphQLErrorPathObservation, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_RESPONSE_ERRORS
+    )
     typename_observations: tuple[StrictStr, ...] = Field(
         default=(), max_length=MAX_GRAPHQL_RESPONSE_TYPENAMES
     )
     object_shape: tuple[StrictStr, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_RESPONSE_SHAPE_NODES
+    )
+    null_paths: tuple[StrictStr, ...] = Field(
         default=(), max_length=MAX_GRAPHQL_RESPONSE_SHAPE_NODES
     )
     evidence_digest: StrictStr = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -721,18 +747,17 @@ def _response_digest(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
-def _error_classes(
-    payload: Mapping[str, Any], status_code: int | None, *, max_errors: int
-) -> tuple[GraphQLErrorClass, ...]:
+def _error_class(
+    item: Mapping[str, Any], status_code: int | None = None
+) -> GraphQLErrorClass:
     if status_code == 401:
-        return (GraphQLErrorClass.authentication_error,)
+        return GraphQLErrorClass.authentication_error
     if status_code == 403:
-        return (GraphQLErrorClass.authorization_error,)
+        return GraphQLErrorClass.authorization_error
     if status_code == 404:
-        return (GraphQLErrorClass.not_found,)
+        return GraphQLErrorClass.not_found
     if status_code == 429:
-        return (GraphQLErrorClass.rate_limited,)
-    output: set[GraphQLErrorClass] = set()
+        return GraphQLErrorClass.rate_limited
     code_map = {
         "GRAPHQL_PARSE_FAILED": GraphQLErrorClass.parse_error,
         "GRAPHQL_VALIDATION_FAILED": GraphQLErrorClass.validation_error,
@@ -745,25 +770,31 @@ def _error_classes(
         "TOO_MANY_REQUESTS": GraphQLErrorClass.rate_limited,
         "INTERNAL_SERVER_ERROR": GraphQLErrorClass.resolver_error,
     }
+    extensions = item.get("extensions")
+    code = (
+        str(extensions.get("code") or extensions.get("category") or "").upper()
+        if isinstance(extensions, Mapping)
+        else ""
+    )
+    if code in code_map:
+        return code_map[code]
+    if item.get("path") is not None:
+        return GraphQLErrorClass.resolver_error
+    if item.get("locations") is not None:
+        return GraphQLErrorClass.validation_error
+    return GraphQLErrorClass.unknown
+
+
+def _error_classes(
+    payload: Mapping[str, Any], status_code: int | None, *, max_errors: int
+) -> tuple[GraphQLErrorClass, ...]:
+    if status_code in {401, 403, 404, 429}:
+        return (_error_class({}, status_code),)
     errors = payload.get("errors")
     bounded_errors = errors[:max_errors] if isinstance(errors, list) else ()
-    for item in bounded_errors:
-        if not isinstance(item, Mapping):
-            continue
-        extensions = item.get("extensions")
-        code = (
-            str(extensions.get("code") or "").upper()
-            if isinstance(extensions, Mapping)
-            else ""
-        )
-        if code in code_map:
-            output.add(code_map[code])
-        elif item.get("path") is not None:
-            output.add(GraphQLErrorClass.resolver_error)
-        elif item.get("locations") is not None:
-            output.add(GraphQLErrorClass.validation_error)
-        else:
-            output.add(GraphQLErrorClass.unknown)
+    output = {
+        _error_class(item) for item in bounded_errors if isinstance(item, Mapping)
+    }
     return tuple(sorted(output, key=lambda item: item.value))
 
 
@@ -861,6 +892,7 @@ def analyze_graphql_response(
         )
 
     shape: set[str] = set()
+    null_paths: set[str] = set()
     typenames: set[str] = set()
     count = 0
     shape_truncated = False
@@ -888,6 +920,8 @@ def analyze_graphql_response(
                     else "scalar"
                 )
                 shape.add(f"{child_path}:{kind}")
+                if item is None:
+                    null_paths.add(child_path)
                 count += 1
                 if (
                     name == "__typename"
@@ -920,8 +954,34 @@ def analyze_graphql_response(
         data_present=data_present,
         errors_present=errors_present,
         error_classes=_error_classes(parsed, status_code, max_errors=max_errors),
+        error_paths=tuple(
+            GraphQLErrorPathObservation(
+                path=tuple(
+                    component
+                    for component in item.get("path", ())[:MAX_GRAPHQL_RESPONSE_DEPTH]
+                    if (type(component) is int and component >= 0)
+                    or (
+                        isinstance(component, str)
+                        and re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]{0,254}", component)
+                    )
+                ),
+                error_class=_error_class(item, status_code),
+            )
+            for item in bounded_errors
+            if isinstance(item, Mapping)
+            and isinstance(item.get("path"), list)
+            and any(
+                (type(component) is int and component >= 0)
+                or (
+                    isinstance(component, str)
+                    and re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]{0,254}", component)
+                )
+                for component in item.get("path", ())[:MAX_GRAPHQL_RESPONSE_DEPTH]
+            )
+        ),
         typename_observations=tuple(sorted(typenames))[:MAX_GRAPHQL_RESPONSE_TYPENAMES],
         object_shape=tuple(sorted(shape))[:MAX_GRAPHQL_RESPONSE_SHAPE_NODES],
+        null_paths=tuple(sorted(null_paths))[:MAX_GRAPHQL_RESPONSE_SHAPE_NODES],
         evidence_digest=digest,
         response_bytes=len(raw),
         truncated=(
@@ -2737,6 +2797,7 @@ __all__ = [
     "GraphQLControlledObjectEvidence",
     "GraphQLDocumentError",
     "GraphQLErrorClass",
+    "GraphQLErrorPathObservation",
     "GraphQLResponseEnvelope",
     "GraphQLResponseObservation",
     "GraphQLSemanticDelta",

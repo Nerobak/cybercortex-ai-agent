@@ -73,6 +73,43 @@ class InvariantResult(ResearchContract):
     satisfied: StrictBool
 
 
+class GraphQLErrorPathEvidence(ResearchContract):
+    """A bounded GraphQL error association without message text."""
+
+    path: tuple[OpaqueIdentifier | StrictInt, ...] = Field(min_length=1, max_length=32)
+    error_class: GraphQLErrorClass
+
+
+class GraphQLStateDifferentialEvidence(ResearchContract):
+    """Authoritative registered effect evidence for a GraphQL mutation."""
+
+    invariant_reference: OpaqueIdentifier
+    identity_reference: OpaqueIdentifier | None = None
+    object_references: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=20)
+    workflow_state_reference: OpaqueIdentifier | None = None
+    before_fingerprint: Sha256Digest
+    after_fingerprint: Sha256Digest
+    protected_effect_observed: StrictBool
+    authoritative: StrictBool = True
+
+    @model_validator(mode="after")
+    def validate_differential(self) -> "GraphQLStateDifferentialEvidence":
+        if len(self.object_references) != len(set(self.object_references)):
+            raise ValueError("GraphQL state object references must be unique")
+        object.__setattr__(
+            self, "object_references", tuple(sorted(self.object_references))
+        )
+        changed = self.before_fingerprint != self.after_fingerprint
+        if self.protected_effect_observed != changed:
+            raise ValueError(
+                "GraphQL protected-effect evidence must match its state differential"
+            )
+        reject_secret_material(
+            self.model_dump(mode="json"), location="GraphQL state evidence"
+        )
+        return self
+
+
 class GraphQLRuntimeResponseEvidence(ResearchContract):
     """Bounded GraphQL response structure; never a response value or body."""
 
@@ -89,11 +126,15 @@ class GraphQLRuntimeResponseEvidence(ResearchContract):
     data_present: StrictBool = False
     errors_present: StrictBool = False
     error_classes: tuple[GraphQLErrorClass, ...] = Field(default=(), max_length=32)
+    error_paths: tuple[GraphQLErrorPathEvidence, ...] = Field(default=(), max_length=32)
     error_count: StrictInt = Field(default=0, ge=0, le=100)
     typename_observations: tuple[OpaqueIdentifier, ...] = Field(
         default=(), max_length=128
     )
     selected_field_presence: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=200
+    )
+    selected_field_nulls: tuple[OpaqueIdentifier, ...] = Field(
         default=(), max_length=200
     )
     object_shape_fingerprint: Sha256Digest
@@ -105,8 +146,40 @@ class GraphQLRuntimeResponseEvidence(ResearchContract):
 
     @model_validator(mode="after")
     def enforce_safe_graphql_evidence(self) -> "GraphQLRuntimeResponseEvidence":
-        if not self.errors_present and (self.error_count or self.error_classes):
+        if not self.errors_present and (
+            self.error_count or self.error_classes or self.error_paths
+        ):
             raise ValueError("GraphQL error evidence requires an errors envelope")
+        if not set(self.selected_field_nulls).issubset(
+            set(self.selected_field_presence)
+        ):
+            raise ValueError("GraphQL null fields must also be structurally present")
+        if any(
+            item.error_class is not GraphQLErrorClass.unknown
+            and item.error_class not in self.error_classes
+            for item in self.error_paths
+        ):
+            raise ValueError("GraphQL error path class is absent from response classes")
+        for name in (
+            "object_references",
+            "error_classes",
+            "typename_observations",
+            "selected_field_presence",
+            "selected_field_nulls",
+        ):
+            values = getattr(self, name)
+            if len(values) != len(set(values)):
+                raise ValueError(f"GraphQL {name} must not contain duplicates")
+            object.__setattr__(
+                self,
+                name,
+                tuple(
+                    sorted(
+                        values,
+                        key=lambda item: getattr(item, "value", str(item)),
+                    )
+                ),
+            )
         reject_secret_material(
             self.model_dump(mode="json"), location="GraphQL runtime evidence"
         )
@@ -152,6 +225,9 @@ class PrimitiveExecutionEvidence(ResearchContract):
     invariant_results: tuple[InvariantResult, ...] = Field(default=(), max_length=20)
     graphql_responses: tuple[GraphQLRuntimeResponseEvidence, ...] = Field(
         default=(), max_length=10
+    )
+    graphql_state_differentials: tuple[GraphQLStateDifferentialEvidence, ...] = Field(
+        default=(), max_length=20
     )
     graphql_trace_events: tuple[GraphQLRuntimeTraceEvent, ...] = Field(
         default=(), max_length=40
@@ -221,7 +297,9 @@ __all__ = [
     "CleanupExecutionResult",
     "ExperimentOutcome",
     "ExperimentResultClassification",
+    "GraphQLErrorPathEvidence",
     "GraphQLRuntimeResponseEvidence",
+    "GraphQLStateDifferentialEvidence",
     "GraphQLRuntimeTraceEvent",
     "InvariantResult",
     "PrimitiveExecutionEvidence",

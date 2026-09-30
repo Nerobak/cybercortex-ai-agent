@@ -62,6 +62,7 @@ MAX_GRAPHQL_HYPOTHESIS_CANDIDATES = 10_000
 
 class GraphQLHypothesisProperty(str, Enum):
     object_authorization = "object-authorization"
+    ownership_authorization = "ownership-authorization"
     field_level_authorization = "field-level-authorization"
     operation_level_authorization = "operation-level-authorization"
     authentication_enforcement = "authentication-enforcement"
@@ -1797,6 +1798,9 @@ class GraphQLHypothesisGenerator:
     def _secure_property_is_proven(state: ResearchState, candidate: _Candidate) -> bool:
         secure_markers = {
             GraphQLHypothesisProperty.object_authorization: {
+                "ownership-authorization-enforced"
+            },
+            GraphQLHypothesisProperty.ownership_authorization: {
                 "ownership-authorization-enforced"
             },
             GraphQLHypothesisProperty.field_level_authorization: {

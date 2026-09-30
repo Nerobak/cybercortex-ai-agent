@@ -168,6 +168,33 @@ def test_error_classification_uses_status_and_structured_codes_not_prose():
     assert unauthorized.error_classes == (GraphQLErrorClass.authentication_error,)
 
 
+def test_error_paths_retain_their_own_safe_structural_classification():
+    result = analyze_graphql_response(
+        {
+            "data": {"viewer": {"email": None}, "catalog": None},
+            "errors": [
+                {
+                    "message": "excluded",
+                    "path": ["viewer", "email"],
+                    "extensions": {"code": "FORBIDDEN"},
+                },
+                {
+                    "message": "excluded too",
+                    "path": ["catalog"],
+                    "extensions": {"category": "GRAPHQL_VALIDATION_FAILED"},
+                },
+            ],
+        },
+        request_was_graphql=True,
+    )
+
+    assert tuple((item.path, item.error_class) for item in result.error_paths) == (
+        (("viewer", "email"), GraphQLErrorClass.authorization_error),
+        (("catalog",), GraphQLErrorClass.validation_error),
+    )
+    assert "excluded" not in result.model_dump_json()
+
+
 def test_document_ingestion_is_valid_idempotent_and_links_one_variable():
     state = semantic_state()
     delta = GraphQLSemanticIngestor().from_document(

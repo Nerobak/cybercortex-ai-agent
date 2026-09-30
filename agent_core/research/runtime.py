@@ -52,6 +52,7 @@ from agent_core.research.outcomes import (
     CleanupExecutionResult,
     ExperimentOutcome,
     ExperimentResultClassification,
+    GraphQLErrorPathEvidence,
     GraphQLRuntimeResponseEvidence,
     GraphQLRuntimeTraceEvent,
     ProposedExecutionMetadata,
@@ -775,6 +776,30 @@ class ResearchRuntime:
                 if re.search(rf"(?:^|\.){re.escape(name)}(?:\[\])?:", shape_names)
             )
         )
+        nulls = tuple(
+            sorted(
+                field_id
+                for field_id, name in fields.items()
+                if any(
+                    re.search(rf"(?:^|\.){re.escape(name)}(?:\[\])?$", path)
+                    for path in observation.null_paths
+                )
+            )
+        )
+        field_names = {
+            item.name: item.field_id for item in self._current_state().graphql_fields
+        }
+        error_paths = tuple(
+            GraphQLErrorPathEvidence(
+                path=item.path,
+                error_class=item.error_class,
+            )
+            for item in observation.error_paths
+            if any(
+                isinstance(component, str) and component in field_names
+                for component in item.path
+            )
+        )
         controlled_match = None
         if request.object_ids:
             expected_values = tuple(
@@ -807,9 +832,11 @@ class ResearchRuntime:
             data_present=observation.data_present,
             errors_present=observation.errors_present,
             error_classes=observation.error_classes,
+            error_paths=error_paths,
             error_count=error_count,
             typename_observations=observation.typename_observations,
             selected_field_presence=present,
+            selected_field_nulls=nulls,
             object_shape_fingerprint=_digest(observation.object_shape),
             controlled_object_reference_match=controlled_match,
             response_digest=observation.evidence_digest,

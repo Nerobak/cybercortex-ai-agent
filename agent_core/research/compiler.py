@@ -1521,9 +1521,12 @@ class ExperimentCompiler:
             GraphQLCandidateKind.object_authorization: "object-authorization",
             GraphQLCandidateKind.authentication: "authentication-enforcement",
             GraphQLCandidateKind.field_authorization: "field-level-authorization",
+            GraphQLCandidateKind.operation_authorization: (
+                "operation-level-authorization"
+            ),
             GraphQLCandidateKind.role_bound: "role-bound-access",
             GraphQLCandidateKind.tenant_bound: "tenant-bound-access",
-            GraphQLCandidateKind.ownership: "object-authorization",
+            GraphQLCandidateKind.ownership: "ownership-authorization",
             GraphQLCandidateKind.mutation_authorization: "mutation-authorization",
             GraphQLCandidateKind.cross_surface: "cross-surface-authorization",
             GraphQLCandidateKind.nested_resolver: (
@@ -1558,7 +1561,14 @@ class ExperimentCompiler:
             GraphQLCandidateKind.cross_surface,
         } and (len(identity_ids) < 2 or not object_ids):
             _fail(CompilerErrorCode.graphql_binding_mismatch)
-        if kind is GraphQLCandidateKind.role_bound and len(identity_ids) < 2:
+        if (
+            kind
+            in {
+                GraphQLCandidateKind.role_bound,
+                GraphQLCandidateKind.operation_authorization,
+            }
+            and len(identity_ids) < 2
+        ):
             _fail(CompilerErrorCode.graphql_binding_mismatch)
         if kind is GraphQLCandidateKind.input_validation and not any(
             isinstance(item, GraphQLVariableMutationInput) for item in graphql_inputs

@@ -18,6 +18,10 @@ from agent_core.research.events import (
 )
 from agent_core.research.experiments import AuthorizedExperiment, SecurityExperiment
 from agent_core.research.graph import GraphAssertion, GraphRelation
+from agent_core.research.graphql_evaluation import (
+    GraphQLDifferentialEvaluator,
+    GraphQLEvaluationResult,
+)
 from agent_core.research.outcomes import (
     ExperimentOutcome,
     ExperimentResultClassification,
@@ -119,6 +123,7 @@ class ResearchEvaluation(ResearchContract):
     candidate_finding: FindingRecord | None = None
     relationships: tuple[Relationship, ...] = Field(default=(), max_length=20)
     graph_assertions: tuple[GraphAssertion, ...] = Field(default=(), max_length=20)
+    graphql_evaluation: GraphQLEvaluationResult | None = None
     pivot_recommended: bool = False
     stop_required: bool = False
     service_instability: bool = False
@@ -216,11 +221,13 @@ class ExperimentEvaluator:
         *,
         allowed_vulnerability_categories: Iterable[str] = (),
         derivation_rules: Sequence[HypothesisDerivationRule] = (),
+        graphql_evaluator: GraphQLDifferentialEvaluator | None = None,
     ) -> None:
         self.allowed_vulnerability_categories = frozenset(
             allowed_vulnerability_categories
         )
         self.derivation_rules = tuple(derivation_rules)
+        self.graphql_evaluator = graphql_evaluator or GraphQLDifferentialEvaluator()
 
     def evaluate(
         self,
@@ -246,6 +253,15 @@ class ExperimentEvaluator:
         )
         if hypothesis is None:
             raise ValueError("experiment hypothesis is absent from research state")
+        graphql_evaluation = None
+        if self.graphql_evaluator.applies_to(experiment):
+            graphql_evaluation = self.graphql_evaluator.evaluate(
+                experiment,
+                outcome,
+                hypothesis,
+                prior_state,
+            )
+            outcome = graphql_evaluation.classified_outcome(outcome)
         evaluation_id = _identifier("evaluation", outcome.outcome_id)
         provenance_id = _identifier("evaluation-provenance", outcome.outcome_id)
         evidence = outcome.evidence_references
@@ -272,6 +288,7 @@ class ExperimentEvaluator:
             hypothesis,
             outcome,
             provenance_id=provenance_id,
+            graphql_evaluation=graphql_evaluation,
         )
         if classification is ExperimentResultClassification.vulnerable_signal and (
             candidate is not None
@@ -311,12 +328,17 @@ class ExperimentEvaluator:
             candidate_finding=candidate,
             relationships=relationships,
             graph_assertions=assertions,
+            graphql_evaluation=graphql_evaluation,
             pivot_recommended=pivot,
             stop_required=stop,
             service_instability=(
                 classification is ExperimentResultClassification.runtime_failed
             ),
-            summary=f"Deterministically classified outcome as {classification.value}.",
+            summary=(
+                graphql_evaluation.summary
+                if graphql_evaluation is not None
+                else f"Deterministically classified outcome as {classification.value}."
+            ),
         )
 
     def apply(
@@ -709,6 +731,7 @@ class ExperimentEvaluator:
         outcome: ExperimentOutcome,
         *,
         provenance_id: str,
+        graphql_evaluation: GraphQLEvaluationResult | None = None,
     ) -> FindingRecord | None:
         if (
             outcome.result_classification
@@ -736,10 +759,30 @@ class ExperimentEvaluator:
             target_id=experiment.target.target_id,
             surface_id=experiment.target.surface_id,
             endpoint_id=experiment.target.endpoint_id,
+            graphql_operation_id=(
+                graphql_evaluation.operation_reference
+                if graphql_evaluation is not None
+                else None
+            ),
+            graphql_field_ids=(
+                graphql_evaluation.field_references
+                if graphql_evaluation is not None
+                else ()
+            ),
+            graphql_argument_ids=(
+                graphql_evaluation.argument_references
+                if graphql_evaluation is not None
+                else ()
+            ),
             primitive=experiment.primitive_steps[0].primitive_name,
             capability=experiment.capability.name,
-            security_property_reference=_identifier(
-                "security-property", experiment.expected_secure_behavior
+            security_property_reference=(
+                f"graphql-security-property:{graphql_evaluation.security_property.value}"
+                if graphql_evaluation is not None
+                and graphql_evaluation.security_property is not None
+                else _identifier(
+                    "security-property", experiment.expected_secure_behavior
+                )
             ),
             controlled_identity_ids=tuple(
                 item
@@ -754,7 +797,11 @@ class ExperimentEvaluator:
                 if experiment.identity_context.relationship is not None
                 else None
             ),
-            controlled_object_ids=experiment.mutation.controlled_object_ids,
+            controlled_object_ids=(
+                graphql_evaluation.controlled_object_references
+                if graphql_evaluation is not None
+                else experiment.mutation.controlled_object_ids
+            ),
             expected_secure_behavior=experiment.expected_secure_behavior,
             observed_vulnerable_behavior=experiment.expected_vulnerable_behavior,
             source_request_delta=outcome.request_delta,

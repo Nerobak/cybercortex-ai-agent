@@ -286,6 +286,7 @@ class GraphQLCandidateKind(str, Enum):
     object_authorization = "object_authorization"
     authentication = "authentication"
     field_authorization = "field_authorization"
+    operation_authorization = "operation_authorization"
     role_bound = "role_bound"
     tenant_bound = "tenant_bound"
     ownership = "ownership"

@@ -73,6 +73,8 @@ from agent_core.research.types import (
     FindingId,
     FindingConfirmationAction,
     FindingStatus,
+    GraphQLArgumentId,
+    GraphQLFieldId,
     GraphQLOperationId,
     GraphQLOperationType,
     HttpMethod,
@@ -1041,6 +1043,11 @@ class FindingRecord(ResearchContract):
     target_id: TargetAssetId | None = None
     surface_id: SurfaceId | None = None
     endpoint_id: EndpointId | None = None
+    graphql_operation_id: GraphQLOperationId | None = None
+    graphql_field_ids: tuple[GraphQLFieldId, ...] = Field(default=(), max_length=64)
+    graphql_argument_ids: tuple[GraphQLArgumentId, ...] = Field(
+        default=(), max_length=64
+    )
     primitive: OpaqueIdentifier | None = None
     capability: OpaqueIdentifier | None = None
     security_property_reference: OpaqueIdentifier | None = None
@@ -1105,6 +1112,8 @@ class FindingRecord(ResearchContract):
         for field_name in (
             "controlled_identity_ids",
             "controlled_object_ids",
+            "graphql_field_ids",
+            "graphql_argument_ids",
             "reproduction_ids",
             "confirmed_evidence_references",
             "conflicting_evidence_references",
@@ -2473,6 +2482,36 @@ class ResearchState(ResearchContract):
             )
             _require_references(
                 item.reproduction_ids, reproduction_ids, "finding reproductions"
+            )
+            _require_optional_reference(item.target_id, target_ids, "finding target")
+            _require_optional_reference(item.surface_id, surface_ids, "finding surface")
+            _require_optional_reference(
+                item.endpoint_id, endpoint_ids, "finding endpoint"
+            )
+            _require_optional_reference(
+                item.graphql_operation_id,
+                graphql_semantic_operation_ids,
+                "finding GraphQL operation",
+            )
+            _require_references(
+                item.graphql_field_ids,
+                graphql_field_ids,
+                "finding GraphQL fields",
+            )
+            _require_references(
+                item.graphql_argument_ids,
+                graphql_argument_ids,
+                "finding GraphQL arguments",
+            )
+            _require_references(
+                item.controlled_identity_ids,
+                identity_ids,
+                "finding controlled identities",
+            )
+            _require_references(
+                item.controlled_object_ids,
+                {value.object_id for value in self.objects},
+                "finding controlled objects",
             )
             _require_optional_reference(
                 item.confirmation_decision_id,

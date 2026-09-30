@@ -34,6 +34,7 @@ from agent_core.research.graphql_execution import (
 from agent_core.research.outcomes import (
     ExperimentResultClassification,
     GraphQLRuntimeResponseEvidence,
+    GraphQLStateDifferentialEvidence,
     GraphQLRuntimeTraceEvent,
     InvariantResult,
     PrimitiveExecutionEvidence,
@@ -405,6 +406,7 @@ class PrimitiveExecutorContext:
         selector_results: tuple[SelectorResult, ...] = (),
         invariant_results: tuple[InvariantResult, ...] = (),
         graphql_responses: tuple[GraphQLRuntimeResponseEvidence, ...] = (),
+        graphql_state_differentials: tuple[GraphQLStateDifferentialEvidence, ...] = (),
     ) -> PrimitiveExecutionEvidence:
         evidence_id = _identifier("evidence", self.experiment_id, step.step_id)
         graphql_trace_events = tuple(
@@ -452,6 +454,7 @@ class PrimitiveExecutorContext:
             selector_results=selector_results,
             invariant_results=invariant_results,
             graphql_responses=graphql_responses,
+            graphql_state_differentials=graphql_state_differentials,
             graphql_trace_events=graphql_trace_events,
             request_accounting_reference=self.request_accounting_reference,
             runtime_provenance_reference=self.runtime_provenance_reference,
@@ -856,6 +859,22 @@ class StateDifferentialExecutor:
                 step,
                 "Compared sealed state references and registered invariants.",
                 invariant_results=tuple(results),
+                graphql_state_differentials=tuple(
+                    GraphQLStateDifferentialEvidence(
+                        invariant_reference=reference,
+                        identity_reference=(
+                            context.comparison_identity_id
+                            or context.primary_identity_id
+                        ),
+                        object_references=tuple(sorted(context.object_references)),
+                        workflow_state_reference=value.after_state_reference,
+                        before_fingerprint=before.digest,
+                        after_fingerprint=after.digest,
+                        protected_effect_observed=before.digest != after.digest,
+                        authoritative=True,
+                    )
+                    for reference in value.invariant_references
+                ),
             )
         )
 

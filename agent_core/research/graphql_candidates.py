@@ -53,6 +53,7 @@ from agent_core.research.primitives import (
     MutationKind,
     PrimitiveCapabilityState,
     PrimitiveStepProposal,
+    StateDifferentialInput,
 )
 from agent_core.research.registry import ExperimentRegistry
 from agent_core.research.state import (
@@ -104,6 +105,12 @@ _PROPERTY_KIND = {
     ),
     GraphQLHypothesisProperty.field_level_authorization.value: (
         GraphQLCandidateKind.field_authorization
+    ),
+    GraphQLHypothesisProperty.operation_level_authorization.value: (
+        GraphQLCandidateKind.operation_authorization
+    ),
+    GraphQLHypothesisProperty.ownership_authorization.value: (
+        GraphQLCandidateKind.ownership
     ),
     GraphQLHypothesisProperty.role_bound_access.value: GraphQLCandidateKind.role_bound,
     GraphQLHypothesisProperty.tenant_bound_access.value: (
@@ -523,6 +530,23 @@ class GraphQLExperimentCandidateBuilder:
                 return None
             primary, comparison = pair
             relationship = IdentityRelationship.different_controlled_role
+        elif kind is GraphQLCandidateKind.operation_authorization:
+            if (
+                operation.authentication_requirement
+                is GraphQLAuthenticationRequirement.tenant_bound
+            ):
+                pair = _distinct_pair(
+                    identities, "tenant_reference", referenced_identities
+                )
+                relationship = IdentityRelationship.different_controlled_tenant
+            else:
+                pair = _distinct_pair(
+                    identities, "role_reference", referenced_identities
+                )
+                relationship = IdentityRelationship.different_controlled_role
+            if pair is None:
+                return None
+            primary, comparison = pair
         elif kind is GraphQLCandidateKind.tenant_bound:
             if (
                 controlled_object is None
@@ -616,8 +640,17 @@ class GraphQLExperimentCandidateBuilder:
             ):
                 return None
             primary = primary or (identities[0] if identities else None)
-            if primary is None:
+            comparison = next(
+                (
+                    item
+                    for item in referenced_identities or identities
+                    if primary is not None and item.identity_id != primary.identity_id
+                ),
+                None,
+            )
+            if primary is None or comparison is None:
                 return None
+            relationship = IdentityRelationship.owner_non_owner
 
         if state_changing and kind not in {
             GraphQLCandidateKind.mutation_authorization,
@@ -691,8 +724,10 @@ class GraphQLExperimentCandidateBuilder:
                 GraphQLCandidateKind.cross_surface,
                 GraphQLCandidateKind.field_authorization,
                 GraphQLCandidateKind.role_bound,
+                GraphQLCandidateKind.operation_authorization,
                 GraphQLCandidateKind.nested_resolver,
                 GraphQLCandidateKind.mutation_authorization,
+                GraphQLCandidateKind.workflow_mutation,
             }
             else 1
         )
@@ -959,6 +994,33 @@ def materialize_graphql_candidate(
     else:
         inputs.append(
             GraphQLOperationInput(**common, identity_id=candidate.primary_identity_id)
+        )
+    if kind is GraphQLCandidateKind.workflow_mutation:
+        workflow = next(
+            (
+                item
+                for item in state.workflows
+                if item.workflow_id == candidate.workflow_id
+            ),
+            None,
+        )
+        changing = (
+            next((item for item in workflow.steps if item.state_changing), None)
+            if workflow is not None
+            else None
+        )
+        if (
+            changing is None
+            or changing.state_before_reference is None
+            or changing.state_after_reference is None
+        ):
+            raise ValueError("GraphQL workflow state differential is unavailable")
+        inputs.append(
+            StateDifferentialInput(
+                before_state_reference=changing.state_before_reference,
+                after_state_reference=changing.state_after_reference,
+                invariant_references=candidate.information_predicates,
+            )
         )
     proposal_seed = _digest(
         {
