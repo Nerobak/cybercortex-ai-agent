@@ -6,11 +6,13 @@ import hashlib
 import json
 import secrets
 import re
+import time
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from agent_core.models import ModelUsageDelta
+from agent_core.agent_models import TransportRequestContext
 from agent_core.phase2_result_status import Phase2ResultStatus
 from agent_core.request_budget import RequestDelta
 from agent_core.research.authorization import (
@@ -26,21 +28,40 @@ from agent_core.research.events import (
     ResearchEventType,
 )
 from agent_core.research.executors import (
+    GraphQLRequestExecutionResult,
     PrimitiveExecutionError,
     PrimitiveExecutorContext,
     RegisteredCleanupExecution,
     RequestExecutionResult,
     ResolvedRequest,
 )
+from agent_core.research.graphql import GraphQLExperimentStateChangeClass
+from agent_core.research.graphql_execution import (
+    GraphQLDocumentRenderer,
+    GraphQLExecutionRequest,
+    materialize_graphql_variables,
+)
+from agent_core.research.graphql_ingest import (
+    GraphQLErrorClass,
+    GraphQLResponseEnvelope,
+    GraphQLResponseObservation,
+    analyze_graphql_response,
+)
 from agent_core.research.experiments import AuthorizedExperiment, _is_gate_authorized
 from agent_core.research.outcomes import (
     CleanupExecutionResult,
     ExperimentOutcome,
     ExperimentResultClassification,
+    GraphQLRuntimeResponseEvidence,
+    GraphQLRuntimeTraceEvent,
     ProposedExecutionMetadata,
     RuntimeProvenance,
     SafeRequestSummary,
     SafeResponseSummary,
+)
+from agent_core.research.primitives import (
+    GraphQLOperationInput,
+    GraphQLVariableMutationInput,
 )
 from agent_core.research.provenance import reject_secret_material
 from agent_core.research.state import (
@@ -54,14 +75,16 @@ from agent_core.research.types import (
     CleanupStatus,
     EvidenceKind,
     ExperimentRuntimeStatus,
+    IdentityEligibility,
     MetadataEntry,
     ProvenanceProducerType,
     PublicMetadata,
     ResearchRunStatus,
 )
+from tools.safe_http import ResponseTooLargeError
 
 RESEARCH_RUNTIME_NAME = "cybercortex-research-runtime"
-RESEARCH_RUNTIME_VERSION = "p4-0d-v1"
+RESEARCH_RUNTIME_VERSION = "p4-1e-v1"
 _RUNTIME_ISSUER = object()
 
 if TYPE_CHECKING:
@@ -94,6 +117,9 @@ class ResearchRuntime:
         "__current_time",
         "__evidence_summaries",
         "__executor_registry",
+        "__graphql_limits",
+        "__graphql_operation_templates",
+        "__graphql_safe_mutations",
         "__issuer",
         "__persistence_failed",
         "__policy",
@@ -150,6 +176,19 @@ class ResearchRuntime:
             self,
             "_ResearchRuntime__state_snapshots",
             MappingProxyType(dict(gate.state_snapshots)),
+        )
+        object.__setattr__(
+            self,
+            "_ResearchRuntime__graphql_operation_templates",
+            MappingProxyType(dict(gate.graphql_operation_templates)),
+        )
+        object.__setattr__(
+            self,
+            "_ResearchRuntime__graphql_safe_mutations",
+            MappingProxyType(dict(gate.graphql_safe_mutations)),
+        )
+        object.__setattr__(
+            self, "_ResearchRuntime__graphql_limits", gate.graphql_limits
         )
         object.__setattr__(
             self,
@@ -276,6 +315,11 @@ class ResearchRuntime:
             or policy_fingerprint(self.__policy) != authorization.policy_hash
         ):
             raise InvalidRuntimeBindingError()
+        if any(
+            step.primitive_name in {"graphql_operation", "graphql_variable_mutation"}
+            for step in authorization.experiment.primitive_steps
+        ) and not self._graphql_bindings_are_current(state, authorization):
+            raise InvalidRuntimeBindingError()
         if self.has_completed_fingerprint(authorization.experiment_fingerprint) and (
             authorization.experiment.reproduction_of is None
             or not self.has_completed_experiment(
@@ -331,6 +375,19 @@ class ResearchRuntime:
             controlled_values=self.__controlled_values,
             evidence_summaries=self.__evidence_summaries,
             state_snapshots=self.__state_snapshots,
+            graphql_operation_templates=self.__graphql_operation_templates,
+            graphql_safe_mutations=self.__graphql_safe_mutations,
+            graphql_state=state,
+            graphql_limits=self.__graphql_limits,
+            authorization_reference=authorization.authorization_reference,
+            identity_bindings=MappingProxyType(identity_bindings),
+            vault_references=tuple(
+                sorted(
+                    str(item.vault_reference)
+                    for item in identity_bindings.values()
+                    if item.vault_reference is not None
+                )
+            ),
             identity_ids=frozenset(identity_bindings),
             object_references=MappingProxyType(object_references),
             primary_identity_id=(
@@ -347,6 +404,15 @@ class ResearchRuntime:
                 authorization,
                 request,
                 identity_bindings,
+                cleanup_reserve=cleanup_reserve,
+                before=before,
+            ),
+            send_graphql=lambda request, template: self._send_graphql(
+                authorization,
+                request,
+                template,
+                identity_bindings,
+                object_references,
                 cleanup_reserve=cleanup_reserve,
                 before=before,
             ),
@@ -416,6 +482,425 @@ class ResearchRuntime:
         self.__completed_fingerprints.add(authorization.experiment_fingerprint)
         self.__completed_experiment_ids.add(authorization.experiment_id)
         return outcome
+
+    def _graphql_bindings_are_current(
+        self, state: ResearchState, authorization: AuthorizedExperiment
+    ) -> bool:
+        identities = {item.identity_id: item for item in state.identities}
+        sealed_identities = {
+            item.identity_id: item
+            for item in authorization.controlled_identity_bindings
+        }
+        for identity_id, sealed in sealed_identities.items():
+            current = identities.get(identity_id)
+            if (
+                current is None
+                or not current.controlled
+                or current.eligibility is not IdentityEligibility.eligible
+                or current.account_reference != sealed.account_reference
+                or current.role_reference != sealed.role_reference
+                or current.tenant_reference != sealed.tenant_reference
+            ):
+                return False
+            try:
+                account = self.__controlled_context.account(sealed.account_reference)
+            except KeyError:
+                return False
+            if (
+                not account.controlled
+                or account.tenant_id != sealed.tenant_reference
+                and sealed.tenant_reference is not None
+                or not self.__policy.account_is_eligible(
+                    account.account_id,
+                    self.__controlled_context,
+                    account_controlled=account.controlled,
+                ).eligible
+                or (
+                    sealed.vault_reference is not None
+                    and not self.__vault.contains(sealed.vault_reference)
+                )
+            ):
+                return False
+        objects = {item.object_id: item for item in state.objects}
+        for sealed in authorization.owned_object_bindings:
+            current = objects.get(sealed.object_id)
+            owner = sealed_identities.get(sealed.owner_identity_id)
+            if (
+                current is None
+                or owner is None
+                or not current.test_owned
+                or not current.evidence_references
+                or current.object_reference != sealed.object_reference
+                or current.owner_identity_id != sealed.owner_identity_id
+                or current.tenant_reference != sealed.tenant_reference
+            ):
+                return False
+            controlled = next(
+                (
+                    item
+                    for item in self.__controlled_context.objects
+                    if item.object_id in {current.object_id, current.object_reference}
+                    and item.owner_account_id == owner.account_reference
+                    and item.test_owned
+                ),
+                None,
+            )
+            if controlled is None or (
+                sealed.tenant_reference is not None
+                and controlled.tenant_id != sealed.tenant_reference
+            ):
+                return False
+        return True
+
+    def _send_graphql(
+        self,
+        authorization: AuthorizedExperiment,
+        request: GraphQLExecutionRequest,
+        template: object,
+        identity_bindings: dict[str, object],
+        object_references: dict[str, str],
+        *,
+        cleanup_reserve: int,
+        before: dict[str, int],
+    ) -> GraphQLRequestExecutionResult:
+        from agent_core.research.executors import RegisteredRuntimeRequestTemplate
+
+        operation_template = self.__graphql_operation_templates.get(
+            request.operation_template_id
+        )
+        if (
+            not request._is_trusted()
+            or not isinstance(template, RegisteredRuntimeRequestTemplate)
+            or operation_template is None
+            or request.operation_id != operation_template.operation_id
+            or request.endpoint_id != template.endpoint_id
+            or request.surface_id != template.surface_id
+            or request.target_id != template.target_id
+            or request.method != template.method.value
+            or request.url != template.url
+            or request.method != "POST"
+            or request.response_byte_limit > self.__graphql_limits.max_response_bytes
+            or request.timeout_seconds > template.timeout_seconds
+            or (
+                request.expected_state_change_class
+                is GraphQLExperimentStateChangeClass.read_only
+                and authorization.experiment.state_changing
+            )
+            or (
+                request.expected_state_change_class
+                is GraphQLExperimentStateChangeClass.reversible_state_change
+                and not authorization.experiment.state_changing
+            )
+            or not self._graphql_request_matches_authorization(
+                authorization,
+                request,
+                identity_bindings,
+                object_references,
+            )
+        ):
+            raise PrimitiveExecutionError("sealed GraphQL request is invalid")
+        used = RequestDelta.from_snapshots(before, self.__budget.snapshot())
+        reservation = authorization.request_budget_reservation
+        non_cleanup = used.discovery + used.auth + used.verification
+        if (
+            non_cleanup >= reservation.verification
+            or self.__budget.remaining <= cleanup_reserve
+        ):
+            raise ResearchBudgetExhaustedError(
+                ResearchAuthorizationErrorCode.cleanup_reserve_unavailable
+            )
+
+        headers = {item.name: item.value for item in template.safe_headers}
+        binding = None
+        if request.identity_id is not None:
+            binding = identity_bindings.get(request.identity_id)
+            reference = getattr(binding, "vault_reference", None)
+            if binding is None:
+                raise PrimitiveExecutionError(
+                    "controlled GraphQL identity binding is unavailable"
+                )
+            if template.credential_header_name is not None:
+                if reference is None:
+                    raise PrimitiveExecutionError(
+                        "controlled GraphQL session binding is unavailable"
+                    )
+                try:
+                    # The credential exists in a local variable only for the
+                    # immediate call into the shared scoped transport.
+                    headers[template.credential_header_name] = self.__vault.get(
+                        reference
+                    )
+                except (KeyError, RuntimeError) as exc:
+                    raise PrimitiveExecutionError(
+                        "controlled GraphQL session binding is unavailable"
+                    ) from exc
+        body = {
+            "query": request.document,
+            "variables": dict(request.variables),
+            "operationName": request.operation_name,
+        }
+        transport_context = None
+        if request.purpose == "graphql_execution":
+            account_reference = getattr(binding, "account_reference", None)
+            transport_context = TransportRequestContext(
+                purpose="graphql_execution",
+                policy_authorized=True,
+                configured_url=template.url,
+                configured_method=template.method.value,
+                configured_endpoint_match=True,
+                controlled_account_id=account_reference,
+                account_controlled=binding is not None,
+                account_policy_authorized=binding is not None,
+                workflow_category="graphql_execution",
+                generated_by="ResearchRuntime",
+            )
+        attempt_before = self.__budget.snapshot()
+        started = time.monotonic()
+        try:
+            response, _redirects = self.__transport.request(
+                request.method,
+                request.url,
+                timeout=request.timeout_seconds,
+                follow_redirects=False,
+                max_redirects=0,
+                headers=headers,
+                json=body,
+                response_byte_limit=request.response_byte_limit,
+                purpose=request.purpose,
+                request_context=transport_context,
+                allow_session_credentials=(request.identity_id is not None),
+                isolate_session_cookies=template.credential_header_name is not None,
+            )
+        except Exception as exc:
+            attempt_after = self.__budget.snapshot()
+            consumed = RequestDelta.from_snapshots(attempt_before, attempt_after).total
+            if consumed != 1:
+                raise
+            latency_ms = min(3_600_000, int((time.monotonic() - started) * 1000))
+            oversized = isinstance(exc, ResponseTooLargeError)
+            observation = GraphQLResponseObservation(
+                envelope=(
+                    GraphQLResponseEnvelope.oversized
+                    if oversized
+                    else GraphQLResponseEnvelope.transport_failure
+                ),
+                errors_present=True,
+                error_classes=(GraphQLErrorClass.transport_error,),
+                evidence_digest=_digest(
+                    "graphql-response-oversized"
+                    if oversized
+                    else "graphql-transport-failure"
+                ),
+                response_bytes=0,
+                truncated=oversized,
+            )
+            return GraphQLRequestExecutionResult(
+                request_summary=_graphql_request_summary(request),
+                response_summary=None,
+                graphql_response=self._graphql_response_evidence(
+                    authorization,
+                    request,
+                    observation,
+                    status_code=None,
+                    latency_ms=latency_ms,
+                    error_count=1,
+                    object_references=object_references,
+                    response_raw=None,
+                ),
+            )
+        latency_ms = min(3_600_000, int((time.monotonic() - started) * 1000))
+        status = getattr(response, "status_code", None)
+        if type(status) is not int or not 100 <= status <= 599:
+            raise PrimitiveExecutionError(
+                "transport returned an invalid response status"
+            )
+        raw = getattr(response, "content", b"")
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8", errors="replace")
+        if not isinstance(raw, bytes):
+            raw = b""
+        if len(raw) > request.response_byte_limit:
+            raise PrimitiveExecutionError("bounded GraphQL response invariant failed")
+        content_type = _response_content_type(response)
+        observation = analyze_graphql_response(
+            raw,
+            status_code=status,
+            content_type=content_type,
+            max_bytes=request.response_byte_limit,
+            max_errors=self.__graphql_limits.max_errors,
+            request_was_graphql=True,
+        )
+        error_count = _bounded_graphql_error_count(
+            raw, self.__graphql_limits.max_errors
+        )
+        if error_count >= self.__graphql_limits.max_errors:
+            observation = observation.model_copy(update={"truncated": True})
+        return GraphQLRequestExecutionResult(
+            request_summary=_graphql_request_summary(request),
+            response_summary=_safe_response_summary(response),
+            graphql_response=self._graphql_response_evidence(
+                authorization,
+                request,
+                observation,
+                status_code=status,
+                latency_ms=latency_ms,
+                error_count=error_count,
+                object_references=object_references,
+                response_raw=raw,
+            ),
+        )
+
+    def _graphql_response_evidence(
+        self,
+        authorization: AuthorizedExperiment,
+        request: GraphQLExecutionRequest,
+        observation: GraphQLResponseObservation,
+        *,
+        status_code: int | None,
+        latency_ms: int,
+        error_count: int,
+        object_references: dict[str, str],
+        response_raw: bytes | None,
+    ) -> GraphQLRuntimeResponseEvidence:
+        shape_names = "\n".join(observation.object_shape)
+        fields = {
+            item.field_id: item.name
+            for item in self._current_state().graphql_fields
+            if item.field_id in request.selected_field_ids
+        }
+        present = tuple(
+            sorted(
+                field_id
+                for field_id, name in fields.items()
+                if re.search(rf"(?:^|\.){re.escape(name)}(?:\[\])?:", shape_names)
+            )
+        )
+        controlled_match = None
+        if request.object_ids:
+            expected_values = tuple(
+                object_references[object_id]
+                for object_id in request.object_ids
+                if object_id in object_references
+            )
+            controlled_match = (
+                _response_contains_controlled_value(response_raw, expected_values)
+                if response_raw is not None and expected_values
+                else None
+            )
+        return GraphQLRuntimeResponseEvidence(
+            authorized_experiment_reference=authorization.authorization_reference,
+            operation_template_reference=request.operation_template_id,
+            operation_reference=request.operation_id,
+            identity_reference=request.identity_id,
+            object_references=request.object_ids,
+            request_accounting_reference=(
+                authorization.request_budget_reservation.reservation_reference
+            ),
+            runtime_provenance_reference=request.runtime_provenance_reference,
+            status_code=status_code,
+            status_class=(
+                f"{status_code // 100}xx"
+                if status_code is not None
+                else "transport_failure"
+            ),
+            envelope=observation.envelope,
+            data_present=observation.data_present,
+            errors_present=observation.errors_present,
+            error_classes=observation.error_classes,
+            error_count=error_count,
+            typename_observations=observation.typename_observations,
+            selected_field_presence=present,
+            object_shape_fingerprint=_digest(observation.object_shape),
+            controlled_object_reference_match=controlled_match,
+            response_digest=observation.evidence_digest,
+            response_bytes=observation.response_bytes,
+            latency_ms=latency_ms,
+            truncated=observation.truncated,
+        )
+
+    def _graphql_request_matches_authorization(
+        self,
+        authorization: AuthorizedExperiment,
+        request: GraphQLExecutionRequest,
+        identity_bindings: dict[str, object],
+        object_references: dict[str, str],
+    ) -> bool:
+        operation_template = self.__graphql_operation_templates.get(
+            request.operation_template_id
+        )
+        if operation_template is None:
+            return False
+        state = self._current_state()
+        vault_references = tuple(
+            str(item.vault_reference)
+            for item in identity_bindings.values()
+            if item.vault_reference is not None
+        )
+        for step in authorization.experiment.primitive_steps:
+            value = step.input
+            if (
+                not isinstance(
+                    value, (GraphQLOperationInput, GraphQLVariableMutationInput)
+                )
+                or str(value.operation_template_id) != request.operation_template_id
+            ):
+                continue
+            if isinstance(value, GraphQLOperationInput):
+                bindings = (
+                    value.variable_bindings or operation_template.variable_bindings
+                )
+                selected_field_ids = value.selected_field_ids
+                identity_id = (
+                    None
+                    if value.anonymous
+                    else value.identity_id
+                    or authorization.experiment.identity_context.primary_identity_id
+                )
+            else:
+                if value.binding is None:
+                    continue
+                bindings = (value.binding,)
+                selected_field_ids = ()
+                identity_id = (
+                    authorization.experiment.identity_context.primary_identity_id
+                )
+            try:
+                rendered = GraphQLDocumentRenderer(state, self.__graphql_limits).render(
+                    operation_template,
+                    variable_bindings=bindings,
+                    selected_field_ids=selected_field_ids,
+                )
+                variables = materialize_graphql_variables(
+                    state,
+                    operation_template,
+                    bindings,
+                    object_references=object_references,
+                    identity_bindings=identity_bindings,
+                    controlled_values=self.__controlled_values,
+                    vault_references=vault_references,
+                    limits=self.__graphql_limits,
+                )
+            except Exception:
+                continue
+            object_ids = tuple(
+                sorted(
+                    item.value_reference
+                    for item in bindings
+                    if item.value_source.value == "controlled_object"
+                )
+            )
+            if (
+                request.identity_id == identity_id
+                and request.document == rendered.document
+                and request.document_digest == rendered.document_digest
+                and request.operation_name == rendered.operation_name
+                and request.selected_field_ids == rendered.selected_field_ids
+                and request.selected_field_names == rendered.selected_field_names
+                and dict(request.variables) == dict(variables)
+                and request.object_ids == object_ids
+            ):
+                return True
+        return False
 
     def _send_registered(
         self,
@@ -599,6 +1084,35 @@ class ResearchRuntime:
                     else None
                 ),
                 requests_used=cleanup_requests,
+                graphql_trace_event=(
+                    GraphQLRuntimeTraceEvent(
+                        event_type="GRAPHQL_CLEANUP",
+                        experiment_reference=authorization.experiment_id,
+                        operation_reference=str(
+                            next(
+                                step.input.operation_id
+                                for step in authorization.experiment.primitive_steps
+                                if step.primitive_name
+                                in {
+                                    "graphql_operation",
+                                    "graphql_variable_mutation",
+                                }
+                            )
+                        ),
+                        identity_reference=(
+                            authorization.experiment.identity_context.primary_identity_id
+                        ),
+                        request_count=cleanup_requests,
+                        status_class=cleanup_status.value,
+                    )
+                    if authorization.experiment.cleanup.required
+                    and any(
+                        step.primitive_name
+                        in {"graphql_operation", "graphql_variable_mutation"}
+                        for step in authorization.experiment.primitive_steps
+                    )
+                    else None
+                ),
             ),
             runtime_provenance=RuntimeProvenance(
                 runtime_name=RESEARCH_RUNTIME_NAME,
@@ -648,6 +1162,32 @@ class ResearchRuntime:
                         entries=(
                             MetadataEntry(
                                 key="primitive_name", value=item.primitive_name
+                            ),
+                            *(
+                                (
+                                    MetadataEntry(
+                                        key="graphql_operation",
+                                        value=item.graphql_responses[
+                                            0
+                                        ].operation_reference,
+                                    ),
+                                    MetadataEntry(
+                                        key="graphql_status_class",
+                                        value=item.graphql_responses[0].status_class,
+                                    ),
+                                    MetadataEntry(
+                                        key="graphql_error_class",
+                                        value=(
+                                            item.graphql_responses[0]
+                                            .error_classes[0]
+                                            .value
+                                            if item.graphql_responses[0].error_classes
+                                            else "none"
+                                        ),
+                                    ),
+                                )
+                                if item.graphql_responses
+                                else ()
                             ),
                         )
                     ),
@@ -769,18 +1309,73 @@ def _create_research_runtime(gate: "ResearchExecutionGate") -> ResearchRuntime:
     return ResearchRuntime(gate, _RUNTIME_ISSUER)
 
 
+def _graphql_request_summary(
+    request: GraphQLExecutionRequest,
+) -> SafeRequestSummary:
+    return SafeRequestSummary(
+        request_template_reference=request.operation_template_id,
+        target_reference=request.target_id,
+        surface_reference=request.surface_id,
+        endpoint_reference=request.endpoint_id,
+        method=request.method,
+        identity_reference=request.identity_id,
+        parameter_references=(),
+        body_present=True,
+    )
+
+
+def _response_content_type(response: object) -> str | None:
+    headers = getattr(response, "headers", {})
+    if not hasattr(headers, "get"):
+        return None
+    raw = headers.get("Content-Type") or headers.get("content-type")
+    if not isinstance(raw, str):
+        return None
+    value = raw.split(";", 1)[0].strip().lower()
+    return value if value and len(value) <= 255 else None
+
+
+def _bounded_graphql_error_count(raw: bytes, limit: int) -> int:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return 0
+    if not isinstance(payload, dict) or not isinstance(payload.get("errors"), list):
+        return 0
+    return min(limit, len(payload["errors"]))
+
+
+def _response_contains_controlled_value(
+    raw: bytes, expected_values: tuple[str, ...]
+) -> bool:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return False
+    expected = set(expected_values)
+    nodes = 0
+
+    def visit(value: object, depth: int) -> bool:
+        nonlocal nodes
+        if depth > 12 or nodes >= 1_024:
+            return False
+        nodes += 1
+        if isinstance(value, str):
+            return value in expected
+        if isinstance(value, dict):
+            return any(visit(item, depth + 1) for item in value.values())
+        if isinstance(value, list):
+            return any(visit(item, depth + 1) for item in value[:32])
+        return False
+
+    return visit(payload, 0)
+
+
 def _safe_response_summary(response: object) -> SafeResponseSummary:
     status = getattr(response, "status_code", None)
     if type(status) is not int or not 100 <= status <= 599:
         raise PrimitiveExecutionError("transport returned an invalid response status")
-    headers = getattr(response, "headers", {})
-    content_type = None
-    if hasattr(headers, "get"):
-        raw_content_type = headers.get("Content-Type") or headers.get("content-type")
-        if isinstance(raw_content_type, str):
-            candidate = raw_content_type.split(";", 1)[0].strip().lower()
-            if candidate and len(candidate) <= 255:
-                content_type = candidate
+    content_type = _response_content_type(response)
     content = getattr(response, "content", b"")
     if isinstance(content, str):
         raw = content.encode("utf-8", errors="replace")
@@ -793,7 +1388,11 @@ def _safe_response_summary(response: object) -> SafeResponseSummary:
     length_class = (
         "empty"
         if length == 0
-        else "small" if length <= 1_024 else "medium" if length <= 100_000 else "large"
+        else "small"
+        if length <= 1_024
+        else "medium"
+        if length <= 100_000
+        else "large"
     )
     return SafeResponseSummary(
         status_code=status,
@@ -813,7 +1412,7 @@ def _response_shape(
     if content_type == "application/json" and raw:
         try:
             value = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             return "invalid-json", ()
 
         def shape(item: object, depth: int = 0) -> object:

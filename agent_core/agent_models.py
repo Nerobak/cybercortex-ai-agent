@@ -65,6 +65,7 @@ ActionPurpose = Literal[
 TransportRequestPurpose = Literal[
     "discovery",
     "graphql_discovery",
+    "graphql_execution",
     "oast",
     "session_acquisition",
     "session_termination",
@@ -92,6 +93,7 @@ class TransportRequestContext(StrictModel):
             "session_invalidation",
             "rate_limit_enforcement",
             "graphql_discovery",
+            "graphql_execution",
         ]
         | None
     ) = None
@@ -100,6 +102,7 @@ class TransportRequestContext(StrictModel):
             "SessionInvalidationExecutor",
             "AuthenticationLoginRateLimitExecutor",
             "GraphQLDiscoverySession",
+            "ResearchRuntime",
         ]
         | None
     ) = None

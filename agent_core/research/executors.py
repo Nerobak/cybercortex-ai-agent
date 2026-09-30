@@ -19,8 +19,22 @@ from urllib.parse import urlparse
 
 from pydantic import Field, StrictBool, model_validator
 
+from agent_core.research.graphql import (
+    GraphQLExperimentStateChangeClass,
+    RegisteredGraphQLOperationTemplate,
+    RegisteredGraphQLSafeMutation,
+)
+from agent_core.research.graphql_execution import (
+    GraphQLDocumentRenderer,
+    GraphQLExecutionLimits,
+    GraphQLExecutionRequest,
+    create_graphql_execution_request,
+    materialize_graphql_variables,
+)
 from agent_core.research.outcomes import (
     ExperimentResultClassification,
+    GraphQLRuntimeResponseEvidence,
+    GraphQLRuntimeTraceEvent,
     InvariantResult,
     PrimitiveExecutionEvidence,
     SafeRequestSummary,
@@ -32,6 +46,8 @@ from agent_core.research.primitives import (
     CompiledPrimitiveStep,
     DifferentialSelector,
     IdentitySwitchInput,
+    GraphQLOperationInput,
+    GraphQLVariableMutationInput,
     MutationKind,
     ObjectSubstitutionInput,
     ParameterMutationInput,
@@ -47,7 +63,7 @@ from agent_core.research.types import (
     ResearchContract,
 )
 
-RESEARCH_EXECUTOR_REGISTRY_VERSION = "phase4-research-executors-v1"
+RESEARCH_EXECUTOR_REGISTRY_VERSION = "phase4-research-executors-v2"
 
 _CREDENTIAL_HEADERS = frozenset(
     {"authorization", "cookie", "proxy-authorization", "x-api-key", "x-auth-token"}
@@ -59,6 +75,7 @@ _ROUTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,2047}$")
 
 
 JSONScalar = str | int | float | bool | None
+RegisteredSafeValue = JSONScalar | tuple[JSONScalar, ...]
 
 
 class RegisteredRequestParameter(ResearchContract):
@@ -123,7 +140,7 @@ RuntimeRequestTemplate = RegisteredRuntimeRequestTemplate
 
 class RegisteredControlledValue(ResearchContract):
     reference: OpaqueIdentifier
-    value: JSONScalar
+    value: RegisteredSafeValue
 
     @model_validator(mode="after")
     def enforce_safe_value(self) -> "RegisteredControlledValue":
@@ -213,6 +230,13 @@ class RequestExecutionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class GraphQLRequestExecutionResult:
+    request_summary: SafeRequestSummary
+    response_summary: SafeResponseSummary | None
+    graphql_response: GraphQLRuntimeResponseEvidence
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutorStepResult:
     evidence: PrimitiveExecutionEvidence
     classification: ExperimentResultClassification = (
@@ -238,6 +262,13 @@ class PrimitiveExecutorContext:
     controlled_values: Mapping[str, RegisteredControlledValue]
     evidence_summaries: Mapping[str, RegisteredEvidenceSummary]
     state_snapshots: Mapping[str, RegisteredStateSnapshot]
+    graphql_operation_templates: Mapping[str, RegisteredGraphQLOperationTemplate]
+    graphql_safe_mutations: Mapping[str, RegisteredGraphQLSafeMutation]
+    graphql_state: Any
+    graphql_limits: GraphQLExecutionLimits
+    authorization_reference: str
+    identity_bindings: Mapping[str, object]
+    vault_references: tuple[str, ...]
     identity_ids: frozenset[str]
     object_references: Mapping[str, str]
     primary_identity_id: str | None
@@ -245,6 +276,10 @@ class PrimitiveExecutorContext:
     request_accounting_reference: str
     runtime_provenance_reference: str
     send_registered: Callable[[ResolvedRequest], RequestExecutionResult]
+    send_graphql: Callable[
+        [GraphQLExecutionRequest, RegisteredRuntimeRequestTemplate],
+        GraphQLRequestExecutionResult,
+    ]
     current_identity_id: str | None = None
     produced_evidence: dict[str, PrimitiveExecutionEvidence] = field(
         default_factory=dict
@@ -258,7 +293,7 @@ class PrimitiveExecutorContext:
                 "registered request template is unavailable"
             ) from exc
 
-    def controlled_value(self, reference: str) -> JSONScalar:
+    def controlled_value(self, reference: str) -> RegisteredSafeValue:
         try:
             return self.controlled_values[reference].value
         except KeyError as exc:
@@ -369,8 +404,40 @@ class PrimitiveExecutorContext:
         response_summaries: tuple[SafeResponseSummary, ...] = (),
         selector_results: tuple[SelectorResult, ...] = (),
         invariant_results: tuple[InvariantResult, ...] = (),
+        graphql_responses: tuple[GraphQLRuntimeResponseEvidence, ...] = (),
     ) -> PrimitiveExecutionEvidence:
         evidence_id = _identifier("evidence", self.experiment_id, step.step_id)
+        graphql_trace_events = tuple(
+            event
+            for response in graphql_responses
+            for event in (
+                GraphQLRuntimeTraceEvent(
+                    event_type="GRAPHQL_AUTHORIZE",
+                    experiment_reference=self.experiment_id,
+                    operation_reference=response.operation_reference,
+                    identity_reference=response.identity_reference,
+                    request_count=0,
+                ),
+                GraphQLRuntimeTraceEvent(
+                    event_type="GRAPHQL_EXECUTE",
+                    experiment_reference=self.experiment_id,
+                    operation_reference=response.operation_reference,
+                    identity_reference=response.identity_reference,
+                    request_count=1,
+                ),
+                GraphQLRuntimeTraceEvent(
+                    event_type="GRAPHQL_RESPONSE",
+                    experiment_reference=self.experiment_id,
+                    operation_reference=response.operation_reference,
+                    identity_reference=response.identity_reference,
+                    request_count=1,
+                    status_class=response.status_class,
+                    error_class=(
+                        response.error_classes[0] if response.error_classes else None
+                    ),
+                ),
+            )
+        )
         item = PrimitiveExecutionEvidence(
             evidence_id=evidence_id,
             step_id=step.step_id,
@@ -384,6 +451,8 @@ class PrimitiveExecutorContext:
             response_summaries=response_summaries,
             selector_results=selector_results,
             invariant_results=invariant_results,
+            graphql_responses=graphql_responses,
+            graphql_trace_events=graphql_trace_events,
             request_accounting_reference=self.request_accounting_reference,
             runtime_provenance_reference=self.runtime_provenance_reference,
         )
@@ -393,6 +462,91 @@ class PrimitiveExecutorContext:
 
 class PrimitiveExecutionError(RuntimeError):
     """Secret-free failure raised by a bounded primitive implementation."""
+
+
+class GraphQLOperationExecutor:
+    route_reference = "research-native:graphql_operation/v1"
+
+    def execute(
+        self, step: CompiledPrimitiveStep, context: PrimitiveExecutorContext
+    ) -> ExecutorStepResult:
+        value = _input(step, GraphQLOperationInput)
+        bindings = value.variable_bindings
+        result, template, object_ids, identity_id = _execute_graphql(
+            value.operation_id,
+            str(value.operation_template_id),
+            value.selected_field_ids,
+            bindings,
+            context,
+            identity_id=value.identity_id,
+            anonymous=value.anonymous,
+        )
+        return ExecutorStepResult(
+            evidence=context.evidence(
+                step,
+                "Executed one registered bounded GraphQL operation.",
+                request_template_reference=template.template_id,
+                identity_references=(identity_id,) if identity_id else (),
+                object_references=object_ids,
+                request_summaries=(result.request_summary,),
+                response_summaries=(
+                    (result.response_summary,)
+                    if result.response_summary is not None
+                    else ()
+                ),
+                graphql_responses=(result.graphql_response,),
+            )
+        )
+
+
+class GraphQLVariableMutationExecutor:
+    route_reference = "research-native:graphql_variable_mutation/v1"
+
+    def execute(
+        self, step: CompiledPrimitiveStep, context: PrimitiveExecutorContext
+    ) -> ExecutorStepResult:
+        value = _input(step, GraphQLVariableMutationInput)
+        try:
+            safe = context.graphql_safe_mutations[str(value.safe_mutation_id)]
+        except KeyError as exc:
+            raise PrimitiveExecutionError(
+                "registered GraphQL safe mutation is unavailable"
+            ) from exc
+        if (
+            value.binding is None
+            or safe.operation_template_id != value.operation_template_id
+            or safe.variable_id != value.variable_id
+            or safe.argument_id != value.argument_id
+            or safe.binding != value.binding
+            or safe.binding.value_reference != value.value_source_reference
+        ):
+            raise PrimitiveExecutionError("registered GraphQL safe mutation changed")
+        result, template, object_ids, identity_id = _execute_graphql(
+            value.operation_id,
+            str(value.operation_template_id),
+            (),
+            (value.binding,),
+            context,
+            identity_id=None,
+            anonymous=False,
+        )
+        return ExecutorStepResult(
+            evidence=context.evidence(
+                step,
+                "Executed one registered bounded GraphQL variable substitution.",
+                request_template_reference=template.template_id,
+                identity_references=(identity_id,) if identity_id else (),
+                object_references=object_ids,
+                mutation_kind=value.mutation_kind.value,
+                request_summaries=(result.request_summary,),
+                response_summaries=(
+                    (result.response_summary,)
+                    if result.response_summary is not None
+                    else ()
+                ),
+                graphql_responses=(result.graphql_response,),
+            )
+        )
 
 
 class RequestReplayExecutor:
@@ -714,6 +868,8 @@ class PrimitiveExecutorRegistry:
     def __init__(self, executors: Iterable[PrimitiveExecutor] = ()) -> None:
         selected = tuple(executors) or (
             AuthenticationDifferentialExecutor(),
+            GraphQLOperationExecutor(),
+            GraphQLVariableMutationExecutor(),
             RequestReplayExecutor(),
             IdentitySwitchExecutor(),
             ParameterMutationExecutor(),
@@ -750,6 +906,110 @@ DEFAULT_PRIMITIVE_EXECUTOR_REGISTRY = PrimitiveExecutorRegistry()
 
 
 _REMOVE = object()
+
+
+def _execute_graphql(
+    operation_id: str,
+    operation_template_id: str,
+    selected_field_ids: tuple[str, ...],
+    bindings: tuple[object, ...],
+    context: PrimitiveExecutorContext,
+    *,
+    identity_id: str | None,
+    anonymous: bool,
+) -> tuple[
+    GraphQLRequestExecutionResult,
+    RegisteredRuntimeRequestTemplate,
+    tuple[str, ...],
+    str | None,
+]:
+    try:
+        operation_template = context.graphql_operation_templates[operation_template_id]
+    except KeyError as exc:
+        raise PrimitiveExecutionError(
+            "registered GraphQL operation template is unavailable"
+        ) from exc
+    if operation_template.operation_id != operation_id:
+        raise PrimitiveExecutionError("registered GraphQL operation changed")
+    request_templates = [
+        item
+        for item in context.request_templates.values()
+        if item.endpoint_id == operation_template.endpoint_id
+        and item.surface_id
+        == next(
+            (
+                surface.surface_id
+                for surface in context.graphql_state.graphql_surfaces
+                if surface.graphql_surface_id == operation_template.graphql_surface_id
+            ),
+            None,
+        )
+    ]
+    if (
+        len(request_templates) != 1
+        or request_templates[0].method is not HttpMethod.post
+    ):
+        raise PrimitiveExecutionError(
+            "registered GraphQL endpoint transport is unavailable"
+        )
+    request_template = request_templates[0]
+    approved_bindings = tuple(bindings) or operation_template.variable_bindings
+    renderer = GraphQLDocumentRenderer(context.graphql_state, context.graphql_limits)
+    rendered = renderer.render(
+        operation_template,
+        variable_bindings=approved_bindings,
+        selected_field_ids=selected_field_ids,
+    )
+    variables = materialize_graphql_variables(
+        context.graphql_state,
+        operation_template,
+        approved_bindings,
+        object_references=context.object_references,
+        identity_bindings=context.identity_bindings,
+        controlled_values=context.controlled_values,
+        vault_references=context.vault_references,
+        limits=context.graphql_limits,
+    )
+    selected_identity = None if anonymous else context.identity(identity_id)
+    object_ids = tuple(
+        sorted(
+            {
+                item.value_reference
+                for item in approved_bindings
+                if getattr(item.value_source, "value", None) == "controlled_object"
+            }
+        )
+    )
+    state_changing = (
+        operation_template.state_change_class
+        is GraphQLExperimentStateChangeClass.reversible_state_change
+    )
+    request = create_graphql_execution_request(
+        target_id=request_template.target_id,
+        surface_id=request_template.surface_id,
+        endpoint_id=request_template.endpoint_id,
+        operation_template_id=operation_template.template_id,
+        operation_id=operation_template.operation_id,
+        method=request_template.method.value,
+        url=request_template.url,
+        rendered=rendered,
+        variables=variables,
+        identity_id=selected_identity,
+        object_ids=object_ids,
+        expected_state_change_class=operation_template.state_change_class,
+        response_byte_limit=context.graphql_limits.max_response_bytes,
+        timeout_seconds=min(
+            request_template.timeout_seconds, context.graphql_limits.timeout_seconds
+        ),
+        purpose="state_mutation" if state_changing else "graphql_execution",
+        runtime_provenance_reference=context.runtime_provenance_reference,
+    )
+    return (
+        context.send_graphql(request, request_template),
+        request_template,
+        object_ids,
+        selected_identity,
+    )
 
 
 def _parameter(

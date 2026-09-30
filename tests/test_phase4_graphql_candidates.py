@@ -461,7 +461,7 @@ def test_input_validation_requires_a_registered_safe_mutation():
         if item.graphql_candidate_kind is GraphQLCandidateKind.input_validation
     )
     assert bounded.safe_mutation_id == safe_mutation.mutation_id
-    assert bounded.worst_case_requests == 4
+    assert bounded.worst_case_requests == 2
 
 
 def test_workflow_mutation_requires_registered_controlled_states_and_cleanup():

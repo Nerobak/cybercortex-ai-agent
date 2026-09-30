@@ -231,6 +231,29 @@ class GraphQLStateChangeClass(str, Enum):
     state_change_observed = "state_change_observed"
 
 
+class GraphQLErrorClass(str, Enum):
+    parse_error = "parse_error"
+    validation_error = "validation_error"
+    authentication_error = "authentication_error"
+    authorization_error = "authorization_error"
+    resolver_error = "resolver_error"
+    not_found = "not_found"
+    rate_limited = "rate_limited"
+    transport_error = "transport_error"
+    unknown = "unknown"
+
+
+class GraphQLResponseEnvelope(str, Enum):
+    graphql_data = "graphql_data"
+    graphql_errors = "graphql_errors"
+    graphql_data_and_errors = "graphql_data_and_errors"
+    ordinary_json = "ordinary_json"
+    html = "html"
+    non_json = "non_json"
+    oversized = "oversized"
+    transport_failure = "transport_failure"
+
+
 class GraphQLExperimentStateChangeClass(str, Enum):
     """Compiler-owned effect class for a registered operation template."""
 

@@ -35,7 +35,19 @@ from agent_core.research.executors import (
     RegisteredStateSnapshot,
 )
 from agent_core.research.fingerprint import experiment_fingerprint
+from agent_core.research.graphql import (
+    GraphQLExperimentStateChangeClass,
+    GraphQLOperationRecord,
+    RegisteredGraphQLOperationTemplate,
+)
+from agent_core.research.graphql_execution import (
+    GraphQLDocumentRenderer,
+    GraphQLExecutionError,
+    GraphQLExecutionLimits,
+)
 from agent_core.research.primitives import (
+    GraphQLOperationInput,
+    GraphQLVariableMutationInput,
     ObjectSubstitutionInput,
     ParameterMutationInput,
     PrimitiveCapabilityState,
@@ -238,6 +250,7 @@ class ResearchExecutionGate:
         controlled_values: tuple[RegisteredControlledValue, ...] = (),
         evidence_summaries: tuple[RegisteredEvidenceSummary, ...] = (),
         state_snapshots: tuple[RegisteredStateSnapshot, ...] = (),
+        graphql_limits: GraphQLExecutionLimits | None = None,
         primitive_registry: ExperimentRegistry = DEFAULT_EXPERIMENT_REGISTRY,
         executor_registry: PrimitiveExecutorRegistry = (
             DEFAULT_PRIMITIVE_EXECUTOR_REGISTRY
@@ -274,6 +287,26 @@ class ResearchExecutionGate:
         self.controlled_values = _unique_map(controlled_values, "reference")
         self.evidence_summaries = _unique_map(evidence_summaries, "reference")
         self.state_snapshots = _unique_map(state_snapshots, "reference")
+        self.graphql_operation_templates = _unique_map(
+            compiler_context.graphql_operation_templates, "template_id"
+        )
+        self.graphql_safe_mutations = _unique_map(
+            compiler_context.graphql_safe_mutations, "mutation_id"
+        )
+        configured_graphql_limits = graphql_limits or GraphQLExecutionLimits(
+            max_response_bytes=min(
+                compiler_context.max_response_bytes,
+                policy.max_response_bytes,
+                262_144,
+            )
+        )
+        if (
+            configured_graphql_limits.max_response_bytes
+            > compiler_context.max_response_bytes
+            or configured_graphql_limits.max_response_bytes > policy.max_response_bytes
+        ):
+            raise ContextMismatchError(ResearchAuthorizationErrorCode.context_mismatch)
+        self.graphql_limits = configured_graphql_limits
 
         from agent_core.research.runtime import _create_research_runtime
 
@@ -608,6 +641,12 @@ class ResearchExecutionGate:
             if value is not None
         )
         identity_map = {item.identity_id: item for item in identities}
+        graphql_experiment = any(
+            isinstance(
+                step.input, (GraphQLOperationInput, GraphQLVariableMutationInput)
+            )
+            for step in experiment.primitive_steps
+        )
         bindings = []
         for object_id in sorted(requested):
             item = _one(state.objects, "object_id", object_id)
@@ -617,7 +656,10 @@ class ResearchExecutionGate:
                 or item.owner_identity_id not in identity_map
                 or not item.evidence_references
                 or item.target_id != experiment.target.target_id
-                or item.surface_id != experiment.target.surface_id
+                or (
+                    not graphql_experiment
+                    and item.surface_id != experiment.target.surface_id
+                )
             ):
                 raise ContextMismatchError(
                     ResearchAuthorizationErrorCode.context_mismatch
@@ -668,9 +710,19 @@ class ResearchExecutionGate:
                 raise PrimitiveUnavailableError(
                     ResearchAuthorizationErrorCode.primitive_unavailable
                 ) from exc
-            if (
+            graphql_runtime_step = isinstance(
+                step.input, (GraphQLOperationInput, GraphQLVariableMutationInput)
+            )
+            definition_executable = (
                 definition.capability_state
-                is not PrimitiveCapabilityState.execution_available
+                is PrimitiveCapabilityState.execution_available
+                or (
+                    graphql_runtime_step
+                    and self.compiler_context.graphql_execution_enabled
+                )
+            )
+            if (
+                not definition_executable
                 or step.capability_state
                 is not PrimitiveCapabilityState.execution_available
                 or definition.executor_adapter_reference is None
@@ -702,6 +754,8 @@ class ResearchExecutionGate:
             if isinstance(step.input, ParameterMutationInput):
                 step_worst = min(step_worst, step.input.maximum_variants)
             calculated_verification += step_worst
+            if graphql_runtime_step:
+                self._validate_graphql_step(step.input, experiment, state, target)
             template_id = getattr(step.input, "request_template_id", None)
             if (
                 isinstance(step.input, ObjectSubstitutionInput)
@@ -770,6 +824,161 @@ class ResearchExecutionGate:
                 ResearchAuthorizationErrorCode.authorization_blocked
             )
         return tuple(routes)
+
+    def _validate_graphql_step(
+        self,
+        value: GraphQLOperationInput | GraphQLVariableMutationInput,
+        experiment: SecurityExperiment,
+        state: ResearchState,
+        target: TargetAsset,
+    ) -> None:
+        template = self.graphql_operation_templates.get(
+            str(value.operation_template_id)
+        )
+        operation = _one(state.graphql_operations, "operation_id", value.operation_id)
+        if (
+            not isinstance(template, RegisteredGraphQLOperationTemplate)
+            or not isinstance(operation, GraphQLOperationRecord)
+            or template.operation_id != operation.operation_id
+            or template.graphql_surface_id != operation.graphql_surface_id
+            or template.operation_type is not operation.operation_type
+            or template.selection_fingerprint != operation.selection_fingerprint
+            or template.endpoint_id != experiment.target.endpoint_id
+        ):
+            raise ContextMismatchError(ResearchAuthorizationErrorCode.context_mismatch)
+        if (
+            template.state_change_class
+            is GraphQLExperimentStateChangeClass.irreversible_or_disallowed
+            or (
+                template.state_change_class
+                is GraphQLExperimentStateChangeClass.read_only
+                and experiment.state_changing
+            )
+            or (
+                template.state_change_class
+                is GraphQLExperimentStateChangeClass.reversible_state_change
+                and not experiment.state_changing
+            )
+        ):
+            raise AuthorizationBlockedError(
+                ResearchAuthorizationErrorCode.authorization_blocked
+            )
+        bindings = (
+            value.variable_bindings or template.variable_bindings
+            if isinstance(value, GraphQLOperationInput)
+            else (value.binding,)
+            if value.binding is not None
+            else ()
+        )
+        selected_fields = (
+            value.selected_field_ids if isinstance(value, GraphQLOperationInput) else ()
+        )
+        if isinstance(value, GraphQLVariableMutationInput):
+            safe = self.graphql_safe_mutations.get(str(value.safe_mutation_id))
+            if (
+                safe is None
+                or safe.operation_template_id != template.template_id
+                or safe.variable_id != value.variable_id
+                or safe.argument_id != value.argument_id
+                or safe.binding != value.binding
+                or safe.binding.value_reference != value.value_source_reference
+            ):
+                raise ContextMismatchError(
+                    ResearchAuthorizationErrorCode.context_mismatch
+                )
+        try:
+            GraphQLDocumentRenderer(state, self.graphql_limits).render(
+                template,
+                variable_bindings=bindings,
+                selected_field_ids=selected_fields,
+            )
+        except GraphQLExecutionError as exc:
+            raise ContextMismatchError(
+                ResearchAuthorizationErrorCode.context_mismatch
+            ) from exc
+        for binding in bindings:
+            if binding.value_source.value == "controlled_object":
+                if (
+                    binding.value_reference
+                    not in experiment.mutation.controlled_object_ids
+                ):
+                    raise ContextMismatchError(
+                        ResearchAuthorizationErrorCode.context_mismatch
+                    )
+            elif binding.value_source.value == "controlled_identity":
+                if binding.value_reference not in {
+                    experiment.identity_context.primary_identity_id,
+                    experiment.identity_context.comparison_identity_id,
+                }:
+                    raise ContextMismatchError(
+                        ResearchAuthorizationErrorCode.context_mismatch
+                    )
+            elif binding.value_reference not in self.controlled_values:
+                raise ContextMismatchError(
+                    ResearchAuthorizationErrorCode.context_mismatch
+                )
+        request_templates = [
+            item
+            for item in self.request_templates.values()
+            if item.endpoint_id == template.endpoint_id
+        ]
+        if len(request_templates) != 1:
+            raise ScopeMismatchError(ResearchAuthorizationErrorCode.scope_mismatch)
+        self._validate_graphql_transport_template(
+            request_templates[0], template, state, target
+        )
+        if isinstance(value, GraphQLOperationInput) and not value.anonymous:
+            request_template = request_templates[0]
+            if (
+                request_template.credential_header_name is not None
+                and not self.policy.credentials_allowed
+            ):
+                raise ContextMismatchError(
+                    ResearchAuthorizationErrorCode.context_mismatch
+                )
+
+    def _validate_graphql_transport_template(
+        self,
+        request_template: RegisteredRuntimeRequestTemplate,
+        operation_template: RegisteredGraphQLOperationTemplate,
+        state: ResearchState,
+        target: TargetAsset,
+    ) -> None:
+        endpoint = _one(state.endpoints, "endpoint_id", operation_template.endpoint_id)
+        surface = _one(
+            state.graphql_surfaces,
+            "graphql_surface_id",
+            operation_template.graphql_surface_id,
+        )
+        if (
+            endpoint is None
+            or surface is None
+            or request_template.target_id != target.target_id
+            or request_template.surface_id != surface.surface_id
+            or request_template.endpoint_id != endpoint.endpoint_id
+            or request_template.method.value != "POST"
+            or request_template.method is not endpoint.method
+            or request_template.parameters
+            or not _url_belongs_to_endpoint(
+                target.canonical_reference,
+                endpoint.route_template,
+                request_template.url,
+            )
+        ):
+            raise ScopeMismatchError(ResearchAuthorizationErrorCode.scope_mismatch)
+        if (
+            operation_template.state_change_class
+            is GraphQLExperimentStateChangeClass.read_only
+        ):
+            decision = self.policy._authorize_url_base(
+                request_template.url, method=request_template.method.value
+            )
+        else:
+            decision = self.policy.authorize_url(
+                request_template.url, method=request_template.method.value
+            )
+        if not decision.allowed:
+            raise ScopeMismatchError(ResearchAuthorizationErrorCode.scope_mismatch)
 
     def _validate_template(
         self,

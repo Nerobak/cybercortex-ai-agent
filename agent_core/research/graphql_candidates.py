@@ -318,7 +318,10 @@ class GraphQLExperimentCandidateBuilder:
                 definition = self.registry.resolve(primitive)
             except ValueError:
                 continue
-            if definition.capability_state is not PrimitiveCapabilityState.compile_only:
+            if definition.capability_state not in {
+                PrimitiveCapabilityState.compile_only,
+                PrimitiveCapabilityState.execution_available,
+            }:
                 continue
             for template in templates:
                 candidate = self._construct(

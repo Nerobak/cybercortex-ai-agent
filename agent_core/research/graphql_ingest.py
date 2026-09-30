@@ -13,7 +13,6 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
 
@@ -44,9 +43,11 @@ from agent_core.research.graphql import (
     GraphQLAuthorizationObservation,
     GraphQLAuthorizationSemantics,
     GraphQLFieldRecord,
+    GraphQLErrorClass,
     GraphQLLimitExceeded,
     GraphQLOperationRecord,
     GraphQLReturnShape,
+    GraphQLResponseEnvelope,
     GraphQLRootRole,
     GraphQLSchemaState,
     GraphQLSemanticConflict,
@@ -97,34 +98,13 @@ MAX_GRAPHQL_FRAGMENT_SPREAD_DEPTH = 8
 MAX_GRAPHQL_RESPONSE_SHAPE_NODES = 1_024
 MAX_GRAPHQL_RESPONSE_DEPTH = 12
 MAX_GRAPHQL_RESPONSE_TYPENAMES = 128
+MAX_GRAPHQL_RESPONSE_ERRORS = 100
+DEFAULT_GRAPHQL_RESPONSE_ERROR_LIMIT = 32
 MAX_GRAPHQL_RESPONSE_BYTES = 262_144
 
 
 class GraphQLDocumentError(ValueError):
     """A document was malformed or exceeded a deterministic parser bound."""
-
-
-class GraphQLErrorClass(str, Enum):
-    parse_error = "parse_error"
-    validation_error = "validation_error"
-    authentication_error = "authentication_error"
-    authorization_error = "authorization_error"
-    resolver_error = "resolver_error"
-    not_found = "not_found"
-    rate_limited = "rate_limited"
-    transport_error = "transport_error"
-    unknown = "unknown"
-
-
-class GraphQLResponseEnvelope(str, Enum):
-    graphql_data = "graphql_data"
-    graphql_errors = "graphql_errors"
-    graphql_data_and_errors = "graphql_data_and_errors"
-    ordinary_json = "ordinary_json"
-    html = "html"
-    non_json = "non_json"
-    oversized = "oversized"
-    transport_failure = "transport_failure"
 
 
 class ParsedGraphQLArgument(ResearchContract):
@@ -742,7 +722,7 @@ def _response_digest(raw: bytes) -> str:
 
 
 def _error_classes(
-    payload: Mapping[str, Any], status_code: int | None
+    payload: Mapping[str, Any], status_code: int | None, *, max_errors: int
 ) -> tuple[GraphQLErrorClass, ...]:
     if status_code == 401:
         return (GraphQLErrorClass.authentication_error,)
@@ -765,7 +745,9 @@ def _error_classes(
         "TOO_MANY_REQUESTS": GraphQLErrorClass.rate_limited,
         "INTERNAL_SERVER_ERROR": GraphQLErrorClass.resolver_error,
     }
-    for item in payload.get("errors") or ():
+    errors = payload.get("errors")
+    bounded_errors = errors[:max_errors] if isinstance(errors, list) else ()
+    for item in bounded_errors:
         if not isinstance(item, Mapping):
             continue
         extensions = item.get("extensions")
@@ -791,12 +773,15 @@ def analyze_graphql_response(
     status_code: int | None = None,
     content_type: str | None = None,
     max_bytes: int = MAX_GRAPHQL_RESPONSE_BYTES,
+    max_errors: int = DEFAULT_GRAPHQL_RESPONSE_ERROR_LIMIT,
     request_was_graphql: bool = False,
 ) -> GraphQLResponseObservation:
     """Return structural response evidence without retaining response values."""
 
     if not 1 <= max_bytes <= MAX_GRAPHQL_RESPONSE_BYTES:
         raise ValueError("GraphQL response byte bound is outside the supported range")
+    if not 1 <= max_errors <= MAX_GRAPHQL_RESPONSE_ERRORS:
+        raise ValueError("GraphQL response error bound is outside the supported range")
     if isinstance(response, bytes):
         raw = response
     elif isinstance(response, str):
@@ -810,7 +795,7 @@ def analyze_graphql_response(
             default=str,
         ).encode("utf-8")
     digest = _response_digest(raw)
-    status_errors = _error_classes({}, status_code)
+    status_errors = _error_classes({}, status_code, max_errors=max_errors)
     if len(raw) > max_bytes:
         return GraphQLResponseObservation(
             envelope=GraphQLResponseEnvelope.oversized,
@@ -832,7 +817,7 @@ def analyze_graphql_response(
             )
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             return GraphQLResponseObservation(
                 envelope=GraphQLResponseEnvelope.non_json,
                 error_classes=status_errors,
@@ -847,7 +832,10 @@ def analyze_graphql_response(
             response_bytes=len(raw),
         )
     data_present = "data" in parsed
-    errors_present = isinstance(parsed.get("errors"), list)
+    errors = parsed.get("errors")
+    errors_present = isinstance(errors, list)
+    bounded_errors = errors[:max_errors] if isinstance(errors, list) else ()
+    errors_truncated = isinstance(errors, list) and len(errors) > max_errors
     content_is_graphql = "graphql-response+json" in str(content_type or "").lower()
     structured_error = errors_present and all(
         isinstance(item, Mapping)
@@ -857,7 +845,7 @@ def analyze_graphql_response(
             or item.get("path") is not None
             or isinstance(item.get("extensions"), Mapping)
         )
-        for item in parsed.get("errors") or ()
+        for item in bounded_errors
     )
     is_graphql = (
         content_is_graphql
@@ -931,12 +919,16 @@ def analyze_graphql_response(
         envelope=envelope,
         data_present=data_present,
         errors_present=errors_present,
-        error_classes=_error_classes(parsed, status_code),
+        error_classes=_error_classes(parsed, status_code, max_errors=max_errors),
         typename_observations=tuple(sorted(typenames))[:MAX_GRAPHQL_RESPONSE_TYPENAMES],
         object_shape=tuple(sorted(shape))[:MAX_GRAPHQL_RESPONSE_SHAPE_NODES],
         evidence_digest=digest,
         response_bytes=len(raw),
-        truncated=shape_truncated or count >= MAX_GRAPHQL_RESPONSE_SHAPE_NODES,
+        truncated=(
+            shape_truncated
+            or errors_truncated
+            or count >= MAX_GRAPHQL_RESPONSE_SHAPE_NODES
+        ),
     )
 
 

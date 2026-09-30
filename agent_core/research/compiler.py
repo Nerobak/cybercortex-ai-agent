@@ -101,7 +101,7 @@ from agent_core.verification_capabilities import (
     get_research_experiment_capability_adapter,
 )
 
-EXPERIMENT_COMPILER_VERSION = "phase4-experiment-compiler-v1"
+EXPERIMENT_COMPILER_VERSION = "phase4-experiment-compiler-v2"
 DEFAULT_EXPERIMENT_TTL_SECONDS = 900
 DEFAULT_MAX_RESPONSE_BYTES = 2_000_000
 
@@ -243,6 +243,7 @@ class CleanupDefinition(ResearchContract):
 class ExperimentCompilerContext(ResearchContract):
     current_time: Timestamp
     execution_ready: StrictBool = False
+    graphql_execution_enabled: StrictBool = False
     compiler_version: OpaqueIdentifier = EXPERIMENT_COMPILER_VERSION
     experiment_ttl_seconds: StrictInt = Field(
         default=DEFAULT_EXPERIMENT_TTL_SECONDS, ge=1, le=86_400
@@ -431,7 +432,15 @@ class ExperimentCompiler:
                 raise ExperimentCompilerError(
                     CompilerErrorCode.unknown_primitive
                 ) from exc
+            graphql_runtime_step = step.primitive_name in {
+                "graphql_operation",
+                "graphql_variable_mutation",
+            }
             if (
+                compiler_context.execution_ready
+                and graphql_runtime_step
+                and not compiler_context.graphql_execution_enabled
+            ) or (
                 compiler_context.execution_ready
                 and definition.capability_state
                 is not PrimitiveCapabilityState.execution_available
@@ -452,6 +461,14 @@ class ExperimentCompiler:
                 preconditions=preconditions,
             )
             definitions.append(definition)
+            capability_state = definition.capability_state
+            if graphql_runtime_step:
+                capability_state = (
+                    PrimitiveCapabilityState.execution_available
+                    if compiler_context.execution_ready
+                    and compiler_context.graphql_execution_enabled
+                    else PrimitiveCapabilityState.compile_only
+                )
             compiled_steps.append(
                 CompiledPrimitiveStep(
                     step_id=step.step_id,
@@ -459,7 +476,7 @@ class ExperimentCompiler:
                     primitive_version=definition.version,
                     input=step.input,
                     output_type=definition.output_type_reference,
-                    capability_state=definition.capability_state,
+                    capability_state=capability_state,
                 )
             )
 

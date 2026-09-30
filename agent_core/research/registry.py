@@ -17,7 +17,7 @@ from agent_core.research.primitives import (
 )
 from agent_core.research.types import OpaqueIdentifier, ResearchContract, TargetClass
 
-EXPERIMENT_REGISTRY_VERSION = "phase4-primitives-v1"
+EXPERIMENT_REGISTRY_VERSION = "phase4-primitives-v2"
 
 
 class PrimitiveDefinition(ResearchContract):
@@ -289,25 +289,27 @@ _DEFAULT_DEFINITIONS = (
         "graphql_operation",
         "GraphQLOperationInput",
         "ReplayEvidence",
-        state=PrimitiveCapabilityState.compile_only,
+        state=PrimitiveCapabilityState.execution_available,
         minimum=1,
         worst=1,
         risk=RiskLevel.low,
         requirements=("registered_graphql_operation",),
         state_change=StateChangeBehavior.method_dependent,
         cleanup=CleanupBehavior.method_dependent,
+        executor_adapter_reference="research-native:graphql_operation/v1",
     ),
     _definition(
         "graphql_variable_mutation",
         "GraphQLVariableMutationInput",
         "MutationEvidence",
-        state=PrimitiveCapabilityState.compile_only,
+        state=PrimitiveCapabilityState.execution_available,
         minimum=1,
-        worst=3,
+        worst=1,
         risk=RiskLevel.moderate,
         requirements=("registered_graphql_operation", "registered_parameter"),
         state_change=StateChangeBehavior.method_dependent,
         cleanup=CleanupBehavior.method_dependent,
+        executor_adapter_reference="research-native:graphql_variable_mutation/v1",
     ),
     _definition(
         "token_mutation",

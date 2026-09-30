@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import Field, StrictBool, StrictInt, model_validator
 
 from agent_core.research.provenance import reject_secret_material
+from agent_core.research.graphql import (
+    GraphQLErrorClass,
+    GraphQLResponseEnvelope,
+)
 from agent_core.research.state import ExperimentOutcome as StoredExperimentOutcome
 from agent_core.research.state import ReproductionOutcome
 from agent_core.research.types import (
@@ -68,6 +73,68 @@ class InvariantResult(ResearchContract):
     satisfied: StrictBool
 
 
+class GraphQLRuntimeResponseEvidence(ResearchContract):
+    """Bounded GraphQL response structure; never a response value or body."""
+
+    authorized_experiment_reference: Sha256Digest
+    operation_template_reference: OpaqueIdentifier
+    operation_reference: OpaqueIdentifier
+    identity_reference: OpaqueIdentifier | None = None
+    object_references: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=20)
+    request_accounting_reference: OpaqueIdentifier
+    runtime_provenance_reference: OpaqueIdentifier
+    status_code: StrictInt | None = Field(default=None, ge=100, le=599)
+    status_class: OpaqueIdentifier
+    envelope: GraphQLResponseEnvelope
+    data_present: StrictBool = False
+    errors_present: StrictBool = False
+    error_classes: tuple[GraphQLErrorClass, ...] = Field(default=(), max_length=32)
+    error_count: StrictInt = Field(default=0, ge=0, le=100)
+    typename_observations: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=128
+    )
+    selected_field_presence: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=200
+    )
+    object_shape_fingerprint: Sha256Digest
+    controlled_object_reference_match: StrictBool | None = None
+    response_digest: Sha256Digest
+    response_bytes: StrictInt = Field(ge=0, le=262_144)
+    latency_ms: StrictInt = Field(ge=0, le=3_600_000)
+    truncated: StrictBool = False
+
+    @model_validator(mode="after")
+    def enforce_safe_graphql_evidence(self) -> "GraphQLRuntimeResponseEvidence":
+        if not self.errors_present and (self.error_count or self.error_classes):
+            raise ValueError("GraphQL error evidence requires an errors envelope")
+        reject_secret_material(
+            self.model_dump(mode="json"), location="GraphQL runtime evidence"
+        )
+        return self
+
+
+class GraphQLRuntimeTraceEvent(ResearchContract):
+    """Reference-only GraphQL runtime trace event."""
+
+    event_type: Literal[
+        "GRAPHQL_AUTHORIZE",
+        "GRAPHQL_EXECUTE",
+        "GRAPHQL_RESPONSE",
+        "GRAPHQL_CLEANUP",
+    ]
+    experiment_reference: OpaqueIdentifier
+    operation_reference: OpaqueIdentifier
+    identity_reference: OpaqueIdentifier | None = None
+    request_count: StrictInt = Field(ge=0, le=100)
+    status_class: OpaqueIdentifier | None = None
+    error_class: GraphQLErrorClass | None = None
+
+    @model_validator(mode="after")
+    def enforce_safe_trace(self) -> "GraphQLRuntimeTraceEvent":
+        reject_secret_material(self.model_dump(mode="json"), location="GraphQL trace")
+        return self
+
+
 class PrimitiveExecutionEvidence(ResearchContract):
     evidence_id: EvidenceArtifactId
     step_id: OpaqueIdentifier
@@ -83,6 +150,12 @@ class PrimitiveExecutionEvidence(ResearchContract):
     )
     selector_results: tuple[SelectorResult, ...] = Field(default=(), max_length=20)
     invariant_results: tuple[InvariantResult, ...] = Field(default=(), max_length=20)
+    graphql_responses: tuple[GraphQLRuntimeResponseEvidence, ...] = Field(
+        default=(), max_length=10
+    )
+    graphql_trace_events: tuple[GraphQLRuntimeTraceEvent, ...] = Field(
+        default=(), max_length=40
+    )
     request_accounting_reference: OpaqueIdentifier
     runtime_provenance_reference: OpaqueIdentifier
 
@@ -99,6 +172,7 @@ class CleanupExecutionResult(ResearchContract):
     cleanup_reference: OpaqueIdentifier | None = None
     evidence_reference: EvidenceArtifactId | None = None
     requests_used: StrictInt = Field(default=0, ge=0, le=100)
+    graphql_trace_event: GraphQLRuntimeTraceEvent | None = None
 
 
 class RuntimeProvenance(ResearchContract):
@@ -147,6 +221,8 @@ __all__ = [
     "CleanupExecutionResult",
     "ExperimentOutcome",
     "ExperimentResultClassification",
+    "GraphQLRuntimeResponseEvidence",
+    "GraphQLRuntimeTraceEvent",
     "InvariantResult",
     "PrimitiveExecutionEvidence",
     "ProposedExecutionMetadata",

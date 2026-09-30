@@ -64,13 +64,13 @@ def test_initial_registry_inventory_and_capability_states_are_explicit():
         "object_substitution",
         "response_differential",
         "state_differential",
+        "graphql_operation",
+        "graphql_variable_mutation",
     }
     assert all(
         DEFAULT_EXPERIMENT_REGISTRY.resolve(name).capability_state
         is PrimitiveCapabilityState.compile_only
         for name in {
-            "graphql_operation",
-            "graphql_variable_mutation",
             "token_mutation",
             "workflow_step_replay",
             "workflow_step_skip",
