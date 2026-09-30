@@ -1099,10 +1099,20 @@ class ResearchExecutionGate:
         duplicate = experiment.experiment_id in completed_ids or fingerprint_seen
         if not duplicate:
             return
-        if experiment.reproduction_of is not None and (
-            experiment.reproduction_of in completed_ids
-            or self.runtime.has_completed_experiment(experiment.reproduction_of)
+        if (
+            experiment.reproduction_of is not None
+            and experiment.reproduction_id is None
+            and experiment.reproduction_finding_id is None
+            and experiment.experiment_id not in completed_ids
+            and not self.runtime.has_completed_experiment(experiment.experiment_id)
+            and (
+                experiment.reproduction_of in completed_ids
+                or self.runtime.has_completed_experiment(experiment.reproduction_of)
+            )
         ):
+            # Compatibility for pre-P4-0F explicit reproductions.  A distinct
+            # legacy experiment ID may run once even though its copied
+            # fingerprint matches the completed source.
             return
         raise DuplicateExperimentError(
             ResearchAuthorizationErrorCode.duplicate_experiment
@@ -1138,6 +1148,46 @@ class ResearchExecutionGate:
                 item.reproduction_id == plan.reproduction_id
                 for item in state.reproduction_outcomes
             )
+            or experiment.target.target_id != plan.target_id
+            or experiment.target.surface_id != plan.surface_id
+            or experiment.target.endpoint_id != plan.endpoint_id
+            or experiment.identity_context.primary_identity_id
+            != plan.primary_identity_id
+            or experiment.identity_context.comparison_identity_id
+            != plan.comparison_identity_id
+            or experiment.identity_context.primary_session_ref_id
+            != plan.proposal_template.primary_session_ref_id
+            or experiment.identity_context.comparison_session_ref_id
+            != plan.proposal_template.comparison_session_ref_id
+            or (
+                experiment.identity_context.relationship.value
+                if experiment.identity_context.relationship is not None
+                else None
+            )
+            != plan.identity_relationship
+            or (
+                (
+                    not set(experiment.mutation.controlled_object_ids).issubset(
+                        set(plan.controlled_object_ids)
+                    )
+                )
+                if plan.graphql_operation_id is not None
+                and plan.alternate_controlled_object_id is None
+                else set(experiment.mutation.controlled_object_ids)
+                != set(
+                    (plan.alternate_controlled_object_id,)
+                    if plan.alternate_controlled_object_id is not None
+                    else plan.controlled_object_ids
+                )
+            )
+            or experiment.state_changing != plan.state_changing
+            or experiment.cleanup.required != plan.cleanup_required
+            or experiment.cleanup.cleanup_reference != plan.cleanup_reference
+            or experiment.request_estimate.total_reservation > plan.maximum_requests
+            or experiment.provenance.source_proposal_id
+            != plan.proposal_template.proposal_id
+            or tuple(item.input for item in experiment.primitive_steps)
+            != tuple(item.input for item in plan.proposal_template.primitive_steps)
         ):
             raise AuthorizationBlockedError(
                 ResearchAuthorizationErrorCode.authorization_blocked

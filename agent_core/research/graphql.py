@@ -26,6 +26,7 @@ from pydantic import (
 
 from agent_core.research.types import (
     EndpointId,
+    EntityKind,
     EntityReference,
     EvidenceArtifactId,
     GraphQLArgumentId,
@@ -1092,6 +1093,159 @@ def graphql_operation_fingerprint(
         document, max_depth=max_depth, max_nodes=max_nodes
     )
     return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def graphql_experiment_semantic_fingerprint(
+    state: object,
+    experiment: object,
+) -> str:
+    """Fingerprint the registered GraphQL semantics used by an experiment.
+
+    The projection contains only typed records and reference-only primitive
+    inputs.  Runtime variable values and rendered GraphQL source are never
+    accepted or included.  Reproduction planning uses this digest to fail
+    closed when an operation, selection, field, argument, or variable binding
+    has changed since the candidate signal was created.
+    """
+
+    primitive_steps = tuple(getattr(experiment, "primitive_steps", ()))
+    graphql_inputs = tuple(
+        getattr(item, "input", None)
+        for item in primitive_steps
+        if getattr(getattr(item, "input", None), "primitive", None)
+        in {"graphql_operation", "graphql_variable_mutation"}
+    )
+    operation_ids = {
+        str(getattr(item, "operation_id"))
+        for item in graphql_inputs
+        if getattr(item, "operation_id", None) is not None
+    }
+    if len(operation_ids) != 1:
+        raise ValueError("GraphQL experiment requires exactly one operation")
+    operation_id = next(iter(operation_ids))
+    operations = tuple(
+        item
+        for item in getattr(state, "graphql_operations", ())
+        if getattr(item, "operation_id", None) == operation_id
+    )
+    if len(operations) != 1 or not isinstance(operations[0], GraphQLOperationRecord):
+        raise ValueError("registered GraphQL operation is unavailable")
+    operation = operations[0]
+    selected_field_ids = {
+        str(field_id)
+        for item in graphql_inputs
+        for field_id in getattr(item, "selected_field_ids", ())
+    }
+    hypothesis_id = getattr(experiment, "hypothesis_id", None)
+    hypothesis = next(
+        (
+            item
+            for item in getattr(state, "hypotheses", ())
+            if item.hypothesis_id == hypothesis_id
+        ),
+        None,
+    )
+    if hypothesis is not None:
+        selected_field_ids.update(
+            item.entity_id
+            for item in hypothesis.entity_references
+            if item.entity_kind is EntityKind.graphql_field
+        )
+    binding_pairs = tuple(
+        binding
+        for item in graphql_inputs
+        for binding in (
+            *getattr(item, "variable_bindings", ()),
+            *(
+                (getattr(item, "binding"),)
+                if getattr(item, "binding", None) is not None
+                else ()
+            ),
+        )
+    )
+    argument_ids = {
+        str(getattr(item, "argument_id"))
+        for item in binding_pairs
+        if getattr(item, "argument_id", None) is not None
+    }
+    if hypothesis is not None:
+        argument_ids.update(
+            item.entity_id
+            for item in hypothesis.entity_references
+            if item.entity_kind is EntityKind.graphql_argument
+        )
+    variable_ids = {
+        str(getattr(item, "variable_id"))
+        for item in binding_pairs
+        if getattr(item, "variable_id", None) is not None
+    }
+    fields = tuple(
+        item
+        for item in getattr(state, "graphql_fields", ())
+        if item.field_id in selected_field_ids
+    )
+    arguments = tuple(
+        item
+        for item in getattr(state, "graphql_arguments", ())
+        if item.argument_id in argument_ids
+    )
+    variables = tuple(
+        item
+        for item in getattr(state, "graphql_variables", ())
+        if item.variable_id in variable_ids
+    )
+    if len(fields) != len(selected_field_ids):
+        raise ValueError("registered GraphQL field semantics are unavailable")
+    if len(arguments) != len(argument_ids):
+        raise ValueError("registered GraphQL argument semantics are unavailable")
+    if len(variables) != len(variable_ids):
+        raise ValueError("registered GraphQL variable semantics are unavailable")
+    surface = tuple(
+        item
+        for item in getattr(state, "graphql_surfaces", ())
+        if item.graphql_surface_id == operation.graphql_surface_id
+    )
+    if len(surface) != 1:
+        raise ValueError("registered GraphQL surface is unavailable")
+    payload = {
+        "surface": surface[0].model_dump(mode="json"),
+        "operation": operation.model_dump(mode="json"),
+        "fields": [
+            item.model_dump(mode="json")
+            for item in sorted(fields, key=lambda value: value.field_id)
+        ],
+        "arguments": [
+            item.model_dump(mode="json")
+            for item in sorted(arguments, key=lambda value: value.argument_id)
+        ],
+        "variables": [
+            item.model_dump(mode="json")
+            for item in sorted(variables, key=lambda value: value.variable_id)
+        ],
+        "bindings": [
+            {
+                "argument_id": item.argument_id,
+                "variable_id": item.variable_id,
+                "value_source": item.value_source.value,
+            }
+            for item in sorted(
+                binding_pairs,
+                key=lambda value: (value.argument_id, value.variable_id),
+            )
+        ],
+        "selected_fields": sorted(selected_field_ids),
+        "candidate_kinds": sorted(
+            {
+                getattr(getattr(item, "candidate_kind", None), "value", None)
+                for item in graphql_inputs
+                if getattr(item, "candidate_kind", None) is not None
+            }
+        ),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _merge_schema_state(

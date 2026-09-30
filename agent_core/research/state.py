@@ -31,6 +31,7 @@ from agent_core.research.graphql import (
     MAX_GRAPHQL_VARIABLES_PER_OPERATION,
     MAX_GRAPHQL_VARIABLES,
     GraphQLArgumentRecord,
+    GraphQLCandidateKind,
     GraphQLFieldRecord,
     GraphQLOperationRecord,
     GraphQLSurface,
@@ -77,6 +78,7 @@ from agent_core.research.types import (
     GraphQLFieldId,
     GraphQLOperationId,
     GraphQLOperationType,
+    GraphQLSurfaceId,
     HttpMethod,
     HypothesisRecordId,
     HypothesisResearchStatus,
@@ -803,6 +805,17 @@ class ReproductionPlan(ResearchContract):
     target_id: TargetAssetId
     surface_id: SurfaceId | None = None
     endpoint_id: EndpointId | None = None
+    graphql_candidate_kind: GraphQLCandidateKind | None = None
+    graphql_surface_id: GraphQLSurfaceId | None = None
+    graphql_operation_id: GraphQLOperationId | None = None
+    source_graphql_operation_template_id: OpaqueIdentifier | None = None
+    graphql_operation_template_id: OpaqueIdentifier | None = None
+    graphql_field_ids: tuple[GraphQLFieldId, ...] = Field(default=(), max_length=64)
+    graphql_argument_ids: tuple[GraphQLArgumentId, ...] = Field(
+        default=(), max_length=64
+    )
+    graphql_selection_fingerprint: Sha256Digest | None = None
+    graphql_semantic_fingerprint: Sha256Digest | None = None
     primary_identity_id: IdentityId | None = None
     comparison_identity_id: IdentityId | None = None
     identity_relationship: OpaqueIdentifier | None = None
@@ -817,6 +830,7 @@ class ReproductionPlan(ResearchContract):
     maximum_attempts: StrictInt = Field(ge=1, le=100)
     state_changing: StrictBool
     cleanup_required: StrictBool
+    cleanup_reference: OpaqueIdentifier | None = None
     confirmation_policy_reference: OpaqueIdentifier
     confirmation_policy_fingerprint: Sha256Digest
     provenance_id: ProvenanceRecordId
@@ -825,6 +839,7 @@ class ReproductionPlan(ResearchContract):
     compiled_experiment_id: ExperimentId | None = None
     model_decision_id: OpaqueIdentifier | None = None
     proposal_template: ReproductionProposalTemplate
+    trace_events: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=20)
 
     @model_validator(mode="after")
     def validate_plan(self) -> "ReproductionPlan":
@@ -843,6 +858,12 @@ class ReproductionPlan(ResearchContract):
                 "reproduction evidence predicates",
             ),
         )
+        for field_name in ("graphql_field_ids", "graphql_argument_ids"):
+            object.__setattr__(
+                self,
+                field_name,
+                _canonical_references(getattr(self, field_name), field_name),
+            )
         if (
             self.alternate_controlled_object_id is not None
             and self.alternate_controlled_object_id in self.controlled_object_ids
@@ -854,6 +875,21 @@ class ReproductionPlan(ResearchContract):
             raise ValueError("completed reproduction plan requires an experiment")
         if self.state_changing != self.cleanup_required:
             raise ValueError("state-changing reproduction requires cleanup")
+        if self.cleanup_required != (self.cleanup_reference is not None):
+            raise ValueError("reproduction cleanup binding is inconsistent")
+        graphql_markers = (
+            self.graphql_candidate_kind,
+            self.graphql_surface_id,
+            self.graphql_operation_id,
+            self.source_graphql_operation_template_id,
+            self.graphql_operation_template_id,
+            self.graphql_selection_fingerprint,
+            self.graphql_semantic_fingerprint,
+        )
+        if any(item is not None for item in graphql_markers) and any(
+            item is None for item in graphql_markers
+        ):
+            raise ValueError("GraphQL reproduction references are incomplete")
         if (
             self.proposal_template.research_id != self.research_id
             or self.proposal_template.hypothesis_id != self.source_hypothesis_id
@@ -926,6 +962,16 @@ class ReproductionOutcome(ResearchContract):
     target_id: TargetAssetId
     surface_id: SurfaceId | None = None
     endpoint_id: EndpointId | None = None
+    graphql_candidate_kind: GraphQLCandidateKind | None = None
+    graphql_surface_id: GraphQLSurfaceId | None = None
+    graphql_operation_id: GraphQLOperationId | None = None
+    graphql_operation_template_id: OpaqueIdentifier | None = None
+    graphql_field_ids: tuple[GraphQLFieldId, ...] = Field(default=(), max_length=64)
+    graphql_argument_ids: tuple[GraphQLArgumentId, ...] = Field(
+        default=(), max_length=64
+    )
+    graphql_selection_fingerprint: Sha256Digest | None = None
+    graphql_semantic_fingerprint: Sha256Digest | None = None
     security_property_reference: OpaqueIdentifier
     identity_relationship: OpaqueIdentifier | None = None
     controlled_object_ids: tuple[ResearchObjectId, ...] = Field(
@@ -940,10 +986,16 @@ class ReproductionOutcome(ResearchContract):
     runtime_provenance_reference: ProvenanceRecordId
     authorization_reference: Sha256Digest
     created_at: Timestamp
+    trace_events: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=20)
 
     @model_validator(mode="after")
     def validate_outcome(self) -> "ReproductionOutcome":
-        for field_name in ("controlled_object_ids", "evidence_references"):
+        for field_name in (
+            "controlled_object_ids",
+            "evidence_references",
+            "graphql_field_ids",
+            "graphql_argument_ids",
+        ):
             object.__setattr__(
                 self,
                 field_name,
@@ -954,6 +1006,18 @@ class ReproductionOutcome(ResearchContract):
                 raise ValueError("a reproduced outcome requires evidence")
             if self.independence is None or not self.independence.valid:
                 raise ValueError("a reproduced outcome requires independence evidence")
+        graphql_markers = (
+            self.graphql_candidate_kind,
+            self.graphql_surface_id,
+            self.graphql_operation_id,
+            self.graphql_operation_template_id,
+            self.graphql_selection_fingerprint,
+            self.graphql_semantic_fingerprint,
+        )
+        if any(item is not None for item in graphql_markers) and any(
+            item is None for item in graphql_markers
+        ):
+            raise ValueError("GraphQL reproduction outcome references are incomplete")
         return self
 
 
@@ -975,6 +1039,7 @@ class FindingConfirmationDecision(ResearchContract):
     total_request_count: StrictInt = Field(default=0, ge=0, le=1_000_000)
     provenance_id: ProvenanceRecordId
     created_at: Timestamp
+    trace_events: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=20)
 
     @model_validator(mode="after")
     def canonicalize_references(self) -> "FindingConfirmationDecision":
@@ -1044,6 +1109,10 @@ class FindingRecord(ResearchContract):
     surface_id: SurfaceId | None = None
     endpoint_id: EndpointId | None = None
     graphql_operation_id: GraphQLOperationId | None = None
+    graphql_operation_template_id: OpaqueIdentifier | None = None
+    graphql_candidate_kind: GraphQLCandidateKind | None = None
+    graphql_selection_fingerprint: Sha256Digest | None = None
+    graphql_semantic_fingerprint: Sha256Digest | None = None
     graphql_field_ids: tuple[GraphQLFieldId, ...] = Field(default=(), max_length=64)
     graphql_argument_ids: tuple[GraphQLArgumentId, ...] = Field(
         default=(), max_length=64
@@ -1130,6 +1199,21 @@ class FindingRecord(ResearchContract):
             )
         if self.status is FindingStatus.reproducing and not self.reproduction_ids:
             raise ValueError("a reproducing finding requires a reproduction plan")
+        graphql_markers = (
+            self.graphql_operation_id,
+            self.graphql_operation_template_id,
+            self.graphql_candidate_kind,
+            self.graphql_selection_fingerprint,
+            self.graphql_semantic_fingerprint,
+        )
+        if any(item is not None for item in graphql_markers) and any(
+            item is None for item in graphql_markers
+        ):
+            raise ValueError("GraphQL finding references are incomplete")
+        if (self.graphql_field_ids or self.graphql_argument_ids) and (
+            self.graphql_operation_id is None
+        ):
+            raise ValueError("GraphQL field/argument references require an operation")
         if self.status in {FindingStatus.reproduced, FindingStatus.confirmed} and not (
             self.reproduction_experiment_ids
         ):
@@ -2404,6 +2488,26 @@ class ResearchState(ResearchContract):
                 item.endpoint_id, endpoint_ids, "reproduction endpoint"
             )
             _require_optional_reference(
+                item.graphql_surface_id,
+                graphql_surface_ids,
+                "reproduction GraphQL surface",
+            )
+            _require_optional_reference(
+                item.graphql_operation_id,
+                graphql_semantic_operation_ids,
+                "reproduction GraphQL operation",
+            )
+            _require_references(
+                item.graphql_field_ids,
+                graphql_field_ids,
+                "reproduction GraphQL fields",
+            )
+            _require_references(
+                item.graphql_argument_ids,
+                graphql_argument_ids,
+                "reproduction GraphQL arguments",
+            )
+            _require_optional_reference(
                 item.primary_identity_id,
                 identity_ids,
                 "reproduction primary identity",
@@ -2438,6 +2542,26 @@ class ResearchState(ResearchContract):
             )
             _require_references(
                 item.evidence_references, evidence_ids, "reproduction evidence"
+            )
+            _require_optional_reference(
+                item.graphql_surface_id,
+                graphql_surface_ids,
+                "reproduction outcome GraphQL surface",
+            )
+            _require_optional_reference(
+                item.graphql_operation_id,
+                graphql_semantic_operation_ids,
+                "reproduction outcome GraphQL operation",
+            )
+            _require_references(
+                item.graphql_field_ids,
+                graphql_field_ids,
+                "reproduction outcome GraphQL fields",
+            )
+            _require_references(
+                item.graphql_argument_ids,
+                graphql_argument_ids,
+                "reproduction outcome GraphQL arguments",
             )
             _require_reference(
                 item.runtime_provenance_reference,

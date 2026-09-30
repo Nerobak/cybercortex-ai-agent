@@ -63,6 +63,8 @@ class ConfirmationProfile(str, Enum):
     authorization_read_only = "authorization_read_only"
     authentication_read_only = "authentication_read_only"
     parameter_mutation_read_only = "parameter_mutation_read_only"
+    graphql_read_only = "graphql_read_only"
+    graphql_state_changing = "graphql_state_changing"
 
 
 class FindingConfirmationPolicy(ResearchContract):
@@ -176,6 +178,48 @@ class FindingConfirmationPolicy(ResearchContract):
         return cls(
             policy_reference=policy_reference,
             profile=ConfirmationProfile.parameter_mutation_read_only,
+        )
+
+    @classmethod
+    def graphql_read_only(
+        cls,
+        policy_reference: str,
+        *,
+        conflicting_evidence_behavior: ConflictingEvidenceBehavior = (
+            ConflictingEvidenceBehavior.reject
+        ),
+    ) -> "FindingConfirmationPolicy":
+        """Require one fresh agreeing reproduction for read-only GraphQL."""
+
+        return cls(
+            policy_reference=policy_reference,
+            profile=ConfirmationProfile.graphql_read_only,
+            minimum_independent_reproductions=1,
+            maximum_attempts=1,
+            conflicting_evidence_behavior=conflicting_evidence_behavior,
+        )
+
+    @classmethod
+    def graphql_state_changing(
+        cls,
+        policy_reference: str,
+        *,
+        minimum_independent_reproductions: int = 2,
+        maximum_attempts: int = 2,
+        conflicting_evidence_behavior: ConflictingEvidenceBehavior = (
+            ConflictingEvidenceBehavior.manual_review
+        ),
+    ) -> "FindingConfirmationPolicy":
+        """Explicit, cleanup-bound profile for GraphQL state changes."""
+
+        return cls(
+            policy_reference=policy_reference,
+            profile=ConfirmationProfile.graphql_state_changing,
+            minimum_independent_reproductions=minimum_independent_reproductions,
+            maximum_attempts=maximum_attempts,
+            state_changing_confirmation_permitted=True,
+            cleanup_required=True,
+            conflicting_evidence_behavior=conflicting_evidence_behavior,
         )
 
 
@@ -405,9 +449,36 @@ class FindingConfirmationEvaluator:
             ):
                 return "identity_relationship_mismatch"
             if policy.required_object_relationship_agreement and (
-                set(item.controlled_object_ids) != set(finding.controlled_object_ids)
+                item.independence.independent_dimension
+                is not ReproductionIndependentDimension.different_owned_object
+                and set(item.controlled_object_ids)
+                != set(finding.controlled_object_ids)
             ):
                 return "object_relationship_mismatch"
+            if (
+                policy.required_object_relationship_agreement
+                and item.independence.independent_dimension
+                is ReproductionIndependentDimension.different_owned_object
+                and (
+                    not item.controlled_object_ids
+                    or bool(
+                        set(item.controlled_object_ids)
+                        & set(finding.controlled_object_ids)
+                    )
+                )
+            ):
+                return "alternate_object_not_independent"
+            if finding.graphql_operation_id is not None and (
+                item.graphql_candidate_kind != finding.graphql_candidate_kind
+                or item.graphql_operation_id != finding.graphql_operation_id
+                or set(item.graphql_field_ids) != set(finding.graphql_field_ids)
+                or set(item.graphql_argument_ids) != set(finding.graphql_argument_ids)
+                or item.graphql_selection_fingerprint
+                != finding.graphql_selection_fingerprint
+                or item.graphql_semantic_fingerprint
+                != finding.graphql_semantic_fingerprint
+            ):
+                return "graphql_semantic_context_mismatch"
             if policy.required_evidence_agreement and not item.evidence_references:
                 return "reproduction_evidence_missing"
             if (
@@ -476,6 +547,21 @@ class FindingConfirmationEvaluator:
             + sum(item.request_delta.total for item in outcomes),
             provenance_id=_identifier("confirmation-provenance", decision_id),
             created_at=occurred_at,
+            trace_events=(
+                {
+                    FindingConfirmationAction.confirm: "GRAPHQL_CONFIRM",
+                    FindingConfirmationAction.reject: "GRAPHQL_REJECT",
+                    FindingConfirmationAction.manual_review: ("GRAPHQL_MANUAL_REVIEW"),
+                }.get(action),
+            )
+            if finding.graphql_operation_id is not None
+            and action
+            in {
+                FindingConfirmationAction.confirm,
+                FindingConfirmationAction.reject,
+                FindingConfirmationAction.manual_review,
+            }
+            else (),
         )
         reject_secret_material(
             result.model_dump(mode="json"), location="finding confirmation decision"
@@ -504,6 +590,13 @@ class FindingConfirmationEvaluator:
         finding = next(item for item in state.findings if item.finding_id == finding_id)
         if finding.status is not FindingStatus.reproducing:
             raise ValueError("finding is not in reproduction")
+        if (
+            plan.confirmation_policy_reference != policy.policy_reference
+            or plan.confirmation_policy_fingerprint != policy.fingerprint
+            or finding.confirmation_policy_reference != policy.policy_reference
+            or finding.confirmation_policy_fingerprint != policy.fingerprint
+        ):
+            raise ValueError("confirmation policy changed after reproduction planning")
         source_outcome = next(
             item
             for item in state.experiment_outcomes
@@ -519,15 +612,35 @@ class FindingConfirmationEvaluator:
                 if plan.reproduction_id in item.reproduction_ids
             )
             return existing
+        graphql_evaluation = None
+        evaluated_outcome = runtime_outcome
+        if plan.graphql_operation_id is not None:
+            from agent_core.research.graphql_evaluation import (
+                GraphQLDifferentialEvaluator,
+            )
+
+            graphql_evaluation = GraphQLDifferentialEvaluator().evaluate(
+                experiment, runtime_outcome, state=state
+            )
+            evaluated_outcome = graphql_evaluation.classified_outcome(runtime_outcome)
         reproduction = ReproductionOutcomeEvaluator().evaluate(
-            finding, plan, experiment, runtime_outcome
+            finding, plan, experiment, evaluated_outcome
         )
+        if (
+            graphql_evaluation is not None
+            and "conflicting-repeated-bounded-evidence"
+            in graphql_evaluation.conflict_codes
+            and reproduction.classification is ReproductionClassification.inconclusive
+        ):
+            reproduction = reproduction.model_copy(
+                update={"classification": ReproductionClassification.conflicting}
+            )
         all_reproductions = (*state.reproduction_outcomes, reproduction)
         decision = self.evaluate(
             finding, source_outcome, all_reproductions, policy, state
         )
         runtime_provenance, evidence = ExperimentEvaluator._runtime_records(
-            runtime_outcome, state
+            evaluated_outcome, state
         )
         decision_provenance = ProvenanceRecord(
             provenance_id=decision.provenance_id,
@@ -546,7 +659,7 @@ class FindingConfirmationEvaluator:
         )
         stored_runtime_outcome = StoredExperimentOutcome.model_validate(
             {
-                **runtime_outcome.model_dump(
+                **evaluated_outcome.model_dump(
                     mode="python", include=set(StoredExperimentOutcome.model_fields)
                 ),
                 "evaluator_result_reference": decision.decision_id,
@@ -594,6 +707,13 @@ class FindingConfirmationEvaluator:
             request_delta=runtime_outcome.request_delta,
             wall_time_seconds=_elapsed_seconds(
                 plan_started_at, runtime_outcome.occurred_at
+            ),
+            cleanup_status=runtime_outcome.cleanup_status,
+            cleanup_barrier_reference=(
+                str(runtime_outcome.cleanup_result.cleanup_reference)
+                if runtime_outcome.cleanup_status is CleanupStatus.failed
+                and runtime_outcome.cleanup_result.cleanup_reference is not None
+                else None
             ),
         )
         next_status = _status_for_action(decision.action)

@@ -40,6 +40,8 @@ from agent_core.research.primitives import (
     ObjectSubstitutionInput,
     ParameterMutationInput,
     PrimitiveStepProposal,
+    GraphQLOperationInput,
+    GraphQLVariableMutationInput,
 )
 from agent_core.research.provenance import reject_secret_material
 from agent_core.research.state import (
@@ -108,6 +110,13 @@ def _kind(experiment: SecurityExperiment) -> ReproductionKind:
     if any(isinstance(item, ParameterMutationInput) for item in inputs):
         return ReproductionKind.parameter_mutation
     raise ReproductionPlanningError("unsupported_reproduction_strategy")
+
+
+def _is_graphql(experiment: SecurityExperiment) -> bool:
+    return any(
+        isinstance(item.input, (GraphQLOperationInput, GraphQLVariableMutationInput))
+        for item in experiment.primitive_steps
+    )
 
 
 def _proposal_template(
@@ -200,6 +209,52 @@ def _typed_evidence_valid(
     experiment: SecurityExperiment,
     outcome: ExperimentOutcome,
 ) -> bool:
+    if plan.graphql_operation_id is not None:
+        responses = tuple(
+            response
+            for item in outcome.evidence
+            if item.primitive_name in {"graphql_operation", "graphql_variable_mutation"}
+            for response in item.graphql_responses
+        )
+        if not responses:
+            return False
+        expected_identities = {
+            item
+            for item in (
+                experiment.identity_context.primary_identity_id,
+                experiment.identity_context.comparison_identity_id,
+            )
+            if item is not None
+        }
+        observed_identities = {
+            item.identity_reference
+            for item in responses
+            if item.identity_reference is not None
+        }
+        expected_objects = set(experiment.mutation.controlled_object_ids)
+        if observed_identities != expected_identities:
+            return False
+        if expected_objects and any(
+            set(item.object_references) != expected_objects for item in responses
+        ):
+            return False
+        if any(
+            item.authorized_experiment_reference != outcome.authorization_reference
+            or item.operation_reference != plan.graphql_operation_id
+            or item.operation_template_reference != plan.graphql_operation_template_id
+            or item.runtime_provenance_reference != outcome.provenance_id
+            for item in responses
+        ):
+            return False
+        response_requests = len(responses)
+        target_requests = (
+            outcome.request_delta.discovery
+            + outcome.request_delta.auth
+            + outcome.request_delta.verification
+        )
+        return response_requests == target_requests and all(
+            item.request_accounting_reference for item in responses
+        )
     expected_primitive = {
         ReproductionKind.object_substitution: "object_substitution",
         ReproductionKind.authentication_differential: "authentication_differential",
@@ -256,7 +311,26 @@ class ReproductionPlanner:
         confirmation_policy: FindingConfirmationPolicy,
         budget_manager: ResearchBudgetManager | None = None,
         available_controlled_context: object | None = None,
+        compiler_context: ExperimentCompilerContext | None = None,
+        graph: object | None = None,
     ) -> tuple[ReproductionPlan, ...]:
+        if _is_graphql(source_experiment):
+            from agent_core.research.graphql_reproduction import (
+                GraphQLReproductionPlanner,
+            )
+
+            return GraphQLReproductionPlanner().plan(
+                finding,
+                state,
+                source_experiment,
+                source_outcome,
+                registry=registry,
+                confirmation_policy=confirmation_policy,
+                budget_manager=budget_manager,
+                available_controlled_context=available_controlled_context,
+                compiler_context=compiler_context,
+                graph=graph,
+            )
         del available_controlled_context
         if finding.status is not FindingStatus.candidate:
             raise ReproductionPlanningError("finding_not_candidate")
@@ -366,6 +440,7 @@ class ReproductionPlanner:
             maximum_attempts=confirmation_policy.maximum_attempts,
             state_changing=source_experiment.state_changing,
             cleanup_required=source_experiment.cleanup.required,
+            cleanup_reference=source_experiment.cleanup.cleanup_reference,
             confirmation_policy_reference=confirmation_policy.policy_reference,
             confirmation_policy_fingerprint=confirmation_policy.fingerprint,
             provenance_id=provenance_id,
@@ -393,6 +468,8 @@ class ReproductionPlanner:
             for item in state.reproduction_plans
         ):
             return state
+        if plan.state_revision != state.revision:
+            raise ReproductionPlanningError("reproduction_plan_stale")
         finding = next(
             (item for item in state.findings if item.finding_id == plan.finding_id),
             None,
@@ -430,6 +507,7 @@ class ReproductionPlanner:
         budget = budget_manager.consume_reproduction_attempt(
             state,
             finding_id=finding.finding_id,
+            model_calls=int(plan.model_decision_id is not None),
             state_changing=plan.state_changing,
         )
         payload = state.model_dump(mode="python")
@@ -495,6 +573,18 @@ class ReproductionPlanner:
         compiler_context: ExperimentCompilerContext,
     ) -> ReproductionExperiment:
         """Materialize through the ordinary ExperimentCompiler."""
+
+        if plan.graphql_operation_id is not None:
+            from agent_core.research.graphql_reproduction import (
+                validate_graphql_reproduction_context,
+            )
+
+            validate_graphql_reproduction_context(
+                plan,
+                state,
+                compiler_context,
+                source_experiment=source_experiment,
+            )
 
         if plan.research_id != state.research_id:
             raise ReproductionPlanningError("reproduction_research_mismatch")
@@ -664,7 +754,14 @@ class ReproductionOutcomeEvaluator:
             outcome.request_delta.total > plan.maximum_requests
             or independence is None
             or not independence.valid
-            or not _typed_evidence_valid(plan, experiment, outcome)
+            or (
+                classification
+                in {
+                    ReproductionClassification.reproduced,
+                    ReproductionClassification.not_reproduced,
+                }
+                and not _typed_evidence_valid(plan, experiment, outcome)
+            )
         ):
             classification = ReproductionClassification.blocked
         if outcome.cleanup_status is CleanupStatus.failed:
@@ -684,13 +781,26 @@ class ReproductionOutcomeEvaluator:
             target_id=experiment.target.target_id,
             surface_id=experiment.target.surface_id,
             endpoint_id=experiment.target.endpoint_id,
+            graphql_candidate_kind=plan.graphql_candidate_kind,
+            graphql_surface_id=plan.graphql_surface_id,
+            graphql_operation_id=plan.graphql_operation_id,
+            graphql_operation_template_id=plan.graphql_operation_template_id,
+            graphql_field_ids=plan.graphql_field_ids,
+            graphql_argument_ids=plan.graphql_argument_ids,
+            graphql_selection_fingerprint=plan.graphql_selection_fingerprint,
+            graphql_semantic_fingerprint=plan.graphql_semantic_fingerprint,
             security_property_reference=security_property,
             identity_relationship=(
                 experiment.identity_context.relationship.value
                 if experiment.identity_context.relationship is not None
                 else None
             ),
-            controlled_object_ids=experiment.mutation.controlled_object_ids,
+            controlled_object_ids=(
+                plan.controlled_object_ids
+                if plan.graphql_operation_id is not None
+                and plan.alternate_controlled_object_id is None
+                else experiment.mutation.controlled_object_ids
+            ),
             evidence_references=outcome.evidence_references,
             request_delta=outcome.request_delta,
             independence=independence,
@@ -698,6 +808,15 @@ class ReproductionOutcomeEvaluator:
             runtime_provenance_reference=outcome.provenance_id,
             authorization_reference=outcome.authorization_reference,
             created_at=outcome.occurred_at,
+            trace_events=(
+                (
+                    "GRAPHQL_REPRODUCTION_AUTHORIZE",
+                    "GRAPHQL_REPRODUCTION_EXECUTE",
+                    "GRAPHQL_REPRODUCTION_EVALUATE",
+                )
+                if plan.graphql_operation_id is not None
+                else ()
+            ),
         )
         reject_secret_material(
             result.model_dump(mode="json"), location="reproduction outcome"

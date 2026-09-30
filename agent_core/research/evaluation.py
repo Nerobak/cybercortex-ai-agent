@@ -22,6 +22,7 @@ from agent_core.research.graphql_evaluation import (
     GraphQLDifferentialEvaluator,
     GraphQLEvaluationResult,
 )
+from agent_core.research.graphql import graphql_experiment_semantic_fingerprint
 from agent_core.research.outcomes import (
     ExperimentOutcome,
     ExperimentResultClassification,
@@ -287,6 +288,7 @@ class ExperimentEvaluator:
             experiment,
             hypothesis,
             outcome,
+            prior_state,
             provenance_id=provenance_id,
             graphql_evaluation=graphql_evaluation,
         )
@@ -729,6 +731,7 @@ class ExperimentEvaluator:
         experiment: SecurityExperiment,
         hypothesis: HypothesisRecord,
         outcome: ExperimentOutcome,
+        state: ResearchState,
         *,
         provenance_id: str,
         graphql_evaluation: GraphQLEvaluationResult | None = None,
@@ -741,6 +744,35 @@ class ExperimentEvaluator:
             not in {CleanupStatus.not_required, CleanupStatus.completed}
         ):
             return None
+        graphql_inputs = tuple(
+            item.input
+            for item in experiment.primitive_steps
+            if getattr(item.input, "primitive", None)
+            in {"graphql_operation", "graphql_variable_mutation"}
+        )
+        graphql_kinds = {
+            item.candidate_kind
+            for item in graphql_inputs
+            if getattr(item, "candidate_kind", None) is not None
+        }
+        operation = next(
+            (
+                item
+                for item in state.graphql_operations
+                if getattr(item, "operation_id", None)
+                == (
+                    graphql_evaluation.operation_reference
+                    if graphql_evaluation is not None
+                    else None
+                )
+            ),
+            None,
+        )
+        graphql_semantic_fingerprint = (
+            graphql_experiment_semantic_fingerprint(state, experiment)
+            if graphql_evaluation is not None
+            else None
+        )
         return FindingRecord(
             finding_id=_identifier("finding", outcome.outcome_id),
             status=FindingStatus.candidate,
@@ -764,6 +796,20 @@ class ExperimentEvaluator:
                 if graphql_evaluation is not None
                 else None
             ),
+            graphql_operation_template_id=(
+                experiment.baseline.reference_id
+                if graphql_evaluation is not None
+                else None
+            ),
+            graphql_candidate_kind=(
+                next(iter(graphql_kinds)) if len(graphql_kinds) == 1 else None
+            ),
+            graphql_selection_fingerprint=(
+                getattr(operation, "selection_fingerprint", None)
+                if graphql_evaluation is not None
+                else None
+            ),
+            graphql_semantic_fingerprint=graphql_semantic_fingerprint,
             graphql_field_ids=(
                 graphql_evaluation.field_references
                 if graphql_evaluation is not None

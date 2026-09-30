@@ -50,6 +50,8 @@ from agent_core.research.primitives import (
     AuthenticationDifferentialInput,
     ObjectSubstitutionInput,
     ParameterMutationInput,
+    GraphQLOperationInput,
+    GraphQLVariableMutationInput,
 )
 from agent_core.research.reproduction import (
     ReproductionPlanner,
@@ -427,7 +429,8 @@ class SecurityResearchOrchestrator:
                                 policy_limitations=self.policy_limitations,
                             )
                             decision = self.reasoning_engine.select(
-                                packet, self.routing_policy  # type: ignore[arg-type]
+                                packet,
+                                self.routing_policy,  # type: ignore[arg-type]
                             )
                             if decision.action in {
                                 ResearchSelectionAction.stop,
@@ -467,7 +470,8 @@ class SecurityResearchOrchestrator:
                             state, policy_limitations=self.policy_limitations
                         )
                         decision = self.reasoning_engine.decide(
-                            packet, self.routing_policy  # type: ignore[arg-type]
+                            packet,
+                            self.routing_policy,  # type: ignore[arg-type]
                         )
                     invalid_model_outputs = 0
                     if (
@@ -781,7 +785,7 @@ class SecurityResearchOrchestrator:
         finding = next(
             item for item in state.findings if item.finding_id == pending.finding_id
         )
-        policy = self._confirmation_policy_for_kind(finding, pending.reproduction_kind)
+        policy = self._confirmation_policy_for_plan(finding, pending)
         compiled = self.reproduction_planner.compile(
             pending,
             None,
@@ -865,6 +869,10 @@ class SecurityResearchOrchestrator:
                         registry=self.compiler.registry,
                         confirmation_policy=policy,
                         budget_manager=self.budget_manager,
+                        compiler_context=self.compiler_context,
+                        graph=self.store.query_graph_assertions(
+                            state.research_id, limit=100
+                        ),
                     )
                 except ReproductionPlanningError as exc:
                     state = self._with_diagnostic_codes(
@@ -940,6 +948,17 @@ class SecurityResearchOrchestrator:
         finding: FindingRecord, experiment: SecurityExperiment
     ) -> FindingConfirmationPolicy | None:
         inputs = tuple(item.input for item in experiment.primitive_steps)
+        if any(
+            isinstance(item, (GraphQLOperationInput, GraphQLVariableMutationInput))
+            for item in inputs
+        ):
+            if experiment.state_changing:
+                return FindingConfirmationPolicy.graphql_state_changing(
+                    finding.confirmation_policy_reference
+                )
+            return FindingConfirmationPolicy.graphql_read_only(
+                finding.confirmation_policy_reference
+            )
         if any(isinstance(item, ObjectSubstitutionInput) for item in inputs):
             return SecurityResearchOrchestrator._confirmation_policy_for_kind(
                 finding, ReproductionKind.object_substitution
@@ -968,6 +987,22 @@ class SecurityResearchOrchestrator:
             )
         return FindingConfirmationPolicy.parameter_mutation_read_only(
             finding.confirmation_policy_reference
+        )
+
+    @staticmethod
+    def _confirmation_policy_for_plan(
+        finding: FindingRecord, plan: object
+    ) -> FindingConfirmationPolicy:
+        if getattr(plan, "graphql_operation_id", None) is not None:
+            if bool(getattr(plan, "state_changing", False)):
+                return FindingConfirmationPolicy.graphql_state_changing(
+                    finding.confirmation_policy_reference
+                )
+            return FindingConfirmationPolicy.graphql_read_only(
+                finding.confirmation_policy_reference
+            )
+        return SecurityResearchOrchestrator._confirmation_policy_for_kind(
+            finding, plan.reproduction_kind
         )
 
     def _mark_reproduction_blocked(

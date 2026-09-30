@@ -637,6 +637,8 @@ class ResearchBudgetManager:
         finding_id: str,
         request_delta: RequestDelta,
         wall_time_seconds: float = 0.0,
+        cleanup_status: CleanupStatus | None = None,
+        cleanup_barrier_reference: str | None = None,
     ) -> BudgetState:
         """Record authoritative reproduction traffic without refund semantics."""
 
@@ -655,6 +657,10 @@ class ResearchBudgetManager:
         )
         payload = current.model_dump(mode="python")
         payload["reproduction_usage"] = tuple(usage.values())
+        if cleanup_status is not None:
+            payload["cleanup_status"] = cleanup_status
+        if cleanup_barrier_reference is not None:
+            payload["cleanup_barrier_reference"] = cleanup_barrier_reference
         return self._synchronize(
             BudgetState.model_validate(payload), research.research_id
         )
