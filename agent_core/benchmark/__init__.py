@@ -35,6 +35,17 @@ from agent_core.benchmark.fixtures import (
     SyntheticReproductionResult,
     synthetic_benchmark_fixtures,
 )
+from agent_core.benchmark.graphql_lab import (
+    GRAPHQL_BENCHMARK_ID,
+    GRAPHQL_BENCHMARK_LAB,
+    GRAPHQL_BENCHMARK_VERSION,
+    ControlledGraphQLLab,
+    GraphQLLabSnapshot,
+    graphql_benchmark_execution_factory,
+    graphql_benchmark_manifest,
+    graphql_benchmark_scoring_policy,
+    install_graphql_benchmark_ground_truth,
+)
 from agent_core.benchmark.reporting import BenchmarkReporter
 from agent_core.benchmark.runner import (
     AutonomousResearchBenchmarkRunner,
@@ -87,6 +98,11 @@ __all__ = [
     "ContaminationMatch",
     "FindingMatcher",
     "GroundTruthAccessError",
+    "GRAPHQL_BENCHMARK_ID",
+    "GRAPHQL_BENCHMARK_LAB",
+    "GRAPHQL_BENCHMARK_VERSION",
+    "ControlledGraphQLLab",
+    "GraphQLLabSnapshot",
     "SyntheticBenchmarkFixture",
     "SyntheticReproductionResult",
     "artifact_fingerprint",
@@ -94,6 +110,10 @@ __all__ = [
     "calculate_benchmark_metrics",
     "canonical_artifact_bytes",
     "compare_benchmark_scores",
+    "graphql_benchmark_execution_factory",
+    "graphql_benchmark_manifest",
+    "graphql_benchmark_scoring_policy",
+    "install_graphql_benchmark_ground_truth",
     "load_benchmark_manifest",
     "manifest_fingerprint",
     "observed_finding_from_record",
