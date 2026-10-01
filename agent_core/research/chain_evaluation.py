@@ -20,6 +20,8 @@ from agent_core.research.chains import (
     stable_chain_identifier,
 )
 from agent_core.research.graph import GraphAssertion, GraphRelation
+from agent_core.research.graphql import build_graphql_graph_assertions
+from agent_core.research.graphql_chains import graphql_chain_semantics_current
 from agent_core.research.state import (
     AttackChain,
     ControlledImpact,
@@ -97,6 +99,34 @@ class AttackChainEvaluator:
         chain_step_ids = {str(item.step_id) for item in chain.steps}
         if not set(outcomes).issubset(chain_step_ids):
             raise ValueError("chain outcome references an unavailable step")
+        if chain.semantic_bindings and not graphql_chain_semantics_current(
+            state, chain.semantic_bindings
+        ):
+            if any(item.request_delta.total for item in step_outcomes):
+                raise ValueError("a stale GraphQL chain step must not execute")
+            timestamp = occurred_at or state.updated_at
+            return AttackChainEvaluation(
+                evaluation_id=stable_chain_identifier(
+                    "chain-evaluation",
+                    {
+                        "chain": chain.attack_chain_id,
+                        "revision": state.revision,
+                        "classification": "stale_graphql_semantics",
+                    },
+                ),
+                research_id=state.research_id,
+                chain_id=chain.attack_chain_id,
+                state_revision=state.revision,
+                classification=AttackChainEvaluationClassification.blocked,
+                blocking_reason="stale_graphql_semantics",
+                evidence_references=chain.evidence_references,
+                downstream_steps_skipped=tuple(
+                    str(item.step_id) for item in chain.steps
+                ),
+                provenance_id=chain.provenance_id,
+                summary="Chain blocked because GraphQL semantics changed.",
+                occurred_at=timestamp,
+            )
 
         evaluated: list[str] = []
         supported: list[str] = []
@@ -278,9 +308,23 @@ class AttackChainEvaluator:
             EntityKind.surface: (state.surfaces, "surface_id"),
             EntityKind.endpoint: (state.endpoints, "endpoint_id"),
             EntityKind.parameter: (state.parameters, "parameter_id"),
+            EntityKind.graphql_surface: (
+                state.graphql_surfaces,
+                "graphql_surface_id",
+            ),
+            EntityKind.graphql_type: (state.graphql_types, "type_id"),
+            EntityKind.graphql_field: (state.graphql_fields, "field_id"),
+            EntityKind.graphql_argument: (
+                state.graphql_arguments,
+                "argument_id",
+            ),
             EntityKind.graphql_operation: (
                 state.graphql_operations,
                 "operation_id",
+            ),
+            EntityKind.graphql_variable: (
+                state.graphql_variables,
+                "variable_id",
             ),
             EntityKind.upload: (state.uploads, "upload_id"),
             EntityKind.workflow: (state.workflows, "workflow_id"),
@@ -323,6 +367,24 @@ class AttackChainEvaluator:
             EntityKind.finding: (state.findings, "finding_id"),
             EntityKind.hypothesis: (state.hypotheses, "hypothesis_id"),
             EntityKind.object: (state.objects, "object_id"),
+            EntityKind.graphql_surface: (
+                state.graphql_surfaces,
+                "graphql_surface_id",
+            ),
+            EntityKind.graphql_type: (state.graphql_types, "type_id"),
+            EntityKind.graphql_field: (state.graphql_fields, "field_id"),
+            EntityKind.graphql_argument: (
+                state.graphql_arguments,
+                "argument_id",
+            ),
+            EntityKind.graphql_operation: (
+                state.graphql_operations,
+                "operation_id",
+            ),
+            EntityKind.graphql_variable: (
+                state.graphql_variables,
+                "variable_id",
+            ),
             EntityKind.surface: (state.surfaces, "surface_id"),
             EntityKind.workflow: (state.workflows, "workflow_id"),
             EntityKind.observation: (state.observations, "observation_id"),
@@ -458,6 +520,9 @@ def create_chain_candidate_finding(
         source_chain_id=chain.attack_chain_id,
         component_finding_ids=chain.finding_ids,
         component_hypothesis_ids=chain.hypothesis_ids,
+        chain_graphql_semantic_references=tuple(
+            item.reference for item in chain.semantic_bindings
+        ),
         step_evidence_references=evaluation.evidence_references,
         combined_impact_evidence_references=(evaluation.combined_impact_evidence),
     )
@@ -509,6 +574,10 @@ class ChainReproductionPlanner:
             raise ValueError("only a candidate chain finding may be reproduced")
         if finding.source_chain_id != chain.attack_chain_id:
             raise ValueError("chain reproduction finding binding mismatch")
+        if chain.semantic_bindings and not graphql_chain_semantics_current(
+            state, chain.semantic_bindings
+        ):
+            raise ValueError("stale GraphQL chain semantics require replanning")
         if not experiment_plans:
             raise ValueError("chain reproduction requires executable fresh steps")
         if tuple(item.sequence for item in experiment_plans) != tuple(
@@ -650,6 +719,7 @@ class AttackChainConfirmationEvaluator:
         policy: ChainConfirmationPolicy,
         state: ResearchState,
         *,
+        graph: Sequence[GraphAssertion] = (),
         occurred_at: str | None = None,
     ) -> ChainConfirmationDecision:
         if finding.status not in {
@@ -699,6 +769,10 @@ class AttackChainConfirmationEvaluator:
         all_links_resolved = all(
             item.status is ChainLinkStatus.supported for item in chain.unresolved_links
         )
+        graphql_semantics_current = graphql_chain_semantics_current(
+            state, chain.semantic_bindings
+        )
+        relationships_current = _chain_relationships_current(chain, state, graph)
         state_evidence_ids = {item.evidence_id for item in state.evidence}
         component_evidence = set(finding.evidence_references)
         successful = []
@@ -761,6 +835,12 @@ class AttackChainConfirmationEvaluator:
             reason = "contradictory_chain_evidence"
         elif not valid_components:
             reason = "component_evidence_invalid"
+        elif not graphql_semantics_current:
+            action = ChainConfirmationAction.manual_review
+            reason = "stale_graphql_semantics"
+        elif not relationships_current:
+            action = ChainConfirmationAction.manual_review
+            reason = "stale_chain_relationships"
         elif policy.require_all_links_resolved and not all_links_resolved:
             reason = "unresolved_chain_links"
         elif policy.require_combined_impact and not (
@@ -1022,6 +1102,36 @@ def chain_confirmation_assertion(
 
 def _find(collection: Sequence[object], field: str, value: str) -> object | None:
     return next((item for item in collection if getattr(item, field) == value), None)
+
+
+def _chain_relationships_current(
+    chain: AttackChain,
+    state: ResearchState,
+    graph: Sequence[GraphAssertion],
+) -> bool:
+    if not chain.relationship_ids:
+        return True
+    current = {item.relationship_id: item for item in state.relationships}
+    current.update(
+        {
+            item.assertion_id: item
+            for item in build_graphql_graph_assertions(
+                state, asserted_at=state.updated_at
+            )
+        }
+    )
+    current.update({item.assertion_id: item for item in graph})
+    evidence_ids = {item.evidence_id for item in state.evidence}
+    return all(
+        relationship_id in current
+        and current[relationship_id].status
+        in {RelationshipStatus.observed, RelationshipStatus.confirmed}
+        and current[relationship_id].derivation_type
+        is not DerivationType.model_proposed
+        and bool(current[relationship_id].evidence_references)
+        and set(current[relationship_id].evidence_references).issubset(evidence_ids)
+        for relationship_id in chain.relationship_ids
+    )
 
 
 def _sum_request_deltas(outcomes: Sequence[ChainStepOutcome]):

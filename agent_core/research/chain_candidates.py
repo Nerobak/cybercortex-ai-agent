@@ -18,6 +18,7 @@ from agent_core.research.chains import (
     ChainLinkStatus,
     ChainSelectionAction,
     ChainSelectionDecision,
+    ChainSemanticBinding,
     MAX_CHAIN_CANDIDATES,
     PublicSafeChainCandidateSummary,
     PublicSafeChainPacket,
@@ -28,6 +29,15 @@ from agent_core.research.chains import (
 )
 from agent_core.research.experiments import ExperimentProposal
 from agent_core.research.graph import GraphAssertion, GraphRelation
+from agent_core.research.graphql import (
+    GraphQLExperimentStateChangeClass,
+    build_graphql_graph_assertions,
+)
+from agent_core.research.graphql_chains import (
+    GraphQLChainAdapter,
+    graphql_chain_bindings_for_operation,
+    graphql_chain_semantics_current,
+)
 from agent_core.research.state import (
     AttackChain,
     AttackChainStep,
@@ -73,6 +83,17 @@ CHAIN_RELATIONS = frozenset(
         GraphRelation.same_object_as,
         GraphRelation.references,
         GraphRelation.requires,
+    }
+)
+
+_GRAPHQL_SEMANTIC_KINDS = frozenset(
+    {
+        EntityKind.graphql_surface,
+        EntityKind.graphql_type,
+        EntityKind.graphql_field,
+        EntityKind.graphql_argument,
+        EntityKind.graphql_operation,
+        EntityKind.graphql_variable,
     }
 )
 
@@ -179,15 +200,29 @@ class AttackChainCandidateBuilder:
             or item.capability in self.registered_capabilities
         )
         assertions = self._assertions(state, graph)
-        edges = [
+        all_edges = [
             item
             for item in (*state.relationships, *assertions)
-            if self._eligible_edge(item, state) and item.predicate in CHAIN_RELATIONS
+            if self._eligible_edge(item, state)
+        ]
+        edges = [item for item in all_edges if item.predicate in CHAIN_RELATIONS]
+        generic_edges = [
+            item
+            for item in edges
+            if item.source.entity_kind not in _GRAPHQL_SEMANTIC_KINDS
+            and item.target.entity_kind not in _GRAPHQL_SEMANTIC_KINDS
         ]
         raw: list[AttackChainCandidate] = []
-        raw.extend(self._edge_candidates(state, edges, eligible_experiments))
-        raw.extend(self._path_candidates(state, edges, eligible_experiments))
+        raw.extend(self._edge_candidates(state, generic_edges, eligible_experiments))
+        raw.extend(self._path_candidates(state, generic_edges, eligible_experiments))
         raw.extend(self._structural_object_candidates(state, eligible_experiments))
+        raw.extend(
+            self._graphql_candidates(
+                state,
+                all_edges,
+                eligible_experiments,
+            )
+        )
 
         deduplicated: dict[str, AttackChainCandidate] = {}
         for candidate in sorted(raw, key=lambda item: item.candidate_id):
@@ -278,6 +313,7 @@ class AttackChainCandidateBuilder:
                     category=category,
                     ordered=ordered,
                     relationship_ids=(self._edge_id(edge),),
+                    relationship_predicates=(edge.predicate.value,),
                     hypotheses=hypotheses,
                     unresolved=unresolved,
                     experiments=related_experiments,
@@ -298,9 +334,9 @@ class AttackChainCandidateBuilder:
     ) -> tuple[AttackChainCandidate, ...]:
         """Compose only the first bounded, acyclic evidenced paths."""
 
-        by_source: dict[tuple[EntityKind, str], list[Relationship | GraphAssertion]] = (
-            {}
-        )
+        by_source: dict[
+            tuple[EntityKind, str], list[Relationship | GraphAssertion]
+        ] = {}
         for edge in sorted(edges, key=self._edge_id):
             by_source.setdefault(
                 (edge.source.entity_kind, edge.source.entity_id), []
@@ -380,6 +416,9 @@ class AttackChainCandidateBuilder:
                             ordered=ordered,
                             relationship_ids=tuple(
                                 self._edge_id(item) for item in candidate_path
+                            ),
+                            relationship_predicates=tuple(
+                                item.predicate.value for item in candidate_path
                             ),
                             hypotheses=tuple(
                                 reference.entity_id
@@ -524,6 +563,9 @@ class AttackChainCandidateBuilder:
                         category=self._category(ordered, state),
                         ordered=ordered,
                         relationship_ids=(),
+                        relationship_predicates=(
+                            ResearchPredicate.references_same_object.value,
+                        ),
                         hypotheses=(hypothesis.hypothesis_id,),
                         unresolved=unresolved,
                         experiments=related,
@@ -538,6 +580,64 @@ class AttackChainCandidateBuilder:
                     return tuple(results)
         return tuple(results)
 
+    def _graphql_candidates(
+        self,
+        state: ResearchState,
+        edges: Sequence[Relationship | GraphAssertion],
+        experiments: tuple[ExperimentCandidate, ...],
+    ) -> tuple[AttackChainCandidate, ...]:
+        """Adapt GraphQL semantics into ordinary P4-0G candidates."""
+
+        by_id = {item.candidate_id: item for item in experiments}
+        results: list[AttackChainCandidate] = []
+        for proposal in GraphQLChainAdapter().propose(state, edges, experiments):
+            selected_ids = {
+                candidate_id
+                for link in proposal.unresolved_links
+                for candidate_id in link.experiment_candidate_ids
+            }
+            related = tuple(
+                by_id[item] for item in sorted(selected_ids) if item in by_id
+            )
+            unresolved = tuple(
+                self._unresolved_link(
+                    link.from_reference,
+                    link.to_reference,
+                    tuple(
+                        by_id[item]
+                        for item in link.experiment_candidate_ids
+                        if item in by_id
+                    ),
+                    edge_id=link.edge_reference,
+                    required_evidence=link.required_evidence,
+                    precondition_references=link.precondition_references,
+                )
+                for link in proposal.unresolved_links
+            )
+            if len(unresolved) != len(proposal.unresolved_links):
+                continue
+            results.append(
+                self._candidate(
+                    state,
+                    category=proposal.category,
+                    ordered=proposal.ordered_references,
+                    relationship_ids=proposal.relationship_ids,
+                    relationship_predicates=proposal.relationship_predicates,
+                    hypotheses=proposal.hypothesis_ids,
+                    unresolved=unresolved,
+                    experiments=related,
+                    evidence=proposal.evidence_references,
+                    provenance=proposal.provenance_references,
+                    surfaces=set(proposal.surface_ids),
+                    object_ids=proposal.object_ids,
+                    identity_ids=proposal.identity_ids,
+                    semantic_bindings=proposal.semantic_bindings,
+                )
+            )
+            if len(results) >= self.limits.maximum_chain_candidates * 2:
+                break
+        return tuple(results)
+
     def _candidate(
         self,
         state: ResearchState,
@@ -545,6 +645,7 @@ class AttackChainCandidateBuilder:
         category: str,
         ordered: tuple[EntityReference, ...],
         relationship_ids: tuple[str, ...],
+        relationship_predicates: tuple[str, ...],
         hypotheses: tuple[str, ...],
         unresolved: tuple[UnresolvedChainLink, ...],
         experiments: tuple[ExperimentCandidate, ...],
@@ -553,6 +654,7 @@ class AttackChainCandidateBuilder:
         surfaces: set[str],
         object_ids: tuple[str, ...] = (),
         identity_ids: tuple[str, ...] = (),
+        semantic_bindings: tuple[ChainSemanticBinding, ...] = (),
     ) -> AttackChainCandidate:
         findings = tuple(
             reference.entity_id
@@ -607,6 +709,21 @@ class AttackChainCandidateBuilder:
         targets = self._target_ids(ordered, state)
         if not targets:
             raise ValueError("eligible chain references must resolve to a target")
+        if not semantic_bindings:
+            semantic_bindings = tuple(
+                binding
+                for reference in ordered
+                if reference.entity_kind is EntityKind.graphql_operation
+                for binding in graphql_chain_bindings_for_operation(
+                    state, reference.entity_id
+                )
+            )
+            semantic_bindings = tuple(
+                {
+                    (item.reference.entity_kind, item.reference.entity_id): item
+                    for item in semantic_bindings
+                }.values()
+            )
         payload = {
             "category": category,
             "ordered_links": [
@@ -631,6 +748,24 @@ class AttackChainCandidateBuilder:
                 for item in unresolved
             ],
         }
+        if semantic_bindings:
+            payload.update(
+                relationship_predicates=sorted(set(relationship_predicates)),
+                semantic_bindings=[
+                    {
+                        "kind": item.reference.entity_kind.value,
+                        "id": item.reference.entity_id,
+                        "fingerprint": item.semantic_fingerprint,
+                    }
+                    for item in sorted(
+                        semantic_bindings,
+                        key=lambda item: (
+                            item.reference.entity_kind.value,
+                            item.reference.entity_id,
+                        ),
+                    )
+                ],
+            )
         fingerprint = stable_chain_digest(payload)
         candidate = AttackChainCandidate(
             candidate_id=f"chain-candidate-{fingerprint[7:31]}",
@@ -646,6 +781,8 @@ class AttackChainCandidateBuilder:
             finding_ids=findings,
             fact_ids=facts,
             relationship_ids=relationship_ids,
+            relationship_predicates=relationship_predicates,
+            semantic_bindings=semantic_bindings,
             entry_condition="Existing typed evidence establishes the first chain link.",
             security_property=f"security-property:{category}",
             expected_secure_behavior="A required security boundary stops the ordered chain.",
@@ -677,6 +814,8 @@ class AttackChainCandidateBuilder:
         experiments: tuple[ExperimentCandidate, ...],
         *,
         edge_id: str,
+        required_evidence: tuple[str, ...] = ("predicate:bounded-chain-link",),
+        precondition_references: tuple[str, ...] = (),
     ) -> UnresolvedChainLink:
         capabilities = tuple(sorted({item.primitive_kind for item in experiments}))
         request_estimate = min(
@@ -696,8 +835,9 @@ class AttackChainCandidateBuilder:
             from_reference=source,
             to_reference=target,
             claim="A bounded experiment can determine whether this chain link holds.",
-            required_evidence=("predicate:bounded-chain-link",),
+            required_evidence=required_evidence,
             allowed_experiment_capabilities=capabilities,
+            precondition_references=precondition_references,
             risk=max(
                 (item.risk_class for item in experiments),
                 key=_risk_rank,
@@ -715,6 +855,18 @@ class AttackChainCandidateBuilder:
         surfaces: set[str],
     ) -> tuple[ExperimentCandidate, ...]:
         reference_ids = {source.entity_id, target.entity_id}
+        operation_ids = {
+            reference.entity_id
+            for reference in (source, target)
+            if reference.entity_kind is EntityKind.graphql_operation
+        }
+        for reference in (source, target):
+            if reference.entity_kind is EntityKind.finding:
+                finding = _find(state.findings, "finding_id", reference.entity_id)
+                if finding is not None:
+                    reference_ids.add(finding.source_hypothesis_id)
+                    if finding.graphql_operation_id is not None:
+                        operation_ids.add(finding.graphql_operation_id)
         return tuple(
             item
             for item in experiments
@@ -726,14 +878,25 @@ class AttackChainCandidateBuilder:
                 or item.hypothesis_id in reference_ids
                 or item.controlled_object_id in reference_ids
             )
+            and (not operation_ids or item.operation_id in operation_ids)
         )
 
     @staticmethod
     def _both_security_outcomes(
         source: EntityReference, target: EntityReference, state: ResearchState
     ) -> bool:
-        eligible = {EntityKind.fact, EntityKind.finding}
-        return source.entity_kind in eligible and target.entity_kind in eligible
+        def conclusive(reference: EntityReference) -> bool:
+            if reference.entity_kind is EntityKind.fact:
+                fact = _find(state.facts, "fact_id", reference.entity_id)
+                return bool(
+                    fact and fact.status in {FactStatus.observed, FactStatus.confirmed}
+                )
+            if reference.entity_kind is EntityKind.finding:
+                finding = _find(state.findings, "finding_id", reference.entity_id)
+                return bool(finding and finding.status is FindingStatus.confirmed)
+            return False
+
+        return conclusive(source) and conclusive(target)
 
     @staticmethod
     def _edge_id(edge: Relationship | GraphAssertion) -> str:
@@ -826,7 +989,12 @@ class AttackChainCandidateBuilder:
             EntityKind.surface: "surfaces",
             EntityKind.endpoint: "endpoints",
             EntityKind.parameter: "parameters",
+            EntityKind.graphql_surface: "graphql_surfaces",
+            EntityKind.graphql_type: "graphql_types",
+            EntityKind.graphql_field: "graphql_fields",
+            EntityKind.graphql_argument: "graphql_arguments",
             EntityKind.graphql_operation: "graphql_operations",
+            EntityKind.graphql_variable: "graphql_variables",
             EntityKind.upload: "uploads",
             EntityKind.workflow: "workflows",
             EntityKind.observation: "observations",
@@ -838,7 +1006,12 @@ class AttackChainCandidateBuilder:
             EntityKind.surface: "surface_id",
             EntityKind.endpoint: "endpoint_id",
             EntityKind.parameter: "parameter_id",
+            EntityKind.graphql_surface: "graphql_surface_id",
+            EntityKind.graphql_type: "type_id",
+            EntityKind.graphql_field: "field_id",
+            EntityKind.graphql_argument: "argument_id",
             EntityKind.graphql_operation: "operation_id",
+            EntityKind.graphql_variable: "variable_id",
             EntityKind.upload: "upload_id",
             EntityKind.workflow: "workflow_id",
             EntityKind.observation: "observation_id",
@@ -895,6 +1068,69 @@ class AttackChainCandidateBuilder:
                 self._surface_ids(
                     EntityReference(
                         entity_kind=EntityKind.endpoint, entity_id=item.endpoint_id
+                    ),
+                    state,
+                    visited,
+                )
+                if item
+                else set()
+            )
+        if reference.entity_kind is EntityKind.graphql_surface:
+            item = _find(
+                state.graphql_surfaces,
+                "graphql_surface_id",
+                reference.entity_id,
+            )
+            return {item.surface_id} if item else set()
+        if reference.entity_kind is EntityKind.graphql_type:
+            item = _find(state.graphql_types, "type_id", reference.entity_id)
+            return (
+                self._surface_ids(
+                    EntityReference(
+                        entity_kind=EntityKind.graphql_surface,
+                        entity_id=item.graphql_surface_id,
+                    ),
+                    state,
+                    visited,
+                )
+                if item
+                else set()
+            )
+        if reference.entity_kind is EntityKind.graphql_field:
+            item = _find(state.graphql_fields, "field_id", reference.entity_id)
+            return (
+                self._surface_ids(
+                    EntityReference(
+                        entity_kind=EntityKind.graphql_type,
+                        entity_id=item.type_id,
+                    ),
+                    state,
+                    visited,
+                )
+                if item
+                else set()
+            )
+        if reference.entity_kind is EntityKind.graphql_argument:
+            item = _find(state.graphql_arguments, "argument_id", reference.entity_id)
+            return (
+                self._surface_ids(
+                    EntityReference(
+                        entity_kind=EntityKind.graphql_field,
+                        entity_id=item.field_id,
+                    ),
+                    state,
+                    visited,
+                )
+                if item
+                else set()
+            )
+        if reference.entity_kind is EntityKind.graphql_variable:
+            item = _find(state.graphql_variables, "variable_id", reference.entity_id)
+            return (
+                self._surface_ids(
+                    EntityReference(
+                        entity_kind=EntityKind.graphql_operation,
+                        entity_id=item.operation_id,
                     ),
                     state,
                     visited,
@@ -962,10 +1198,25 @@ class AttackChainCandidateBuilder:
         self, ordered: tuple[EntityReference, ...], state: ResearchState
     ) -> str:
         kinds = {item.entity_kind for item in ordered}
+        graphql = bool(
+            kinds
+            & {
+                EntityKind.graphql_surface,
+                EntityKind.graphql_type,
+                EntityKind.graphql_field,
+                EntityKind.graphql_argument,
+                EntityKind.graphql_operation,
+                EntityKind.graphql_variable,
+            }
+        )
         if EntityKind.token in kinds:
-            return "token-to-authorization"
-        if EntityKind.session in kinds:
-            return "authentication-to-authorization"
+            return "token-to-graphql" if graphql else "token-to-authorization"
+        if EntityKind.session in kinds or EntityKind.identity in kinds:
+            return (
+                "authentication-to-graphql"
+                if graphql
+                else "authentication-to-authorization"
+            )
         surface_ids: list[str] = []
         for reference in ordered:
             for surface_id in sorted(self._surface_ids(reference, state)):
@@ -983,6 +1234,8 @@ class AttackChainCandidateBuilder:
             return (
                 "graphql-to-rest" if first_graphql < first_rest else "rest-to-graphql"
             )
+        if graphql and all(item is SurfaceType.graphql for item in types):
+            return "graphql-to-graphql"
         if SurfaceType.token in types:
             return "token-to-authorization"
         if SurfaceType.authentication in types or SurfaceType.session in types:
@@ -998,12 +1251,18 @@ class AttackChainCandidateBuilder:
         state: ResearchState,
         graph: ResearchGraphRepository | Sequence[GraphAssertion] | None,
     ) -> tuple[GraphAssertion, ...]:
+        collected: dict[str, GraphAssertion] = {
+            item.assertion_id: item
+            for item in build_graphql_graph_assertions(
+                state, asserted_at=state.updated_at
+            )
+        }
         if graph is None:
-            return ()
+            return tuple(collected.values())
         if isinstance(graph, Sequence):
-            return tuple(graph)
+            collected.update({item.assertion_id: item for item in graph})
+            return tuple(collected.values())
         references = _state_entity_ids(state)
-        collected: dict[str, GraphAssertion] = {}
         for reference in references:
             if len(collected) >= 500:
                 break
@@ -1059,6 +1318,10 @@ class PublicSafeChainPacketBuilder:
                     risk=item.risk,
                     expected_information_value=item.expected_information_value,
                     evidence_references=item.evidence_references,
+                    graphql_reference_ids=tuple(
+                        binding.reference.entity_id
+                        for binding in item.semantic_bindings[:8]
+                    ),
                 )
                 for item in candidates
             ),
@@ -1163,6 +1426,8 @@ def materialize_chain_hypothesis(
         confidence=ResearchConfidence.low,
         confirmation_policy_reference=confirmation_policy_reference,
         provenance_references=candidate.provenance_references,
+        relationship_predicates=candidate.relationship_predicates,
+        semantic_bindings=candidate.semantic_bindings,
         semantic_fingerprint=candidate.semantic_fingerprint,
     )
 
@@ -1236,6 +1501,8 @@ def materialize_attack_chain(
         finding_ids=candidate.finding_ids,
         fact_ids=candidate.fact_ids,
         relationship_ids=candidate.relationship_ids,
+        relationship_predicates=candidate.relationship_predicates,
+        semantic_bindings=candidate.semantic_bindings,
         steps=tuple(steps),
         entry_condition=candidate.entry_condition,
         security_property=candidate.security_property,
@@ -1324,6 +1591,10 @@ class ChainExperimentPlanner:
             raise ValueError("chain hypothesis semantic binding changed")
         if state.research_id != hypothesis.research_id:
             raise ValueError("chain plan research binding mismatch")
+        if candidate.semantic_bindings and not graphql_chain_semantics_current(
+            state, candidate.semantic_bindings
+        ):
+            return None
         requested_completed = set(completed_link_ids)
         known_supported = {
             item.link_id
@@ -1417,6 +1688,13 @@ class ChainExperimentPlanner:
             )
             if available.worst_case_requests > remaining_requests:
                 return None
+            if (
+                available.graphql_state_change_class
+                is GraphQLExperimentStateChangeClass.reversible_state_change
+                and budget_state.state_changes_consumed
+                >= budget_state.limits.state_changing_chain_ceiling
+            ):
+                return None
         proposal = materialize_candidate(
             available, state, model_decision_id=model_decision_id
         )
@@ -1477,6 +1755,11 @@ def _state_entity_ids(state: ResearchState) -> tuple[str, ...]:
                 *(item.surface_id for item in state.surfaces),
                 *(item.endpoint_id for item in state.endpoints),
                 *(item.operation_id for item in state.graphql_operations),
+                *(item.graphql_surface_id for item in state.graphql_surfaces),
+                *(item.type_id for item in state.graphql_types),
+                *(item.field_id for item in state.graphql_fields),
+                *(item.argument_id for item in state.graphql_arguments),
+                *(item.variable_id for item in state.graphql_variables),
                 *(item.workflow_id for item in state.workflows),
                 *(item.upload_id for item in state.uploads),
             ]

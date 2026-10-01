@@ -21,6 +21,7 @@ from agent_core.result_normalizer import public_result
 from agent_core.research.types import (
     AttackChainId,
     CleanupStatus,
+    EntityKind,
     EntityReference,
     EvidenceArtifactId,
     FindingId,
@@ -101,6 +102,31 @@ class ChainConfirmationAction(str, Enum):
     manual_review = "manual_review"
 
 
+class ChainSemanticBinding(ResearchContract):
+    """A public-safe snapshot binding for semantics used by a chain.
+
+    The digest covers typed semantic records only.  It is used to fail closed
+    when a GraphQL operation, field, argument, type, or surface changes after
+    chain construction.
+    """
+
+    reference: EntityReference
+    semantic_fingerprint: Sha256Digest
+
+    @model_validator(mode="after")
+    def require_graphql_reference(self) -> "ChainSemanticBinding":
+        if self.reference.entity_kind not in {
+            EntityKind.graphql_surface,
+            EntityKind.graphql_type,
+            EntityKind.graphql_field,
+            EntityKind.graphql_argument,
+            EntityKind.graphql_operation,
+            EntityKind.graphql_variable,
+        }:
+            raise ValueError("chain semantic binding must reference GraphQL semantics")
+        return self
+
+
 class UnresolvedChainLink(ResearchContract):
     """One explicit gap. It may be tested, but must never be assumed true."""
 
@@ -111,6 +137,9 @@ class UnresolvedChainLink(ResearchContract):
     required_evidence: tuple[OpaqueIdentifier, ...] = Field(min_length=1, max_length=20)
     allowed_experiment_capabilities: tuple[OpaqueIdentifier, ...] = Field(
         min_length=1, max_length=20
+    )
+    precondition_references: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=20
     )
     risk: RiskLevel
     request_estimate: StrictInt = Field(ge=0, le=10_000)
@@ -131,6 +160,11 @@ class UnresolvedChainLink(ResearchContract):
             self,
             "allowed_experiment_capabilities",
             tuple(sorted(set(self.allowed_experiment_capabilities))),
+        )
+        object.__setattr__(
+            self,
+            "precondition_references",
+            tuple(sorted(set(self.precondition_references))),
         )
         object.__setattr__(
             self,
@@ -163,6 +197,12 @@ class AttackChainCandidate(ResearchContract):
     finding_ids: tuple[FindingId, ...] = Field(default=(), max_length=20)
     fact_ids: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=100)
     relationship_ids: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=100)
+    relationship_predicates: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=100
+    )
+    semantic_bindings: tuple[ChainSemanticBinding, ...] = Field(
+        default=(), max_length=100
+    )
     entry_condition: PublicText
     security_property: PublicText
     expected_secure_behavior: PublicText
@@ -200,6 +240,7 @@ class AttackChainCandidate(ResearchContract):
             "finding_ids",
             "fact_ids",
             "relationship_ids",
+            "relationship_predicates",
             "available_experiment_candidates",
             "evidence_references",
             "provenance_references",
@@ -208,6 +249,25 @@ class AttackChainCandidate(ResearchContract):
             if len(values) != len(set(values)):
                 raise ValueError(f"{field_name} must be unique")
             object.__setattr__(self, field_name, tuple(sorted(values)))
+        semantic_markers = tuple(
+            (item.reference.entity_kind, item.reference.entity_id)
+            for item in self.semantic_bindings
+        )
+        if len(semantic_markers) != len(set(semantic_markers)):
+            raise ValueError("chain semantic bindings must be unique")
+        object.__setattr__(
+            self,
+            "semantic_bindings",
+            tuple(
+                sorted(
+                    self.semantic_bindings,
+                    key=lambda item: (
+                        item.reference.entity_kind.value,
+                        item.reference.entity_id,
+                    ),
+                )
+            ),
+        )
         links = tuple(item.link_id for item in self.required_unresolved_links)
         if len(links) != len(set(links)):
             raise ValueError("candidate unresolved-link IDs must be unique")
@@ -250,6 +310,9 @@ class PublicSafeChainCandidateSummary(ResearchContract):
     expected_information_value: StrictFloat = Field(ge=0.0, le=1.0)
     evidence_references: tuple[EvidenceArtifactId, ...] = Field(
         min_length=1, max_length=300
+    )
+    graphql_reference_ids: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=8
     )
 
 
@@ -352,6 +415,12 @@ class AttackChainHypothesis(ResearchContract):
     provenance_references: tuple[ProvenanceRecordId, ...] = Field(
         min_length=1, max_length=100
     )
+    relationship_predicates: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=100
+    )
+    semantic_bindings: tuple[ChainSemanticBinding, ...] = Field(
+        default=(), max_length=100
+    )
     semantic_fingerprint: Sha256Digest
 
     @model_validator(mode="after")
@@ -374,10 +443,33 @@ class AttackChainHypothesis(ResearchContract):
             for item in self.unresolved_links
         ):
             raise ValueError("chain hypothesis links must bind adjacent references")
-        for field_name in ("evidence_references", "provenance_references"):
+        for field_name in (
+            "evidence_references",
+            "provenance_references",
+            "relationship_predicates",
+        ):
             object.__setattr__(
                 self, field_name, tuple(sorted(set(getattr(self, field_name))))
             )
+        semantic_markers = tuple(
+            (item.reference.entity_kind, item.reference.entity_id)
+            for item in self.semantic_bindings
+        )
+        if len(semantic_markers) != len(set(semantic_markers)):
+            raise ValueError("chain hypothesis semantic bindings must be unique")
+        object.__setattr__(
+            self,
+            "semantic_bindings",
+            tuple(
+                sorted(
+                    self.semantic_bindings,
+                    key=lambda item: (
+                        item.reference.entity_kind.value,
+                        item.reference.entity_id,
+                    ),
+                )
+            ),
+        )
         _enforce_public_boundary(self, "attack-chain hypothesis")
         return self
 
@@ -712,33 +804,44 @@ def stable_chain_identifier(prefix: str, value: object) -> str:
 def chain_candidate_fingerprint(candidate: AttackChainCandidate) -> Sha256Digest:
     """Deduplicate semantic links independently of IDs, time, and wording."""
 
-    return stable_chain_digest(
-        {
-            "category": candidate.category,
-            "ordered_links": [
-                (item.entity_kind.value, item.entity_id)
-                for item in candidate.ordered_references
-            ],
-            "security_property": candidate.security_property,
-            "surfaces": sorted(candidate.surface_ids),
-            "identities": sorted(candidate.identity_ids),
-            "objects": sorted(candidate.object_ids),
-            "unresolved": [
+    payload = {
+        "category": candidate.category,
+        "ordered_links": [
+            (item.entity_kind.value, item.entity_id)
+            for item in candidate.ordered_references
+        ],
+        "security_property": candidate.security_property,
+        "surfaces": sorted(candidate.surface_ids),
+        "identities": sorted(candidate.identity_ids),
+        "objects": sorted(candidate.object_ids),
+        "unresolved": [
+            {
+                "from": (
+                    item.from_reference.entity_kind.value,
+                    item.from_reference.entity_id,
+                ),
+                "to": (
+                    item.to_reference.entity_kind.value,
+                    item.to_reference.entity_id,
+                ),
+                "capabilities": sorted(item.allowed_experiment_capabilities),
+            }
+            for item in candidate.required_unresolved_links
+        ],
+    }
+    if candidate.semantic_bindings:
+        payload.update(
+            relationship_predicates=sorted(candidate.relationship_predicates),
+            semantic_bindings=[
                 {
-                    "from": (
-                        item.from_reference.entity_kind.value,
-                        item.from_reference.entity_id,
-                    ),
-                    "to": (
-                        item.to_reference.entity_kind.value,
-                        item.to_reference.entity_id,
-                    ),
-                    "capabilities": sorted(item.allowed_experiment_capabilities),
+                    "kind": item.reference.entity_kind.value,
+                    "id": item.reference.entity_id,
+                    "fingerprint": item.semantic_fingerprint,
                 }
-                for item in candidate.required_unresolved_links
+                for item in candidate.semantic_bindings
             ],
-        }
-    )
+        )
+    return stable_chain_digest(payload)
 
 
 def _enforce_public_boundary(record: ResearchContract, location: str) -> None:

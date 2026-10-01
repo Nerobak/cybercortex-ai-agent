@@ -50,6 +50,7 @@ from agent_core.research.chains import (
     ChainReproductionOutcome,
     ChainReproductionPlan,
     ChainStepOutcome,
+    ChainSemanticBinding,
     MAX_CHAIN_DEPTH,
     UnresolvedChainLink,
     enforce_chain_public_boundary,
@@ -1156,6 +1157,9 @@ class FindingRecord(ResearchContract):
     chain_reproduction_ids: tuple[OpaqueIdentifier, ...] = Field(
         default=(), max_length=20
     )
+    chain_graphql_semantic_references: tuple[EntityReference, ...] = Field(
+        default=(), max_length=100
+    )
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> "FindingRecord":
@@ -1197,6 +1201,32 @@ class FindingRecord(ResearchContract):
                 field_name,
                 _canonical_references(getattr(self, field_name), field_name),
             )
+        graphql_markers = tuple(
+            sorted(
+                self.chain_graphql_semantic_references,
+                key=lambda item: (item.entity_kind.value, item.entity_id),
+            )
+        )
+        if len(graphql_markers) != len(
+            {(item.entity_kind, item.entity_id) for item in graphql_markers}
+        ):
+            raise ValueError("chain GraphQL semantic references must be unique")
+        if any(
+            item.entity_kind
+            not in {
+                EntityKind.graphql_surface,
+                EntityKind.graphql_type,
+                EntityKind.graphql_field,
+                EntityKind.graphql_argument,
+                EntityKind.graphql_operation,
+                EntityKind.graphql_variable,
+            }
+            for item in graphql_markers
+        ):
+            raise ValueError("chain GraphQL references must be semantic entities")
+        if graphql_markers and self.source_chain_id is None:
+            raise ValueError("GraphQL chain references require a source chain")
+        object.__setattr__(self, "chain_graphql_semantic_references", graphql_markers)
         if self.status is FindingStatus.reproducing and not self.reproduction_ids:
             raise ValueError("a reproducing finding requires a reproduction plan")
         graphql_markers = (
@@ -1301,10 +1331,15 @@ class AttackChainStep(ResearchContract):
             EntityKind.session,
             EntityKind.token,
             EntityKind.object,
+            EntityKind.graphql_surface,
+            EntityKind.graphql_type,
+            EntityKind.graphql_field,
+            EntityKind.graphql_argument,
             EntityKind.surface,
             EntityKind.endpoint,
             EntityKind.parameter,
             EntityKind.graphql_operation,
+            EntityKind.graphql_variable,
             EntityKind.upload,
             EntityKind.workflow,
         }
@@ -1328,11 +1363,16 @@ class AttackChainStep(ResearchContract):
                 EntityKind.session: AttackChainStepKind.identity_transition,
                 EntityKind.token: AttackChainStepKind.identity_transition,
                 EntityKind.object: AttackChainStepKind.object_transition,
+                EntityKind.graphql_surface: AttackChainStepKind.surface_transition,
+                EntityKind.graphql_type: AttackChainStepKind.surface_transition,
+                EntityKind.graphql_field: AttackChainStepKind.surface_transition,
+                EntityKind.graphql_argument: AttackChainStepKind.surface_transition,
                 EntityKind.upload: AttackChainStepKind.object_transition,
                 EntityKind.surface: AttackChainStepKind.surface_transition,
                 EntityKind.endpoint: AttackChainStepKind.surface_transition,
                 EntityKind.parameter: AttackChainStepKind.surface_transition,
                 EntityKind.graphql_operation: AttackChainStepKind.surface_transition,
+                EntityKind.graphql_variable: AttackChainStepKind.surface_transition,
                 EntityKind.workflow: AttackChainStepKind.workflow_transition,
             }.get(source.entity_kind, AttackChainStepKind.relationship)
         step_id = self.step_id or (
@@ -1385,6 +1425,12 @@ class AttackChain(ResearchContract):
     finding_ids: tuple[FindingId, ...] = Field(default=(), max_length=20)
     fact_ids: tuple[FactId, ...] = Field(default=(), max_length=100)
     relationship_ids: tuple[RelationshipId, ...] = Field(default=(), max_length=100)
+    relationship_predicates: tuple[OpaqueIdentifier, ...] = Field(
+        default=(), max_length=100
+    )
+    semantic_bindings: tuple[ChainSemanticBinding, ...] = Field(
+        default=(), max_length=100
+    )
     steps: tuple[AttackChainStep, ...] = Field(min_length=2, max_length=MAX_CHAIN_DEPTH)
     entry_condition: PublicText = "Existing evidence establishes the first chain step."
     security_property: PublicText = "A bounded security boundary may be crossed."
@@ -1428,6 +1474,7 @@ class AttackChain(ResearchContract):
             "finding_ids",
             "fact_ids",
             "relationship_ids",
+            "relationship_predicates",
             "evidence_references",
             "combined_impact_evidence",
             "reproduction_ids",
@@ -1437,6 +1484,25 @@ class AttackChain(ResearchContract):
                 field_name,
                 _canonical_references(getattr(self, field_name), field_name),
             )
+        semantic_markers = tuple(
+            (item.reference.entity_kind, item.reference.entity_id)
+            for item in self.semantic_bindings
+        )
+        if len(semantic_markers) != len(set(semantic_markers)):
+            raise ValueError("attack-chain semantic bindings must be unique")
+        object.__setattr__(
+            self,
+            "semantic_bindings",
+            tuple(
+                sorted(
+                    self.semantic_bindings,
+                    key=lambda item: (
+                        item.reference.entity_kind.value,
+                        item.reference.entity_id,
+                    ),
+                )
+            ),
+        )
         link_ids = tuple(item.link_id for item in self.unresolved_links)
         _unique(link_ids, "attack-chain unresolved-link IDs")
         object.__setattr__(
@@ -1478,36 +1544,47 @@ class AttackChain(ResearchContract):
             and (_as_datetime(self.updated_at) < _as_datetime(self.created_at))
         ):
             raise ValueError("chain update cannot precede creation")
-        fingerprint = stable_chain_digest(
-            {
-                "category": self.category,
-                "ordered_links": [
-                    (
-                        step.source_reference.entity_kind.value,
-                        step.source_reference.entity_id,
-                    )
-                    for step in self.steps
-                ],
-                "security_property": self.security_property,
-                "surfaces": sorted(self.surface_ids),
-                "identities": sorted(self.identity_ids),
-                "objects": sorted(self.object_ids),
-                "unresolved": [
+        fingerprint_payload = {
+            "category": self.category,
+            "ordered_links": [
+                (
+                    step.source_reference.entity_kind.value,
+                    step.source_reference.entity_id,
+                )
+                for step in self.steps
+            ],
+            "security_property": self.security_property,
+            "surfaces": sorted(self.surface_ids),
+            "identities": sorted(self.identity_ids),
+            "objects": sorted(self.object_ids),
+            "unresolved": [
+                {
+                    "from": (
+                        item.from_reference.entity_kind.value,
+                        item.from_reference.entity_id,
+                    ),
+                    "to": (
+                        item.to_reference.entity_kind.value,
+                        item.to_reference.entity_id,
+                    ),
+                    "capabilities": sorted(item.allowed_experiment_capabilities),
+                }
+                for item in self.unresolved_links
+            ],
+        }
+        if self.semantic_bindings:
+            fingerprint_payload.update(
+                relationship_predicates=sorted(self.relationship_predicates),
+                semantic_bindings=[
                     {
-                        "from": (
-                            item.from_reference.entity_kind.value,
-                            item.from_reference.entity_id,
-                        ),
-                        "to": (
-                            item.to_reference.entity_kind.value,
-                            item.to_reference.entity_id,
-                        ),
-                        "capabilities": sorted(item.allowed_experiment_capabilities),
+                        "kind": item.reference.entity_kind.value,
+                        "id": item.reference.entity_id,
+                        "fingerprint": item.semantic_fingerprint,
                     }
-                    for item in self.unresolved_links
+                    for item in self.semantic_bindings
                 ],
-            }
-        )
+            )
+        fingerprint = stable_chain_digest(fingerprint_payload)
         if (
             self.semantic_fingerprint is not None
             and self.semantic_fingerprint != fingerprint
@@ -2673,6 +2750,8 @@ class ResearchState(ResearchContract):
                 chain_reproduction_ids,
                 "chain finding reproductions",
             )
+            for reference in item.chain_graphql_semantic_references:
+                _validate_entity_reference(reference, self)
         for item in self.chain_candidates:
             if item.research_id != self.research_id:
                 raise ValueError("chain candidate research reference mismatch")
@@ -2709,6 +2788,8 @@ class ResearchState(ResearchContract):
             )
             for reference in item.ordered_references:
                 _validate_entity_reference(reference, self)
+            for binding in item.semantic_bindings:
+                _validate_entity_reference(binding.reference, self)
             for link in item.required_unresolved_links:
                 _validate_entity_reference(link.from_reference, self)
                 _validate_entity_reference(link.to_reference, self)
@@ -2735,6 +2816,8 @@ class ResearchState(ResearchContract):
             )
             for reference in item.ordered_references:
                 _validate_entity_reference(reference, self)
+            for binding in item.semantic_bindings:
+                _validate_entity_reference(binding.reference, self)
             for link in item.unresolved_links:
                 _validate_entity_reference(link.from_reference, self)
                 _validate_entity_reference(link.to_reference, self)
@@ -2781,6 +2864,8 @@ class ResearchState(ResearchContract):
                 _require_references(
                     step.consumed_fact_ids, fact_ids, "attack-chain consumed facts"
                 )
+            for binding in item.semantic_bindings:
+                _validate_entity_reference(binding.reference, self)
             for link in item.unresolved_links:
                 _validate_entity_reference(link.from_reference, self)
                 _validate_entity_reference(link.to_reference, self)
