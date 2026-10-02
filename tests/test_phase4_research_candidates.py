@@ -503,6 +503,100 @@ def test_orchestrator_authorizes_only_the_model_selected_candidate(tmp_path):
     )
 
 
+def test_orchestrator_deterministically_materializes_single_candidate_without_model(
+    tmp_path,
+):
+    state = synthetic_state(endpoint_count=1, hypotheses=("bola",))
+    store = ResearchStore(tmp_path / "singleton-candidate.sqlite3")
+    store.create_research(state)
+    router = FakeSelectionRouter()
+    budgets = ResearchBudgetManager(
+        model_ledger=router.ledger,
+        model_call_ceiling=4,
+    )
+    _state, _budgets, compiler, context, builder = candidate_system(
+        state, budgets=budgets
+    )
+    assert len(builder.build(state, compiler_context=context)) == 1
+
+    class RecordingGate(FakeGate):
+        def __init__(self):
+            super().__init__()
+            self.authorized = []
+
+        def authorize(self, experiment):
+            self.authorized.append(experiment)
+            return super().authorize(experiment)
+
+    gate = RecordingGate()
+    runtime = FakeResearchRuntime((ExperimentResultClassification.inconclusive,))
+    selector = ExperimentSelector(compiler, budgets)
+    runner = SecurityResearchOrchestrator(
+        store=store,
+        compiler=compiler,
+        compiler_context=context,
+        gate=gate,
+        runtime=runtime,
+        selector=selector,
+        evaluator=ExperimentEvaluator(),
+        pivot_planner=PivotPlanner(selector),
+        budget_manager=budgets,
+        reasoning_engine=ResearchReasoningEngine(router, max_output_tokens=4096),
+        routing_policy=routing_policy(),
+        packet_builder=PublicSafeResearchPacketBuilder(compiler.registry, budgets),
+        candidate_builder=builder,
+        candidate_packet_builder=PublicSafeCandidatePacketBuilder(budgets),
+    )
+
+    result = runner.run(state.research_id, max_iterations=1)
+
+    assert router.requests == []
+    assert len(gate.authorized) == 1
+    assert gate.authorized[0].provenance.source_model_decision_id is None
+    assert len(result.state.experiment_history) == 1
+    assert "singleton_deterministic_selection" in result.state.diagnostic_codes
+    assert result.state.budgets[0].model_budget.usage.attempted_calls == 0
+
+
+def test_orchestrator_with_zero_candidates_stops_without_model_call(tmp_path):
+    state = synthetic_state(endpoint_count=1, hypotheses=("unsupported-category",))
+    store = ResearchStore(tmp_path / "zero-candidates.sqlite3")
+    store.create_research(state)
+    router = FakeSelectionRouter()
+    budgets = ResearchBudgetManager(
+        model_ledger=router.ledger,
+        model_call_ceiling=4,
+    )
+    _state, _budgets, compiler, context, builder = candidate_system(
+        state, budgets=budgets
+    )
+    assert builder.build(state, compiler_context=context) == ()
+    selector = ExperimentSelector(compiler, budgets)
+    runner = SecurityResearchOrchestrator(
+        store=store,
+        compiler=compiler,
+        compiler_context=context,
+        gate=FakeGate(),
+        runtime=FakeResearchRuntime(()),
+        selector=selector,
+        evaluator=ExperimentEvaluator(),
+        pivot_planner=PivotPlanner(selector),
+        budget_manager=budgets,
+        reasoning_engine=ResearchReasoningEngine(router, max_output_tokens=4096),
+        routing_policy=routing_policy(),
+        packet_builder=PublicSafeResearchPacketBuilder(compiler.registry, budgets),
+        candidate_builder=builder,
+        candidate_packet_builder=PublicSafeCandidatePacketBuilder(budgets),
+    )
+
+    result = runner.run(state.research_id)
+
+    assert router.requests == []
+    assert result.stop_reason.value == "no_eligible_experiments"
+    assert result.state.experiment_history == ()
+    assert result.state.budgets[0].model_budget.usage.attempted_calls == 0
+
+
 def test_model_failure_never_falls_back_to_first_candidate(tmp_path):
     state, budgets, compiler, context, builder, _candidates = build_candidates()
     store = ResearchStore(tmp_path / "candidate-failure.sqlite3")
@@ -544,7 +638,7 @@ def test_model_failure_never_falls_back_to_first_candidate(tmp_path):
     assert "model_invalid_structured_response" in result.state.diagnostic_codes
 
 
-def test_authorization_failure_persists_successful_strategy_call_across_restart(
+def test_authorization_failure_persists_singleton_selection_without_model_call(
     tmp_path,
 ):
     state = synthetic_state(endpoint_count=1, hypotheses=("bola",))
@@ -587,20 +681,20 @@ def test_authorization_failure_persists_successful_strategy_call_across_restart(
 
     result = runner.run(state.research_id)
 
-    assert len(router.requests) == 1
+    assert len(router.requests) == 0
     assert runtime.calls == []
     assert result.state.status is not ResearchRunStatus.executing_experiment
     assert result.state.experiment_history[0].result_classification == (
         ResearchAuthorizationErrorCode.authorization_blocked.value
     )
-    assert result.state.budgets[0].model_budget.usage.attempted_calls == 1
-    assert result.state.budgets[0].model_budget.usage.successful_calls == 1
+    assert result.state.budgets[0].model_budget.usage.attempted_calls == 0
+    assert result.state.budgets[0].model_budget.usage.successful_calls == 0
 
     store.close()
     restarted = ResearchStore(database).load_research(state.research_id)
     assert restarted.status is not ResearchRunStatus.executing_experiment
-    assert restarted.budgets[0].model_budget.usage.attempted_calls == 1
-    assert restarted.budgets[0].model_budget.usage.successful_calls == 1
+    assert restarted.budgets[0].model_budget.usage.attempted_calls == 0
+    assert restarted.budgets[0].model_budget.usage.successful_calls == 0
 
 
 def test_bootstrap_sufficiency_skips_expansion_then_strategy_calls_once(tmp_path):

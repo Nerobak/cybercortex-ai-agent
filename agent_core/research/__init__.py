@@ -217,6 +217,12 @@ from agent_core.research.graphql_candidates import (
     materialize_graphql_candidate,
     materialize_selected_graphql_candidate,
 )
+from agent_core.research.graphql_readiness import (
+    GRAPHQL_READINESS_VERSION,
+    ControlledObjectDescriptor,
+    candidate_ready_graphql_operation_templates,
+    derive_candidate_ready_graphql_operations,
+)
 from agent_core.research.graphql_execution import (
     GRAPHQL_EXECUTION_VERSION,
     MAX_GRAPHQL_EXECUTION_ERRORS,
@@ -989,7 +995,9 @@ __all__ = [
     "GraphQLCandidateKind",
     "GraphQLCandidateLimits",
     "GraphQLCandidatePolicy",
+    "ControlledObjectDescriptor",
     "GraphQLExperimentCandidateBuilder",
+    "GRAPHQL_READINESS_VERSION",
     "GraphQLExperimentStateChangeClass",
     "GraphQLHypothesisGenerationResult",
     "GraphQLHypothesisGenerator",
@@ -1003,6 +1011,8 @@ __all__ = [
     "GraphQLOperationRecord",
     "GraphQLNormalizedOperationStructure",
     "GraphQLOperationType",
+    "candidate_ready_graphql_operation_templates",
+    "derive_candidate_ready_graphql_operations",
     "GraphQLAcquisitionResult",
     "GraphQLAuthenticatedDiscovery",
     "GraphQLAuthenticatedDiscoveryResult",

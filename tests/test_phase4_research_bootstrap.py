@@ -16,6 +16,7 @@ from agent_core.controlled_context import (
     ControlledAccount,
     ControlledContext,
     ControlledObject,
+    OwnedObjectAcquisition,
 )
 from agent_core.credential_vault import CredentialVault
 from agent_core.models import (
@@ -570,6 +571,118 @@ def test_blind_bootstrap_uses_one_registered_probe_for_a_path_only_candidate(
     assert request_budget.total == 2
     assert len(state.graphql_surfaces) == 1
     assert not state.findings
+
+
+def test_bootstrap_phase_reservation_preserves_controlled_acquisition_capacity(
+    tmp_path,
+):
+    store = ResearchStore(tmp_path / "bootstrap-reservation.sqlite3")
+    request_budget = RequestBudget(32, per_host_limit=32)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    selected_policy = policy(allow_graphql=True).model_copy(
+        update={"request_budget": 32, "per_host_request_budget": 32}
+    )
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-bootstrap-reservation",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-bootstrap-reservation",
+        policy=selected_policy,
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+    vault = CredentialVault()
+    context = controlled(vault)
+    context.object_acquisition.extend(
+        OwnedObjectAcquisition(
+            owner_account_id=account.account_id,
+            collection_url=f"{TARGET}/controlled-owned-resources",
+            object_type="Resource",
+            identifier_field="resourceRef",
+            items_field="items",
+            max_items=1,
+        )
+        for account in context.accounts
+    )
+
+    class PressureRunner(FakeDiscoveryRunner):
+        def __init__(self):
+            super().__init__(
+                request_budget,
+                surface=discovery_surface(empty=True),
+                capture=graphql_capture_bundle(vault, identity_id="account-a"),
+            )
+            self.ordinary_requests = 0
+
+        def run(self, target, **kwargs):
+            del target, kwargs
+            self.calls += 1
+            while self.budget.remaining:
+                self.budget.consume("discovery", host="blind.example")
+                self.ordinary_requests += 1
+            return {
+                "canonical_attack_surface": self.surface.model_dump(mode="json"),
+                "capture_bundle": self.capture.model_dump(mode="json"),
+            }
+
+    acquired_requests = []
+
+    def acquire_object(request):
+        acquired_requests.append(
+            (request["purpose"], "Authorization" in request.get("headers", {}))
+        )
+        return {
+            "status_code": 200,
+            "body": {
+                "items": [{"resourceRef": f"synthetic-owned-{len(acquired_requests)}"}]
+            },
+        }
+
+    runner = PressureRunner()
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=selected_policy,
+        controlled_context=context,
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        profile="authenticated",
+        tool_runner=runner,
+        vault=vault,
+        object_acquisition_sender=acquire_object,
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=18,
+            maximum_graphql_discovery_requests=8,
+            minimum_post_bootstrap_request_reserve=4,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+    try:
+        state = bootstrapper.prepare(initial)
+
+        progress = state.bootstrap_progress[0]
+        assert runner.ordinary_requests == 11
+        assert len(acquired_requests) == 2
+        assert len(state.objects) == 2
+        assert len(state.graphql_surfaces) == 1
+        assert len(state.graphql_operations) == 1
+        assert progress.request_delta.total == request_budget.total == 13
+        assert request_budget.remaining == 19
+        assert request_budget.limit == 32
+        assert request_budget.snapshot()["verification_requests"] == 0
+        assert request_budget.snapshot()["cleanup_requests"] == 0
+        assert any(
+            "preserve controlled candidate-readiness" in item
+            for item in progress.limitations
+        )
+    finally:
+        vault.close()
 
 
 def test_bootstrap_authenticated_graphql_discovery_persists_only_differential_shape(

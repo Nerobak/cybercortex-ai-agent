@@ -18,6 +18,7 @@ from agent_core.research.authorization import (
 )
 from agent_core.research.budgets import ResearchBudgetManager
 from agent_core.research.candidates import (
+    ExperimentCandidate,
     ExperimentCandidateBuilder,
     PublicSafeCandidatePacketBuilder,
     materialize_candidate,
@@ -394,6 +395,7 @@ class SecurityResearchOrchestrator:
 
             decision = None
             model_proposals: tuple[ExperimentProposal, ...] = ()
+            experiment_candidates: tuple[ExperimentCandidate, ...] = ()
             model_failure_code: str | None = None
             lightweight_selection = bool(
                 self.candidate_builder is not None
@@ -401,7 +403,7 @@ class SecurityResearchOrchestrator:
                 and not static_proposals
                 and self.proposal_source is None
             )
-            if self.reasoning_engine is not None:
+            if self.reasoning_engine is not None or lightweight_selection:
                 try:
                     if lightweight_selection:
                         experiment_candidates = self.candidate_builder.build(  # type: ignore[union-attr]
@@ -413,16 +415,22 @@ class SecurityResearchOrchestrator:
                             policy_reference=self.compiler_context.policy_reference,
                             policy_fingerprint=self._policy_fingerprint(),
                         )
-                        if (
-                            not experiment_candidates
-                            and not exceptional_expansion_attempted
+                        if len(experiment_candidates) == 1:
+                            # Candidate builders return only deterministically screened,
+                            # compile-valid candidates.  Choosing the sole member adds no
+                            # strategic information, so keep the ordinary freshness,
+                            # compiler, selector, policy, and authorization path while
+                            # avoiding an unnecessary model call.
+                            model_proposals = (
+                                materialize_candidate(experiment_candidates[0], state),
+                            )
+                            state = self._with_diagnostic_codes(
+                                state, "singleton_deterministic_selection"
+                            )
+                        elif (
+                            len(experiment_candidates) > 1
+                            and self.reasoning_engine is not None
                         ):
-                            exceptional_expansion_attempted = True
-                            expanded = self._expand_hypotheses_exceptionally(state)
-                            if len(expanded.hypotheses) > len(state.hypotheses):
-                                continue
-                            state = expanded
-                        if experiment_candidates:
                             packet = self.candidate_packet_builder.build(  # type: ignore[union-attr]
                                 state,
                                 experiment_candidates,
@@ -591,6 +599,15 @@ class SecurityResearchOrchestrator:
                     diagnostic_codes.append("selector_rejection")
                 if not state.objects:
                     diagnostic_codes.append("missing_controlled_object")
+                if state.graphql_surfaces:
+                    if not state.graphql_operations:
+                        diagnostic_codes.append("no_graphql_operation")
+                    elif not any(
+                        item.primitive_kind
+                        in {"graphql_operation", "graphql_variable_mutation"}
+                        for item in experiment_candidates
+                    ):
+                        diagnostic_codes.append("no_eligible_graphql_candidate")
                 if any(
                     item.identity_requirement.required
                     and not item.identity_requirement.mechanisms

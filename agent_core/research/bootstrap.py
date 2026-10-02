@@ -68,6 +68,11 @@ from agent_core.research.graphql_hypotheses import (
     GraphQLHypothesisGenerator,
     GraphQLHypothesisLimits,
 )
+from agent_core.research.graphql_readiness import (
+    ControlledObjectDescriptor,
+    candidate_ready_graphql_operation_templates,
+    derive_candidate_ready_graphql_operations,
+)
 from agent_core.research.graph import GraphAssertion, ResearchGraphRepository
 from agent_core.research.reasoning import (
     PublicSafeResearchPacketBuilder,
@@ -107,6 +112,7 @@ class BootstrapStopReason(str, Enum):
 class ResearchBootstrapLimits(ResearchContract):
     maximum_discovery_target_requests: StrictInt = Field(default=30, ge=1, le=5_000)
     maximum_graphql_discovery_requests: StrictInt = Field(default=3, ge=0, le=20)
+    minimum_post_bootstrap_request_reserve: StrictInt = Field(default=4, ge=1, le=1_000)
     maximum_discovered_endpoints: StrictInt = Field(default=500, ge=1, le=5_000)
     maximum_parameters_imported: StrictInt = Field(default=1_000, ge=1, le=10_000)
     maximum_request_templates: StrictInt = Field(default=500, ge=1, le=5_000)
@@ -265,12 +271,20 @@ class ResearchBootstrapper:
         self._context_adapter = ControlledContextResearchAdapter()
         self._template_factory = RequestTemplateFactory()
         self._capture_cache: dict[str, CaptureBundle] = {}
-        self._discovery_budget_view: _DiscoveryBudgetView | None = None
+        self._bootstrap_request_ceiling = min(
+            self.limits.maximum_discovery_target_requests,
+            max(
+                0,
+                request_budget.remaining
+                - self.limits.minimum_post_bootstrap_request_reserve,
+            ),
+        )
+        self._discovery_budget_view = _DiscoveryBudgetView(
+            request_budget, self._bootstrap_request_ceiling
+        )
+        self._budget_bindings: list[tuple[object, str, object]] = []
         if tool_runner is None:
-            budget_view = _DiscoveryBudgetView(
-                request_budget, self.limits.maximum_discovery_target_requests
-            )
-            self._discovery_budget_view = budget_view
+            budget_view = self._discovery_budget_view
             client = ScopedHTTPClient(policy=policy, budget=budget_view)  # type: ignore[arg-type]
             self.tool_runner = ToolRunner(
                 tool_timeout=min(
@@ -296,6 +310,7 @@ class ResearchBootstrapper:
             config=self.graphql_discovery_config,
             session=graphql_session,
         )
+        self._graphql_session = graphql_session
         self.graphql_authenticated_discovery = (
             GraphQLAuthenticatedDiscovery(
                 session=graphql_session,
@@ -401,6 +416,7 @@ class ResearchBootstrapper:
     def prepare(self, state: ResearchState) -> ResearchState:
         """Run or resume bounded bootstrap until experiment selection is possible."""
 
+        self._activate_phase_budget()
         try:
             while state.status in {
                 ResearchRunStatus.initializing,
@@ -432,6 +448,8 @@ class ResearchBootstrapper:
                 )
             else:
                 state = current
+        finally:
+            self._restore_authoritative_budget()
         return state
 
     def compiler_context(
@@ -446,9 +464,19 @@ class ResearchBootstrapper:
             for item in self._template_factory.compiler_templates(state)
         }
         generated.update({item.template_id: item for item in base.request_templates})
+        graphql_templates = {
+            item.template_id: item
+            for item in candidate_ready_graphql_operation_templates(state)
+        }
+        graphql_templates.update(
+            {item.template_id: item for item in base.graphql_operation_templates}
+        )
         return base.model_copy(
             update={
-                "request_templates": tuple(generated[key] for key in sorted(generated))
+                "request_templates": tuple(generated[key] for key in sorted(generated)),
+                "graphql_operation_templates": tuple(
+                    graphql_templates[key] for key in sorted(graphql_templates)
+                ),
             }
         )
 
@@ -527,14 +555,17 @@ class ResearchBootstrapper:
         previously_consumed = progress.request_delta.total if progress else 0
         remaining_bootstrap_requests = max(
             0,
-            self.limits.maximum_discovery_target_requests - previously_consumed,
+            self._bootstrap_request_ceiling - previously_consumed,
         )
         if remaining_bootstrap_requests <= 0:
             raise _BootstrapStopped(
                 BootstrapStopReason.discovery_request_budget_exhausted
             )
-        if self._discovery_budget_view is not None:
-            self._discovery_budget_view.reset_phase_limit(remaining_bootstrap_requests)
+        readiness_reserve = self._candidate_readiness_reserve()
+        ordinary_discovery_limit = max(
+            1, remaining_bootstrap_requests - readiness_reserve
+        )
+        self._discovery_budget_view.reset_phase_limit(ordinary_discovery_limit)
         plan = self.discovery_orchestrator.initial_surface_plan(
             goal="Build bounded Phase 4 research surface",
             target=target.canonical_reference,
@@ -570,6 +601,21 @@ class ResearchBootstrapper:
             )
         if not isinstance(result, dict):
             raise ValueError("discovery runner returned an invalid result")
+        consumed_by_ordinary_discovery = RequestDelta.from_snapshots(
+            before, self.request_budget.snapshot()
+        ).total
+        reservation_limitations = (
+            (
+                "Optional ordinary discovery was bounded to preserve controlled "
+                "candidate-readiness request capacity.",
+            )
+            if readiness_reserve
+            and consumed_by_ordinary_discovery >= ordinary_discovery_limit
+            else ()
+        )
+        self._discovery_budget_view.reset_phase_limit(
+            max(0, remaining_bootstrap_requests - consumed_by_ordinary_discovery)
+        )
         bundle = self._capture_from_result(result)
         surface = self._canonical_surface(
             target.canonical_reference, result=result, capture_bundle=bundle
@@ -614,10 +660,7 @@ class ResearchBootstrapper:
             graphql_limitations.update(graphql_result.limitations)
         after = self.request_budget.snapshot()
         delta = RequestDelta.from_snapshots(before, after)
-        if (
-            previously_consumed + delta.total
-            > self.limits.maximum_discovery_target_requests
-        ):
+        if previously_consumed + delta.total > self._bootstrap_request_ceiling:
             failure_progress = self._updated_progress(
                 state,
                 progress,
@@ -641,7 +684,13 @@ class ResearchBootstrapper:
             plan_reference=opaque_reference(plan.run_id, "discovery-plan"),
             discovery_completed=True,
             request_delta=delta,
-            limitations=tuple((*surface.limitations, *sorted(graphql_limitations))),
+            limitations=tuple(
+                (
+                    *surface.limitations,
+                    *reservation_limitations,
+                    *sorted(graphql_limitations),
+                )
+            ),
         )
         adapted = self._with_progress_and_budget(adapted, next_progress)
         if self._wall_time_exhausted():
@@ -673,14 +722,19 @@ class ResearchBootstrapper:
         acquisition_consumed = RequestDelta.from_snapshots(
             before, self.request_budget.snapshot()
         ).total
+        remaining_after_acquisition = max(
+            0,
+            self._bootstrap_request_ceiling - already_consumed - acquisition_consumed,
+        )
+        graphql_authenticated_reserve = self._graphql_authenticated_reserve(
+            state, remaining_after_acquisition
+        )
         authenticated, authenticated_limitations = self._discover_controlled_objects(
             state,
             target,
             maximum_requests=max(
                 0,
-                self.limits.maximum_discovery_target_requests
-                - already_consumed
-                - acquisition_consumed,
+                remaining_after_acquisition - graphql_authenticated_reserve,
             ),
         )
         acquired = (*acquired, *authenticated)
@@ -710,11 +764,31 @@ class ResearchBootstrapper:
         adapted, authenticated_graphql_limitations = (
             self._discover_authenticated_graphql(adapted, target)
         )
+        adapted, readiness_limitations = derive_candidate_ready_graphql_operations(
+            adapted,
+            self._controlled_object_descriptors(adapted),
+            occurred_at=self._now(adapted),
+        )
+        diagnostic_codes = set(adapted.diagnostic_codes)
+        if adapted.graphql_surfaces and not adapted.graphql_operations:
+            diagnostic_codes.add("no_graphql_operation")
+        if adapted.graphql_surfaces and not adapted.objects:
+            diagnostic_codes.add("no_controlled_object")
         after = self.request_budget.snapshot()
         delta = RequestDelta.from_snapshots(before, after)
         if (
+            self.controlled_context.object_acquisition
+            and not adapted.objects
+            and already_consumed + delta.total >= self._bootstrap_request_ceiling
+        ):
+            diagnostic_codes.add("bootstrap_reserve_exhausted")
+        if diagnostic_codes != set(adapted.diagnostic_codes):
+            adapted = adapted.model_copy(
+                update={"diagnostic_codes": tuple(sorted(diagnostic_codes))}
+            )
+        if (
             progress.request_delta.total if progress else 0
-        ) + delta.total > self.limits.maximum_discovery_target_requests:
+        ) + delta.total > self._bootstrap_request_ceiling:
             failure_progress = self._updated_progress(
                 state,
                 progress,
@@ -750,6 +824,7 @@ class ResearchBootstrapper:
                 *authenticated_limitations,
                 *graphql_limitations,
                 *authenticated_graphql_limitations,
+                *readiness_limitations,
             ),
         )
         adapted = self._with_progress_and_budget(adapted, next_progress)
@@ -977,7 +1052,7 @@ class ResearchBootstrapper:
         }
         remaining = max(
             0,
-            self.limits.maximum_discovery_target_requests
+            self._bootstrap_request_ceiling
             - (progress.request_delta.total if progress else 0),
         )
         for config in self.controlled_context.object_acquisition:
@@ -1042,6 +1117,8 @@ class ResearchBootstrapper:
             return state, ()
         endpoint_by_id = {item.endpoint_id: item for item in state.endpoints}
         eligible_requirements = {
+            GraphQLAuthenticationRequirement.unknown,
+            GraphQLAuthenticationRequirement.anonymous_observed,
             GraphQLAuthenticationRequirement.authenticated_observed,
             GraphQLAuthenticationRequirement.authentication_required,
             GraphQLAuthenticationRequirement.role_bound,
@@ -1070,6 +1147,116 @@ class ResearchBootstrapper:
             current = result.delta.apply(current)
             limitations.update(result.limitations)
         return current, tuple(sorted(limitations))
+
+    def _candidate_readiness_reserve(self) -> int:
+        """Reserve bootstrap capacity for evidence that makes candidates usable."""
+
+        if self.profile != "authenticated" or not self.controlled_context.accounts:
+            return 0
+        pending_objects = sum(
+            1
+            for config in self.controlled_context.object_acquisition
+            if not any(
+                item.test_owned
+                and item.owner_account_id == config.owner_account_id
+                and item.object_type == config.object_type
+                for item in self.controlled_context.objects
+            )
+        )
+        # Before discovery establishes a protocol, reserve only generic API
+        # semantic and controlled-context capacity.  GraphQL-specific
+        # reservation is activated later by _graphql_authenticated_reserve.
+        semantic_enrichment = 2
+        authenticated_context = min(2, len(self.controlled_context.accounts))
+        phase_safety_reserve = 1
+        return min(
+            max(0, self._bootstrap_request_ceiling - 1),
+            pending_objects
+            + authenticated_context
+            + semantic_enrichment
+            + phase_safety_reserve,
+        )
+
+    def _graphql_authenticated_reserve(
+        self, state: ResearchState, remaining: int
+    ) -> int:
+        if not state.graphql_surfaces or self.graphql_authenticated_discovery is None:
+            return 0
+        # The discovery session itself preserves one request, so include that
+        # safety margin in this phase's reservation.
+        return min(remaining, len(self.controlled_context.accounts) + 2)
+
+    def _controlled_object_descriptors(
+        self, state: ResearchState
+    ) -> dict[str, ControlledObjectDescriptor]:
+        """Join safe imported references back to configured acquisition semantics."""
+
+        configurations = {
+            (item.owner_account_id, item.object_type): item
+            for item in self.controlled_context.object_acquisition
+        }
+        identity_by_account = {
+            item.account_reference: item.identity_id for item in state.identities
+        }
+        descriptors: dict[str, ControlledObjectDescriptor] = {}
+        for controlled_object in self.controlled_context.objects:
+            configuration = configurations.get(
+                (controlled_object.owner_account_id, controlled_object.object_type)
+            )
+            owner_identity_id = identity_by_account.get(
+                opaque_reference(controlled_object.owner_account_id, "account")
+            )
+            if configuration is None or owner_identity_id is None:
+                continue
+            research_object = next(
+                (
+                    item
+                    for item in state.objects
+                    if item.owner_identity_id == owner_identity_id
+                    and item.test_owned
+                    and item.object_reference
+                    == opaque_reference(controlled_object.object_id, "object-reference")
+                ),
+                None,
+            )
+            if research_object is not None:
+                descriptors[research_object.object_id] = ControlledObjectDescriptor(
+                    object_type=controlled_object.object_type,
+                    identifier_field=configuration.identifier_field,
+                )
+        return descriptors
+
+    def _bind_phase_budget(self, runner: object) -> None:
+        """Temporarily constrain all bootstrap transports through one ledger view."""
+
+        for owner, attribute in (
+            (runner, "request_budget"),
+            (runner, "budget"),
+            (getattr(runner, "http_client", None), "budget"),
+        ):
+            if (
+                owner is None
+                or getattr(owner, attribute, None) is not self.request_budget
+            ):
+                continue
+            self._budget_bindings.append((owner, attribute, self.request_budget))
+            setattr(owner, attribute, self._discovery_budget_view)
+
+    def _activate_phase_budget(self) -> None:
+        if self._budget_bindings:
+            return
+        self._bind_phase_budget(self.tool_runner)
+        session = self._graphql_session
+        if session is not None and session.request_budget is self.request_budget:
+            self._budget_bindings.append(
+                (session, "request_budget", self.request_budget)
+            )
+            session.request_budget = self._discovery_budget_view  # type: ignore[assignment]
+
+    def _restore_authoritative_budget(self) -> None:
+        for owner, attribute, original in reversed(self._budget_bindings):
+            setattr(owner, attribute, original)
+        self._budget_bindings.clear()
 
     def _register_acquired_objects(self, objects: Sequence[ControlledObject]) -> None:
         """Retain raw values only in the process-local controlled context."""

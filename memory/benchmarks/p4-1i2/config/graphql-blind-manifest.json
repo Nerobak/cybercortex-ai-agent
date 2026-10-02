@@ -1,0 +1,31 @@
+{
+  "benchmark_id": "controlled-api-research-001",
+  "benchmark_version": "p4-1i.1-v1",
+  "title": "Blind controlled API research benchmark",
+  "description": "A deterministic local read-only API research target with two controlled identities and independently acquired test objects.",
+  "target_class": "dedicated_lab",
+  "authorized_target_reference": "http://127.0.0.1:8765",
+  "scope_reference": "controlled-local-api-scope-v1",
+  "controlled_account_metadata_references": [
+    "controlled-identity-a",
+    "controlled-identity-b"
+  ],
+  "controlled_setup_object_references": [],
+  "policy_reference": "controlled-api-research-policy-v1",
+  "request_budget": 32,
+  "model_budget": 6,
+  "experiment_budget": 4,
+  "reproduction_budget": 2,
+  "chain_budget": 0,
+  "wall_time_budget": 180.0,
+  "allowed_state_change_class": "read_only",
+  "reset_strategy": "stateless_target",
+  "ground_truth_reference": "controlled-api-private-truth-v1",
+  "scoring_policy_reference": "controlled-api-confirmation-policy-v1",
+  "benchmark_tags": [
+    "blind",
+    "controlled-lab",
+    "read-only"
+  ],
+  "created_at": "2026-10-01T00:00:00+00:00"
+}

@@ -10,7 +10,9 @@ from agent_core.research import (
     CleanupDefinition,
     ExperimentCompiler,
     ExperimentCompilerContext,
+    ExperimentEvaluator,
     ExperimentRegistry,
+    ExperimentSelector,
     GraphQLCandidateKind,
     GraphQLCandidateLimits,
     GraphQLCandidatePolicy,
@@ -34,17 +36,22 @@ from agent_core.research import (
     Identity,
     IdentityEligibility,
     InformationGainEstimate,
+    PivotPlanner,
     PublicSafeCandidatePacketBuilder,
+    PublicSafeResearchPacketBuilder,
     RegisteredGraphQLSafeMutation,
     ResearchBudgetManager,
     ResearchConfidence,
+    ResearchReasoningEngine,
     ResearchPredicate,
+    ResearchRunStatus,
     ResearchSelectionAction,
     ResearchSelectionDecision,
     ResearchState,
     ResearchStore,
     Relationship,
     RelationshipStatus,
+    SecurityResearchOrchestrator,
     EntityKind,
     EntityReference,
     DerivationType,
@@ -58,6 +65,9 @@ from test_phase4_graphql_hypotheses import (
     _two_identity_state,
 )
 from test_phase4_graphql_semantics import TS, semantic_state
+from test_phase4_research_candidates import FakeSelectionRouter, routing_policy
+from test_phase4_research_orchestrator import FakeGate, FakeResearchRuntime
+from agent_core.research.evaluation import ExperimentResultClassification
 
 
 def _state(state: ResearchState, **updates: object) -> ResearchState:
@@ -171,6 +181,69 @@ def test_authentication_candidate_costs_exactly_two_requests():
 
     assert candidate.minimum_requests == 2
     assert candidate.worst_case_requests == 2
+
+
+def test_single_graphql_candidate_reaches_normal_lifecycle_without_model_call(
+    tmp_path,
+):
+    state, context, builder = _candidate_fixture()
+    state = _state(state, status=ResearchRunStatus.selecting_experiment)
+    candidates = builder.build(state, compiler_context=context)
+    selected = next(
+        item
+        for item in candidates
+        if item.graphql_candidate_kind is GraphQLCandidateKind.object_authorization
+    )
+
+    class SingletonGraphQLBuilder:
+        def build(self, current, **_kwargs):
+            assert current.revision == selected.state_revision
+            return (selected,)
+
+    class RecordingGate(FakeGate):
+        def __init__(self):
+            super().__init__()
+            self.authorized = []
+
+        def authorize(self, experiment):
+            self.authorized.append(experiment)
+            return super().authorize(experiment)
+
+    store = ResearchStore(tmp_path / "graphql-singleton.sqlite3")
+    store.create_research(state)
+    router = FakeSelectionRouter()
+    budgets = builder.budget_manager
+    budgets.model_ledger = router.ledger
+    compiler = builder.compiler
+    selector = ExperimentSelector(compiler, budgets)
+    gate = RecordingGate()
+    runtime = FakeResearchRuntime((ExperimentResultClassification.inconclusive,))
+    runner = SecurityResearchOrchestrator(
+        store=store,
+        compiler=compiler,
+        compiler_context=context,
+        gate=gate,
+        runtime=runtime,
+        selector=selector,
+        evaluator=ExperimentEvaluator(),
+        pivot_planner=PivotPlanner(selector),
+        budget_manager=budgets,
+        reasoning_engine=ResearchReasoningEngine(router),
+        routing_policy=routing_policy(),
+        packet_builder=PublicSafeResearchPacketBuilder(compiler.registry, budgets),
+        candidate_builder=SingletonGraphQLBuilder(),
+        candidate_packet_builder=PublicSafeCandidatePacketBuilder(budgets),
+    )
+
+    result = runner.run(state.research_id, max_iterations=1)
+
+    assert router.requests == []
+    assert len(gate.authorized) == 1
+    assert gate.authorized[0].target.operation_id == selected.operation_id
+    assert gate.authorized[0].provenance.source_model_decision_id is None
+    assert len(result.state.experiment_history) == 1
+    assert result.state.experiment_history[0].status.value == "completed"
+    assert "singleton_deterministic_selection" in result.state.diagnostic_codes
 
 
 def test_tenant_candidate_requires_two_controlled_tenants():

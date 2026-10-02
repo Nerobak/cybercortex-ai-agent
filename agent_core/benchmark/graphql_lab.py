@@ -65,15 +65,16 @@ from agent_core.research.candidates import (
 from agent_core.research.compiler import ExperimentCompiler, ExperimentCompilerContext
 from agent_core.research.evaluation import ExperimentEvaluator
 from agent_core.research.graph import ResearchGraphRepository
-from agent_core.research.graphql import GraphQLTypeKind
 from agent_core.research.graphql_candidates import (
     GraphQLCandidatePolicy,
     GraphQLExperimentCandidateBuilder,
-    build_registered_graphql_operation_template,
 )
 from agent_core.research.graphql_discovery import (
     GraphQLDiscoveryConfig,
     GraphQLIntrospectionPolicy,
+)
+from agent_core.research.graphql_readiness import (
+    candidate_ready_graphql_operation_templates,
 )
 from agent_core.research.orchestrator import SecurityResearchOrchestrator
 from agent_core.research.pivot import PivotPlanner
@@ -86,7 +87,6 @@ from agent_core.research.selection import ExperimentSelector
 from agent_core.research.state import ProvenanceRecord, ResearchState, TargetAsset
 from agent_core.research.store import ResearchStore
 from agent_core.research.types import (
-    GraphQLOperationType,
     ProvenanceProducerType,
     ResearchRunStatus,
     TargetClass,
@@ -800,53 +800,7 @@ class _CombinedCandidateBuilder:
 
 
 def _operation_templates(state: ResearchState) -> tuple[Any, ...]:
-    templates = []
-    fields = {item.field_id: item for item in state.graphql_fields}
-    types_by_name = {
-        (item.graphql_surface_id, item.name): item for item in state.graphql_types
-    }
-    for operation in state.graphql_operations:
-        if operation.operation_type is not GraphQLOperationType.query:
-            continue
-        paths: list[tuple[str, ...]] = []
-        for root_id in operation.root_field_ids:
-            root = fields.get(root_id)
-            if root is None:
-                continue
-            paths.append((root_id,))
-            returned = types_by_name.get(
-                (operation.graphql_surface_id, root.return_type.named_type)
-            )
-            if returned is None:
-                continue
-            scalar_children = [
-                fields[field_id]
-                for field_id in returned.field_ids
-                if field_id in fields
-                and (
-                    child_type := types_by_name.get(
-                        (
-                            operation.graphql_surface_id,
-                            fields[field_id].return_type.named_type,
-                        )
-                    )
-                )
-                is None
-                or child_type.kind in {GraphQLTypeKind.scalar, GraphQLTypeKind.enum}
-            ]
-            paths.extend(
-                (root_id, child.field_id)
-                for child in sorted(scalar_children, key=lambda item: item.name)[:2]
-            )
-        if paths:
-            templates.append(
-                build_registered_graphql_operation_template(
-                    state,
-                    operation.operation_id,
-                    selection_paths=paths,
-                )
-            )
-    return tuple(sorted(templates, key=lambda item: item.template_id))
+    return candidate_ready_graphql_operation_templates(state)
 
 
 def _safe_path_component(value: str, label: str) -> str:
