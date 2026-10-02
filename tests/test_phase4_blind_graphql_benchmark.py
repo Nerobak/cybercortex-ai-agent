@@ -27,6 +27,7 @@ from agent_core.benchmark.graphql_lab import (
     GRAPHQL_BENCHMARK_LAB,
 )
 from agent_core.controlled_context import ControlledContext
+from agent_core.models.pricing import model_response_matches_route
 from agent_core.research import (
     CleanupStatus,
     ControlledImpact,
@@ -583,10 +584,33 @@ def test_trusted_factory_preflight_uses_production_components_without_calls(tmp_
     assert type(bindings.model_router).__name__ == "ModelRouter"
     assert isinstance(bindings.bootstrapper, ResearchBootstrapper)
     assert isinstance(orchestrator, SecurityResearchOrchestrator)
+    routing = bindings.bootstrapper.routing_policy
+    configuration = bindings.model_router.registry.configuration
+    provider = bindings.model_router.registry.create("ollama")
+    assert research_input.model_routing_policy.provider == "ollama"
+    assert research_input.model_routing_policy.requested_model == "deepseek-r1:32b"
+    assert routing.mode.value == "local_only"
+    assert routing.preferred.provider == "ollama"
+    assert routing.preferred.model == "deepseek-r1:32b"
+    assert routing.fallback_allowed is False
+    assert routing.max_provider_attempts == 1
+    assert configuration.default_provider == "ollama"
+    assert configuration.ollama.model_name == "deepseek-r1:32b"
+    assert configuration.ollama.timeout_seconds == 60.0
+    assert configuration.ollama.max_output_tokens == 12_000
+    assert provider.model_name == "deepseek-r1:32b"
+    assert model_response_matches_route(
+        "ollama", routing.preferred.model, provider.model_name
+    )
+    assert not model_response_matches_route(
+        "ollama", routing.preferred.model, "different-local-model"
+    )
     assert isinstance(bindings.bootstrapper.controlled_context, ControlledContext)
     assert len(bindings.bootstrapper.controlled_context.accounts) == 2
     assert bindings.bootstrapper.controlled_context.objects == []
     assert bindings.request_budget.total == 0
+    assert bindings.budget_manager.model_ledger is bindings.model_router.ledger
+    assert bindings.model_router.ledger.records == ()
     assert (
         bindings.model_router.ledger.usage_for_run("research-factory").attempted_calls
         == 0

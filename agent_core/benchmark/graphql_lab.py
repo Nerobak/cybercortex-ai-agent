@@ -50,7 +50,6 @@ from agent_core.models import (
     ModelRoute,
     ModelRouter,
     ModelRoutingPolicy,
-    ProviderConfiguration,
     ProviderRegistry,
     RoutingMode,
 )
@@ -102,7 +101,6 @@ GRAPHQL_SCORING_POLICY_REFERENCE = "controlled-api-confirmation-policy-v1"
 GRAPHQL_POLICY_REFERENCE = "controlled-api-research-policy-v1"
 GRAPHQL_SCOPE_REFERENCE = "controlled-local-api-scope-v1"
 GRAPHQL_RESET_REFERENCE = "controlled-read-only-reset-v1"
-GRAPHQL_MODEL_NAME = "cybercortex-lightweight-strategy"
 GRAPHQL_CREATED_AT = "2026-10-01T00:00:00+00:00"
 _HIDDEN_SENTINEL = "p4-1i1-private-sentinel-7e4d2a9c"
 
@@ -660,10 +658,28 @@ def install_graphql_benchmark_ground_truth(
     return store.put(GRAPHQL_GROUND_TRUTH_REFERENCE, _private_ground_truth())
 
 
-def _model_routing_policy() -> ModelRoutingPolicy:
+def _benchmark_model_configuration() -> ModelConfiguration:
+    """Use the production defaults with the benchmark's bounded output ceiling."""
+
+    configuration = ModelConfiguration()
+    selected = configuration.provider_configuration(configuration.default_provider)
+    if configuration.default_provider != "ollama" or selected.model_name is None:
+        raise RuntimeError("benchmark requires the configured local Ollama model")
+    return configuration.model_copy(
+        update={"ollama": selected.model_copy(update={"max_output_tokens": 12_000})}
+    )
+
+
+def _model_routing_policy(
+    configuration: ModelConfiguration,
+) -> ModelRoutingPolicy:
+    provider = configuration.default_provider
+    model = configuration.provider_configuration(provider).model_name
+    if provider != "ollama" or model is None:
+        raise RuntimeError("benchmark requires the configured local Ollama model")
     return ModelRoutingPolicy(
         mode=RoutingMode.local_only,
-        preferred=ModelRoute(provider="ollama", model=GRAPHQL_MODEL_NAME),
+        preferred=ModelRoute(provider=provider, model=model),
         fallback_allowed=False,
         max_provider_attempts=1,
         budget=ModelBudgetLimits(
@@ -862,15 +878,8 @@ def graphql_benchmark_execution_factory(
         manifest.request_budget, per_host_limit=manifest.request_budget
     )
     ledger = ModelCallLedger()
-    routing_policy = _model_routing_policy()
-    model_configuration = ModelConfiguration(
-        default_provider="ollama",
-        ollama=ProviderConfiguration(
-            model_name=GRAPHQL_MODEL_NAME,
-            base_url="http://127.0.0.1:11434",
-            max_output_tokens=12_000,
-        ),
-    )
+    model_configuration = _benchmark_model_configuration()
+    routing_policy = _model_routing_policy(model_configuration)
     model_router = ModelRouter(ProviderRegistry(model_configuration), ledger=ledger)
     budget_manager = ResearchBudgetManager(
         ResearchBudgetPolicy(

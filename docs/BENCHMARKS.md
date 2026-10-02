@@ -57,5 +57,12 @@ truth contains one read-only GraphQL object-authorization finding. Correctly
 enforced authentication and protected-field behavior are diagnostic controls,
 not ground-truth findings.
 
+The trusted factory derives its route from the normal typed production model
+configuration, whose local default is `ollama` / `deepseek-r1:32b`, then applies
+the benchmark's existing 12,000-token provider output ceiling. Routing remains
+`local_only`, fallback is disabled, and provider attempts are bounded to one.
+Requested-model metadata is configuration evidence only: actual provider/model
+provenance and usage continue to come from the router's authoritative ledger.
+
 P4-1I.1 constructs and tests this fixture only. It does not run CyberCortex
 against the target and does not invoke any model provider.
