@@ -18,6 +18,7 @@ from agent_core.controlled_context import (
     OwnedObjectAcquisition,
     SessionAcquirer,
     SessionAcquisition,
+    owned_object_acquisition_reference,
 )
 from agent_core.controlled_executor import ControlledVerificationExecutor
 from agent_core.credential_vault import CredentialVault
@@ -1562,6 +1563,8 @@ def test_owned_object_acquirer_builds_in_memory_test_owned_object():
             tenant_id="tenant-a",
             object_type="order",
             test_owned=True,
+            ownership_basis="owner_scoped_authenticated_collection",
+            source_reference=owned_object_acquisition_reference(config),
         )
         assert budget.snapshot()["discovery_requests"] == 1
     finally:
@@ -1911,14 +1914,16 @@ def test_tenant_equal_success_without_confirmed_protected_data_is_inconclusive()
             _gate(_policy(), context),
             vault,
             context,
-            lambda request: calls.append(request)
-            or {
-                "status_code": 200,
-                "body": {
-                    "tenant_id": "tenant-alpha",
-                    "projects": [{"project_id": "public-project"}],
-                },
-            },
+            lambda request: (
+                calls.append(request)
+                or {
+                    "status_code": 200,
+                    "body": {
+                        "tenant_id": "tenant-alpha",
+                        "projects": [{"project_id": "public-project"}],
+                    },
+                }
+            ),
         ).execute(
             hypothesis,
             plan,
@@ -2183,8 +2188,7 @@ def test_tenant_isolation_uses_acquired_object_and_controlled_tenant():
             transport,
             category="tenant_isolation",
             target=(
-                "https://authorized.example/api/tenants/{tenant_id}/"
-                "orders/{order_id}"
+                "https://authorized.example/api/tenants/{tenant_id}/orders/{order_id}"
             ),
         )
 

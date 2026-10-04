@@ -42,6 +42,21 @@ class ControlledObjectDescriptor:
     identifier_field: str
 
 
+_READINESS_DIAGNOSTIC_PREFIX = "graphql_readiness_"
+
+
+def _with_readiness_diagnostic(state: ResearchState, code: str) -> ResearchState:
+    diagnostic_codes = {
+        item
+        for item in state.diagnostic_codes
+        if not item.startswith(_READINESS_DIAGNOSTIC_PREFIX)
+    }
+    diagnostic_codes.add(code)
+    return state.model_copy(
+        update={"diagnostic_codes": tuple(sorted(diagnostic_codes))}
+    )
+
+
 def derive_candidate_ready_graphql_operations(
     state: ResearchState,
     descriptors: Mapping[str, ControlledObjectDescriptor],
@@ -50,8 +65,19 @@ def derive_candidate_ready_graphql_operations(
 ) -> tuple[ResearchState, tuple[str, ...]]:
     """Derive bounded operations only from unambiguous controlled evidence."""
 
-    if not state.graphql_surfaces or not descriptors:
+    if not state.graphql_surfaces:
         return state, ()
+    if candidate_ready_graphql_operation_templates(state):
+        return _with_readiness_diagnostic(
+            state, "graphql_readiness_operation_ready"
+        ), ()
+    if not descriptors:
+        code = (
+            "graphql_readiness_missing_controlled_object"
+            if not state.objects
+            else "graphql_readiness_missing_controlled_object_descriptor"
+        )
+        return _with_readiness_diagnostic(state, code), (code,)
 
     type_by_surface_name = {
         (item.graphql_surface_id, item.name): item for item in state.graphql_types
@@ -75,7 +101,6 @@ def derive_candidate_ready_graphql_operations(
     derived_variables: list[GraphQLVariableRecord] = []
     updated_arguments = dict(arguments)
     provenance_records = {item.provenance_id: item for item in state.provenance}
-    limitations: set[str] = set()
 
     for graphql_surface_id, surface in sorted(surfaces.items()):
         query_roots = tuple(
@@ -266,7 +291,13 @@ def derive_candidate_ready_graphql_operations(
                 )
 
     if not derived_operations:
-        return state, tuple(sorted(limitations))
+        if not state.graphql_types or not state.graphql_fields:
+            code = "graphql_readiness_missing_schema_semantics"
+        elif not objects:
+            code = "graphql_readiness_missing_ownership_evidence"
+        else:
+            code = "graphql_readiness_missing_registered_operation_evidence"
+        return _with_readiness_diagnostic(state, code), (code,)
 
     operations = {
         item.operation_id: item
@@ -285,7 +316,14 @@ def derive_candidate_ready_graphql_operations(
         graphql_variables=tuple(variables[key] for key in sorted(variables)),
         provenance=tuple(provenance_records[key] for key in sorted(provenance_records)),
     )
-    return ResearchState.model_validate(payload), tuple(sorted(limitations))
+    ready = ResearchState.model_validate(payload)
+    code = (
+        "graphql_readiness_operation_ready"
+        if candidate_ready_graphql_operation_templates(ready)
+        else "graphql_readiness_missing_operation_template"
+    )
+    ready = _with_readiness_diagnostic(ready, code)
+    return ready, (() if code == "graphql_readiness_operation_ready" else (code,))
 
 
 def candidate_ready_graphql_operation_templates(state: ResearchState):

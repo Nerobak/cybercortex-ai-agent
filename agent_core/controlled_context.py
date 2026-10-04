@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -97,6 +98,18 @@ class OwnedObjectAcquisition(StrictModel):
         if not method or len(method) > 16 or not method.isalpha():
             raise ValueError("method must be a conventional HTTP method token")
         return method
+
+
+def owned_object_acquisition_reference(config: OwnedObjectAcquisition) -> str:
+    """Return a stable, secret-free reference to one configured acquisition."""
+
+    encoded = json.dumps(
+        config.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return "owned-object-acquisition:" + hashlib.sha256(encoded).hexdigest()
 
 
 class SessionAcquisition(StrictModel):
@@ -521,6 +534,8 @@ class OwnedObjectAcquirer:
             tenant_id=tenant_id,
             object_type=config.object_type,
             test_owned=True,
+            ownership_basis="owner_scoped_authenticated_collection",
+            source_reference=owned_object_acquisition_reference(config),
         )
 
     @classmethod

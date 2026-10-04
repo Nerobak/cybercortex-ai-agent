@@ -77,6 +77,14 @@ class BenchmarkRunNotFound(BenchmarkRunnerError):
     pass
 
 
+class BenchmarkNonterminalOrchestratorReturn(BenchmarkRunnerError):
+    """A normal orchestrator return did not satisfy the terminal contract."""
+
+
+class BenchmarkResearchTerminatedFailed(BenchmarkRunnerError):
+    """The research lifecycle terminated in its failure state."""
+
+
 @dataclass(frozen=True)
 class BenchmarkExecutionBindings:
     """Existing production components configured for one fresh research ID."""
@@ -613,7 +621,26 @@ class AutonomousResearchBenchmarkRunner:
             prepared = bindings.bootstrapper.prepare(state)
             orchestrator = bindings.build_orchestrator(prepared)
             result = orchestrator.run(research_id, max_iterations=max_iterations)
-            final_state = result.state
+            result_state = getattr(result, "state", None)
+            persisted_state = bindings.research_store.load_research(research_id)
+            if not isinstance(result_state, ResearchState) or artifact_fingerprint(
+                result_state
+            ) != artifact_fingerprint(persisted_state):
+                raise BenchmarkNonterminalOrchestratorReturn(
+                    "benchmark_nonterminal_orchestrator_return"
+                )
+            if persisted_state.status is ResearchRunStatus.failed:
+                raise BenchmarkResearchTerminatedFailed(
+                    "benchmark_research_terminated_failed"
+                )
+            if (
+                getattr(result, "completed", False) is not True
+                or persisted_state.status is not ResearchRunStatus.stopped
+            ):
+                raise BenchmarkNonterminalOrchestratorReturn(
+                    "benchmark_nonterminal_orchestrator_return"
+                )
+            final_state = persisted_state
             elapsed = time.monotonic() - started
             self.run_store.save_artifact(run.run_id, "final-state", final_state)
             completed = running.model_copy(
@@ -684,8 +711,19 @@ class AutonomousResearchBenchmarkRunner:
         unexpected_adjudications: dict[str, UnexpectedFindingRecord] | None = None,
     ) -> BenchmarkScore:
         run = self.run_store.load(run_id)
+        if run.status is BenchmarkRunStatus.scored:
+            score = self.run_store.load_artifact(run_id, "score", BenchmarkScore)
+            assert isinstance(score, BenchmarkScore)
+            if (
+                run.scoring_reference is None
+                or artifact_fingerprint(score) != run.scoring_reference
+            ):
+                raise BenchmarkRunnerError(
+                    "already-scored benchmark artifact integrity failure"
+                )
+            return score
         if run.status not in {BenchmarkRunStatus.completed, BenchmarkRunStatus.failed}:
-            raise BenchmarkRunnerError("scoring requires terminated research")
+            raise BenchmarkRunnerError("benchmark run is not ready for scoring")
         manifest = self.run_store.load_artifact(run_id, "manifest", BenchmarkManifest)
         assert isinstance(manifest, BenchmarkManifest)
         if run.benchmark_manifest_fingerprint != artifact_fingerprint(manifest):

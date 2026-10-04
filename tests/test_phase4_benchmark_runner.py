@@ -19,6 +19,7 @@ from agent_core.benchmark import (
     BenchmarkRun,
     BenchmarkRunStatus,
     BenchmarkRunStore,
+    BenchmarkRunnerError,
     BenchmarkScoringPolicy,
     IntegrityStatus,
     ResetStrategy,
@@ -134,11 +135,27 @@ class _Orchestrator:
         self.store = store
         self.budget_manager = budget_manager
         self.calls = 0
+        self.final_status = ResearchRunStatus.stopped
+        self.completed = True
 
     def run(self, research_id, max_iterations=None):
         del max_iterations
         self.calls += 1
-        return SimpleNamespace(state=self.store.load_research(research_id))
+        current = self.store.load_research(research_id)
+        final = ResearchState.model_validate(
+            {
+                **current.model_dump(mode="python"),
+                "revision": current.revision + 1,
+                "status": self.final_status,
+                "updated_at": NOW,
+            }
+        )
+        final = self.store.commit_revision(
+            research_id,
+            expected_revision=current.revision,
+            state=final,
+        )
+        return SimpleNamespace(state=final, completed=self.completed)
 
 
 class _TrackingTruthStore(BenchmarkGroundTruthStore):
@@ -322,6 +339,100 @@ def test_controller_preflight_parse_is_private_and_scoring_load_is_terminated(
     )
     assert "hidden-sentinel-4f9c" not in research_material
     assert "truth-1" not in research_material
+
+
+def test_normal_nonterminal_orchestrator_return_cannot_complete_benchmark(tmp_path):
+    private = _TrackingTruthStore(tmp_path / "truth")
+    private.put("truth-1", truth())
+    bindings, _, orchestrator = _bindings(tmp_path)
+    orchestrator.final_status = ResearchRunStatus.modeling
+    orchestrator.completed = False
+    framework = _framework(tmp_path, private)
+
+    with pytest.raises(
+        BenchmarkRunnerError, match="benchmark research execution failed"
+    ):
+        framework.run(
+            manifest(),
+            research_input(persistence_location=str(bindings.research_store.database)),
+            bindings,
+            BenchmarkResetPlan(
+                strategy=ResetStrategy.stateless_target,
+                reset_reference="stateless-reset-1",
+            ),
+            research_id="research-1",
+            run_id="run-1",
+        )
+
+    failed = framework.run_store.load("run-1")
+    runtime = framework.run_store.load_artifact(
+        "run-1", "runtime-metadata", BenchmarkRuntimeMetadata
+    )
+    events = framework.run_store.events("run-1")
+    assert failed.status is BenchmarkRunStatus.failed
+    assert isinstance(runtime, BenchmarkRuntimeMetadata)
+    assert runtime.failure_class == "BenchmarkNonterminalOrchestratorReturn"
+    assert BenchmarkEventType.run_completed not in {item.event_type for item in events}
+    assert events[-1].event_type is BenchmarkEventType.run_failed
+    assert framework.run_store.verify_events("run-1")
+
+
+def test_failed_research_terminal_is_not_benchmark_success(tmp_path):
+    private = _TrackingTruthStore(tmp_path / "truth")
+    private.put("truth-1", truth())
+    bindings, _, orchestrator = _bindings(tmp_path)
+    orchestrator.final_status = ResearchRunStatus.failed
+    framework = _framework(tmp_path, private)
+
+    with pytest.raises(BenchmarkRunnerError):
+        framework.run(
+            manifest(),
+            research_input(persistence_location=str(bindings.research_store.database)),
+            bindings,
+            BenchmarkResetPlan(
+                strategy=ResetStrategy.stateless_target,
+                reset_reference="stateless-reset-1",
+            ),
+            research_id="research-1",
+            run_id="run-1",
+        )
+
+    assert framework.run_store.load("run-1").status is BenchmarkRunStatus.failed
+    runtime = framework.run_store.load_artifact(
+        "run-1", "runtime-metadata", BenchmarkRuntimeMetadata
+    )
+    assert isinstance(runtime, BenchmarkRuntimeMetadata)
+    assert runtime.failure_class == "BenchmarkResearchTerminatedFailed"
+
+
+def test_scoring_an_already_scored_run_returns_existing_score_without_new_events(
+    tmp_path,
+):
+    private = _TrackingTruthStore(tmp_path / "truth")
+    private.put("truth-1", truth())
+    bindings, _, _ = _bindings(tmp_path)
+    framework = _framework(tmp_path, private)
+    framework.run(
+        manifest(),
+        research_input(persistence_location=str(bindings.research_store.database)),
+        bindings,
+        BenchmarkResetPlan(
+            strategy=ResetStrategy.stateless_target,
+            reset_reference="stateless-reset-1",
+        ),
+        research_id="research-1",
+        run_id="run-1",
+    )
+    first = framework.score_run("run-1")
+    events_before = framework.run_store.events("run-1")
+    scoring_loads_before = private.scoring_loads
+
+    second = framework.score_run("run-1")
+
+    assert second == first
+    assert framework.run_store.events("run-1") == events_before
+    assert private.scoring_loads == scoring_loads_before
+    assert framework.run_store.verify_events("run-1")
 
 
 def test_research_component_contracts_have_no_ground_truth_channel():

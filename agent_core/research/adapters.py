@@ -8,12 +8,17 @@ import re
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 from pydantic import Field
 
 from agent_core.agent_models import Hypothesis
 from agent_core.attack_surface import CanonicalAttackSurface
-from agent_core.controlled_context import ControlledContext, ControlledObject
+from agent_core.controlled_context import (
+    ControlledContext,
+    ControlledObject,
+    owned_object_acquisition_reference,
+)
 from agent_core.credential_vault import CredentialVault
 from agent_core.policy import AssessmentPolicy
 from agent_core.research.evaluation import (
@@ -110,6 +115,106 @@ def digest_for(value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _normalized_http_reference(base: str, value: str) -> tuple[str, str, str, str]:
+    parsed = urlsplit(urljoin(base, value))
+    return (
+        parsed.scheme.casefold(),
+        parsed.netloc.casefold(),
+        parsed.path or "/",
+        parsed.query,
+    )
+
+
+def _controlled_object_surface_id(
+    controlled_object: ControlledObject,
+    context: ControlledContext,
+    state: ResearchState,
+    *,
+    target_id: str,
+) -> str | None:
+    """Resolve one object's primary surface only from typed acquisition evidence."""
+
+    surfaces = {
+        item.surface_id: item for item in state.surfaces if item.target_id == target_id
+    }
+    if not surfaces:
+        return None
+    candidates: set[str] = set()
+    source_reference = controlled_object.source_reference
+    endpoints = {
+        item.endpoint_id: item
+        for item in state.endpoints
+        if item.target_id == target_id and item.surface_id in surfaces
+    }
+    parameters = {item.parameter_id: item for item in state.parameters}
+
+    for parameter_id in controlled_object.parameter_ids:
+        parameter = parameters.get(parameter_id)
+        endpoint = (
+            endpoints.get(parameter.endpoint_id) if parameter is not None else None
+        )
+        if endpoint is not None:
+            candidates.add(endpoint.surface_id)
+
+    if source_reference:
+        if source_reference in surfaces:
+            candidates.add(source_reference)
+        endpoint = endpoints.get(source_reference)
+        if endpoint is not None:
+            candidates.add(endpoint.surface_id)
+        for template in state.request_templates:
+            if (
+                template.template_id == source_reference
+                and template.target_id == target_id
+                and template.surface_id in surfaces
+            ):
+                candidates.add(template.surface_id)
+        graphql_surface_ids = {
+            item.graphql_surface_id: item.surface_id
+            for item in state.graphql_surfaces
+            if item.target_id == target_id and item.surface_id in surfaces
+        }
+        graphql_surface_id = graphql_surface_ids.get(source_reference)
+        if graphql_surface_id is not None:
+            candidates.add(graphql_surface_id)
+        for operation in state.graphql_operations:
+            if operation.operation_id != source_reference:
+                continue
+            semantic_surface_id = getattr(operation, "graphql_surface_id", None)
+            if semantic_surface_id is not None:
+                resolved = graphql_surface_ids.get(semantic_surface_id)
+                if resolved is not None:
+                    candidates.add(resolved)
+            else:
+                resolved = getattr(operation, "surface_id", None)
+                if resolved in surfaces:
+                    candidates.add(resolved)
+
+        target = next(item for item in state.targets if item.target_id == target_id)
+        for acquisition in context.object_acquisition:
+            if owned_object_acquisition_reference(acquisition) != source_reference:
+                continue
+            acquisition_reference = _normalized_http_reference(
+                target.canonical_reference, acquisition.collection_url
+            )
+            for candidate_endpoint in endpoints.values():
+                if candidate_endpoint.method.value != acquisition.method:
+                    continue
+                endpoint_reference = _normalized_http_reference(
+                    target.canonical_reference, candidate_endpoint.route_template
+                )
+                if endpoint_reference == acquisition_reference:
+                    candidates.add(candidate_endpoint.surface_id)
+
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if candidates:
+        return None
+    if len(surfaces) == 1:
+        return next(iter(surfaces))
+    return None
+
+
 def _timestamp(value: str | None = None) -> str:
     return value or datetime.now(timezone.utc).isoformat()
 
@@ -144,6 +249,7 @@ class ControlledContextResearchRecords(ResearchContract):
     evidence: tuple[EvidenceArtifact, ...] = Field(default=(), max_length=5_000)
     provenance: tuple[ProvenanceRecord, ...] = Field(default=(), max_length=100)
     limitations: tuple[str, ...] = Field(default=(), max_length=100)
+    diagnostic_codes: tuple[str, ...] = Field(default=(), max_length=100)
 
 
 class AttackSurfaceResearchAdapter:
@@ -765,8 +871,8 @@ class ControlledContextResearchAdapter:
                     )
                 )
 
-        surfaces = [item for item in state.surfaces if item.target_id == target_id]
         limitations: list[str] = []
+        diagnostic_codes: set[str] = set()
         evidence: list[EvidenceArtifact] = []
         objects: list[ResearchObject] = []
         controlled_objects = {
@@ -774,96 +880,101 @@ class ControlledContextResearchAdapter:
             for item in (*context.objects, *acquired_objects)
             if item.test_owned
         }
-        if controlled_objects and len(surfaces) != 1:
-            limitations.append(
-                "Controlled objects require exactly one unambiguous target surface before import."
+        for controlled_object in (
+            controlled_objects[key] for key in sorted(controlled_objects)
+        ):
+            owner_identity = account_to_identity.get(controlled_object.owner_account_id)
+            owner_account = next(
+                (
+                    item
+                    for item in context.accounts
+                    if item.account_id == controlled_object.owner_account_id
+                ),
+                None,
             )
-        elif surfaces:
-            for controlled_object in controlled_objects.values():
-                owner_identity = account_to_identity.get(
-                    controlled_object.owner_account_id
-                )
-                owner_account = next(
-                    (
-                        item
-                        for item in context.accounts
-                        if item.account_id == controlled_object.owner_account_id
+            if (
+                owner_identity is None
+                or owner_account is None
+                or not owner_account.controlled
+            ):
+                limitations.append("controlled_object_owner_unavailable")
+                diagnostic_codes.add("controlled_object_owner_unavailable")
+                continue
+            surface_id = _controlled_object_surface_id(
+                controlled_object,
+                context,
+                state,
+                target_id=target_id,
+            )
+            if surface_id is None:
+                limitations.append("controlled_object_surface_ambiguous")
+                diagnostic_codes.add("controlled_object_surface_ambiguous")
+                continue
+            evidence_id = stable_research_identifier(
+                "evidence",
+                state.research_id,
+                controlled_object.owner_account_id,
+                controlled_object.object_id,
+                "ownership",
+            )
+            evidence.append(
+                EvidenceArtifact(
+                    evidence_id=evidence_id,
+                    evidence_kind=EvidenceKind.imported,
+                    digest=digest_for(
+                        {
+                            "owner": controlled_object.owner_account_id,
+                            "object_type": controlled_object.object_type,
+                            "test_owned": True,
+                        }
                     ),
-                    None,
-                )
-                if (
-                    owner_identity is None
-                    or owner_account is None
-                    or not owner_account.controlled
-                ):
-                    limitations.append(
-                        "A controlled object owner was absent from the controlled account set."
-                    )
-                    continue
-                evidence_id = stable_research_identifier(
-                    "evidence",
-                    state.research_id,
-                    controlled_object.owner_account_id,
-                    controlled_object.object_id,
-                    "ownership",
-                )
-                evidence.append(
-                    EvidenceArtifact(
-                        evidence_id=evidence_id,
-                        evidence_kind=EvidenceKind.imported,
-                        digest=digest_for(
-                            {
-                                "owner": controlled_object.owner_account_id,
-                                "object_type": controlled_object.object_type,
-                                "test_owned": True,
-                            }
-                        ),
-                        summary=(
-                            "An owner-scoped authenticated collection returned this controlled resource."
-                            if controlled_object.ownership_basis
-                            == "owner_scoped_authenticated_collection"
-                            else "Controlled context records researcher-authorized test ownership."
-                        ),
-                        source_reference=(
-                            controlled_object.source_reference
-                            or stable_research_identifier(
-                                "controlled-object-source",
-                                controlled_object.owner_account_id,
-                                controlled_object.object_id,
-                            )
-                        ),
-                        observed_at=timestamp,
-                        provenance_id=provenance_id,
-                    )
-                )
-                objects.append(
-                    ResearchObject(
-                        object_id=stable_research_identifier(
-                            "object",
-                            target_id,
-                            controlled_object.object_type,
+                    summary=(
+                        "An owner-scoped authenticated collection returned this controlled resource."
+                        if controlled_object.ownership_basis
+                        == "owner_scoped_authenticated_collection"
+                        else "Controlled context records researcher-authorized test ownership."
+                    ),
+                    source_reference=(
+                        controlled_object.source_reference
+                        or stable_research_identifier(
+                            "controlled-object-source",
+                            controlled_object.owner_account_id,
                             controlled_object.object_id,
-                        ),
-                        target_id=target_id,
-                        surface_id=surfaces[0].surface_id,
-                        object_type=opaque_reference(
-                            controlled_object.object_type, "object-type"
-                        ),
-                        object_reference=opaque_reference(
-                            controlled_object.object_id, "object-reference"
-                        ),
-                        owner_identity_id=owner_identity,
-                        tenant_reference=(
-                            opaque_reference(controlled_object.tenant_id, "tenant")
-                            if controlled_object.tenant_id
-                            else None
-                        ),
-                        test_owned=True,
-                        parameter_references=controlled_object.parameter_ids,
-                        evidence_references=(evidence_id,),
-                        provenance_id=provenance_id,
-                    )
+                        )
+                    ),
+                    observed_at=timestamp,
+                    provenance_id=provenance_id,
                 )
+            )
+            objects.append(
+                ResearchObject(
+                    object_id=stable_research_identifier(
+                        "object",
+                        target_id,
+                        controlled_object.object_type,
+                        controlled_object.object_id,
+                    ),
+                    target_id=target_id,
+                    surface_id=surface_id,
+                    object_type=opaque_reference(
+                        controlled_object.object_type, "object-type"
+                    ),
+                    object_reference=opaque_reference(
+                        controlled_object.object_id, "object-reference"
+                    ),
+                    owner_identity_id=owner_identity,
+                    tenant_reference=(
+                        opaque_reference(controlled_object.tenant_id, "tenant")
+                        if controlled_object.tenant_id
+                        else None
+                    ),
+                    test_owned=True,
+                    parameter_references=controlled_object.parameter_ids,
+                    evidence_references=(evidence_id,),
+                    provenance_id=provenance_id,
+                )
+            )
+            diagnostic_codes.add("controlled_object_surface_bound")
 
         records = ControlledContextResearchRecords(
             identities=tuple(identities),
@@ -873,6 +984,7 @@ class ControlledContextResearchAdapter:
             evidence=tuple(evidence),
             provenance=(provenance,),
             limitations=tuple(sorted(set(limitations))),
+            diagnostic_codes=tuple(sorted(diagnostic_codes)),
         )
         reject_secret_material(
             records.model_dump(mode="json"),
@@ -894,6 +1006,9 @@ class ControlledContextResearchAdapter:
             ("provenance", "provenance_id"),
         ):
             payload[name] = _merge(getattr(state, name), getattr(records, name), field)
+        payload["diagnostic_codes"] = tuple(
+            sorted({*state.diagnostic_codes, *records.diagnostic_codes})
+        )
         return ResearchState.model_validate(payload)
 
     def adapt_acquired_objects(
