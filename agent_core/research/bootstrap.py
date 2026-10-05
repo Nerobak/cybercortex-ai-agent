@@ -23,6 +23,7 @@ from agent_core.controlled_context import (
     ControlledObject,
     OwnedObjectAcquirer,
     OwnedObjectAcquisitionError,
+    OwnedObjectAcquisitionTransportError,
 )
 from agent_core.credential_vault import CredentialVault
 from agent_core.hypothesis_engine import (
@@ -717,7 +718,9 @@ class ResearchBootstrapper:
         bundle = self._capture_cache.get(target.target_id) or self.capture_bundle
         captures = tuple(bundle.requests) if bundle is not None else ()
         before = self.request_budget.snapshot()
-        acquired, acquisition_limitations = self._acquire_objects(progress)
+        acquired, acquisition_limitations, acquisition_diagnostics = (
+            self._acquire_objects(progress)
+        )
         already_consumed = progress.request_delta.total if progress else 0
         acquisition_consumed = RequestDelta.from_snapshots(
             before, self.request_budget.snapshot()
@@ -770,6 +773,7 @@ class ResearchBootstrapper:
             occurred_at=self._now(adapted),
         )
         diagnostic_codes = set(adapted.diagnostic_codes)
+        diagnostic_codes.update(acquisition_diagnostics)
         if adapted.graphql_surfaces and not adapted.graphql_operations:
             diagnostic_codes.add("no_graphql_operation")
         if adapted.graphql_surfaces and not adapted.objects:
@@ -1033,18 +1037,20 @@ class ResearchBootstrapper:
 
     def _acquire_objects(
         self, progress: ResearchBootstrapProgress | None
-    ) -> tuple[tuple[ControlledObject, ...], tuple[str, ...]]:
+    ) -> tuple[tuple[ControlledObject, ...], tuple[str, ...], tuple[str, ...]]:
         if not self.controlled_context.object_acquisition:
-            return (), ()
+            return (), (), ()
         if self.object_acquisition_sender is None or self.vault is None:
             return (
                 (),
                 (
                     "Controlled object acquisition context is incomplete; no object identifier was invented.",
                 ),
+                (),
             )
-        output = []
-        limitations = []
+        output: list[ControlledObject] = []
+        limitations: list[str] = []
+        diagnostics: set[str] = set()
         existing = {
             (item.owner_account_id, item.object_type)
             for item in self.controlled_context.objects
@@ -1072,18 +1078,28 @@ class ResearchBootstrapper:
                 )
                 continue
             try:
+                before_attempt = self.request_budget.total
                 account = self.controlled_context.account(config.owner_account_id)
                 output.append(
                     OwnedObjectAcquirer(self.vault, self.request_budget).acquire(
                         account, config, self.object_acquisition_sender
                     )
                 )
-                remaining -= 1
+            except OwnedObjectAcquisitionTransportError as exc:
+                diagnostics.add(exc.diagnostic_code)
+                limitations.append(str(exc))
             except (KeyError, OwnedObjectAcquisitionError, RequestBudgetExceeded):
                 limitations.append(
                     "A bounded controlled object could not be acquired; missing context was retained."
                 )
-        return tuple(output), tuple(sorted(set(limitations)))
+            finally:
+                consumed = self.request_budget.total - before_attempt
+                remaining = max(0, remaining - consumed)
+        return (
+            tuple(output),
+            tuple(sorted(set(limitations))),
+            tuple(sorted(diagnostics)),
+        )
 
     def _discover_controlled_objects(
         self,

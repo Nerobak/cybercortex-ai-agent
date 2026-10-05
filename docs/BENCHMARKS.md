@@ -66,3 +66,41 @@ provenance and usage continue to come from the router's authoritative ledger.
 
 P4-1I.1 constructs and tests this fixture only. It does not run CyberCortex
 against the target and does not invoke any model provider.
+
+### Single-run lab preflight
+
+For the next blind run, the operator must use the run-exclusive paths
+`/tmp/p4-1i8-graphql-lab.pid` and `/tmp/p4-1i8-graphql-lab.log`. If either path
+already exists, preserve it and stop rather than overwriting prior evidence.
+Start exactly one Uvicorn process with the reviewed application, explicit
+loopback host, and port 8765, append all output to the log, and write its PID to
+the PID file.
+
+```shell
+test ! -e /tmp/p4-1i8-graphql-lab.pid
+test ! -e /tmp/p4-1i8-graphql-lab.log
+nohup python -m uvicorn agent_core.benchmark.graphql_lab:app \
+  --host 127.0.0.1 --port 8765 \
+  >>/tmp/p4-1i8-graphql-lab.log 2>&1 &
+printf '%s\n' "$!" >/tmp/p4-1i8-graphql-lab.pid
+```
+
+If either `test` or either startup command fails, stop and do not invoke the
+benchmark. Do not truncate, replace, or delete the PID or log after startup.
+
+Immediately before the one permitted benchmark invocation, run:
+
+```shell
+python -m agent_core.benchmark.lab_preflight \
+  --pid-file /tmp/p4-1i8-graphql-lab.pid \
+  --log-file /tmp/p4-1i8-graphql-lab.log
+```
+
+The preflight fails closed unless the PID and log files exist, the PID is live,
+its command is the expected GraphQL lab Uvicorn command, and that PID owns the
+TCP 8765 listener. It then makes exactly one non-redirecting `/healthz` request
+and verifies that the same PID remains alive and still owns the listener. Any
+startup, health, PID, command, or listener failure means **stop without running
+the benchmark**. A successful preflight authorizes no retry and no extra health
+request; proceed immediately to the single run using research ID
+`graphql-blind-04` and run ID `graphql-blind-run-04`.

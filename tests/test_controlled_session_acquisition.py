@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
 
 import agent
 import phase2_cli
@@ -16,6 +17,7 @@ from agent_core.controlled_context import (
     ControlledObject,
     OwnedObjectAcquirer,
     OwnedObjectAcquisition,
+    OwnedObjectAcquisitionTransportError,
     SessionAcquirer,
     SessionAcquisition,
     owned_object_acquisition_reference,
@@ -1566,6 +1568,96 @@ def test_owned_object_acquirer_builds_in_memory_test_owned_object():
             ownership_basis="owner_scoped_authenticated_collection",
             source_reference=owned_object_acquisition_reference(config),
         )
+        assert budget.snapshot()["discovery_requests"] == 1
+    finally:
+        vault.close()
+
+
+@pytest.mark.parametrize(
+    ("transport_failure", "diagnostic_code"),
+    (
+        (
+            requests.ConnectionError("private connection detail"),
+            "controlled_acquisition_transport_connection_failed",
+        ),
+        (
+            requests.Timeout("private timeout detail"),
+            "controlled_acquisition_transport_timeout",
+        ),
+        (
+            requests.RequestException("private protocol detail"),
+            "controlled_acquisition_transport_error",
+        ),
+    ),
+)
+def test_owned_object_acquirer_normalizes_expected_transport_failures_once(
+    transport_failure,
+    diagnostic_code,
+):
+    vault = CredentialVault()
+    account = _token_account(vault, "alice", ALICE_TOKEN)
+    config = OwnedObjectAcquisition(
+        owner_account_id="alice",
+        collection_url="https://authorized.example/api/orders",
+        object_type="order",
+        identifier_field="order_id",
+    )
+    budget = RequestBudget(2)
+
+    class BudgetedFailingSender:
+        manages_request_budget = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, request):
+            del request
+            self.calls += 1
+            budget.consume("discovery")
+            raise transport_failure
+
+    sender = BudgetedFailingSender()
+    try:
+        with pytest.raises(OwnedObjectAcquisitionTransportError) as exc_info:
+            OwnedObjectAcquirer(vault, budget).acquire(account, config, sender)
+
+        rendered = f"{exc_info.value!r} {exc_info.value}"
+        assert exc_info.value.diagnostic_code == diagnostic_code
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+        assert "private" not in rendered
+        assert "authorized.example" not in rendered
+        assert ALICE_TOKEN not in rendered
+        assert sender.calls == 1
+        assert budget.snapshot()["discovery_requests"] == 1
+        assert budget.total == 1
+    finally:
+        vault.close()
+
+
+def test_owned_object_acquirer_does_not_swallow_unexpected_sender_exception():
+    vault = CredentialVault()
+    account = _token_account(vault, "alice", ALICE_TOKEN)
+    config = OwnedObjectAcquisition(
+        owner_account_id="alice",
+        collection_url="https://authorized.example/api/orders",
+        object_type="order",
+        identifier_field="order_id",
+    )
+    budget = RequestBudget(2)
+    calls = 0
+
+    def sender(request):
+        nonlocal calls
+        del request
+        calls += 1
+        raise TypeError("synthetic programming failure")
+
+    try:
+        with pytest.raises(TypeError, match="synthetic programming failure"):
+            OwnedObjectAcquirer(vault, budget).acquire(account, config, sender)
+
+        assert calls == 1
         assert budget.snapshot()["discovery_requests"] == 1
     finally:
         vault.close()

@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from pydantic import Field, field_validator
+from requests.exceptions import (
+    ConnectionError as RequestsConnectionError,
+    RequestException,
+    Timeout as RequestsTimeout,
+)
 
 from agent_core.agent_models import (
     AuthorizationAction,
@@ -473,6 +478,31 @@ class OwnedObjectAcquisitionError(ValueError):
     """Safe, secret-free failure raised while parsing an owned collection."""
 
 
+class OwnedObjectAcquisitionTransportError(OwnedObjectAcquisitionError):
+    """Expected sender failure normalized without retaining transport details."""
+
+    _REASONS = {
+        "controlled_acquisition_transport_connection_failed": (
+            "Controlled-object acquisition could not connect after one authorized "
+            "request attempt."
+        ),
+        "controlled_acquisition_transport_timeout": (
+            "Controlled-object acquisition timed out after one authorized request "
+            "attempt."
+        ),
+        "controlled_acquisition_transport_error": (
+            "Controlled-object acquisition transport failed after one authorized "
+            "request attempt."
+        ),
+    }
+
+    def __init__(self, diagnostic_code: str) -> None:
+        if diagnostic_code not in self._REASONS:
+            raise ValueError("unsupported controlled-acquisition transport diagnostic")
+        self.diagnostic_code = diagnostic_code
+        super().__init__(self._REASONS[diagnostic_code])
+
+
 class OwnedObjectAcquirer:
     """Acquire one bounded object from an authenticated controlled-owner source."""
 
@@ -506,14 +536,26 @@ class OwnedObjectAcquirer:
 
         if not getattr(sender, "manages_request_budget", False):
             self.budget.consume("discovery")
-        response = sender(
-            {
-                "method": config.method,
-                "url": config.collection_url,
-                "purpose": "owned_object_acquisition",
-                "headers": {"Authorization": f"Bearer {token}"},
-            }
-        )
+        transport_failure_code = None
+        try:
+            response = sender(
+                {
+                    "method": config.method,
+                    "url": config.collection_url,
+                    "purpose": "owned_object_acquisition",
+                    "headers": {"Authorization": f"Bearer {token}"},
+                }
+            )
+        except (RequestsTimeout, TimeoutError):
+            transport_failure_code = "controlled_acquisition_transport_timeout"
+        except (RequestsConnectionError, ConnectionError):
+            transport_failure_code = (
+                "controlled_acquisition_transport_connection_failed"
+            )
+        except RequestException:
+            transport_failure_code = "controlled_acquisition_transport_error"
+        if transport_failure_code is not None:
+            raise OwnedObjectAcquisitionTransportError(transport_failure_code)
         status_code = response.get("status_code")
         if not isinstance(status_code, int) or not 200 <= status_code < 300:
             raise OwnedObjectAcquisitionError(

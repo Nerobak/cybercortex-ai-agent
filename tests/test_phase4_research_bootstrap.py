@@ -685,6 +685,205 @@ def test_bootstrap_phase_reservation_preserves_controlled_acquisition_capacity(
         vault.close()
 
 
+@pytest.mark.parametrize(
+    ("transport_failure", "diagnostic_code"),
+    (
+        (
+            requests.ConnectionError("private connection detail"),
+            "controlled_acquisition_transport_connection_failed",
+        ),
+        (
+            requests.Timeout("private timeout detail"),
+            "controlled_acquisition_transport_timeout",
+        ),
+    ),
+)
+def test_bootstrap_persists_safe_controlled_acquisition_transport_failure(
+    tmp_path,
+    transport_failure,
+    diagnostic_code,
+):
+    store = ResearchStore(tmp_path / "bootstrap-acquisition-failure.sqlite3")
+    request_budget = RequestBudget(10, per_host_limit=10)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-bootstrap-acquisition-failure",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-bootstrap-acquisition-failure",
+        policy=policy(),
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+    vault = CredentialVault()
+    context = controlled(vault)
+    context.object_acquisition.append(
+        OwnedObjectAcquisition(
+            owner_account_id="account-a",
+            collection_url=f"{TARGET}/controlled-owned-resources",
+            object_type="Resource",
+            identifier_field="resourceRef",
+            items_field="items",
+            max_items=1,
+        )
+    )
+    calls = 0
+
+    def acquire_object(request):
+        nonlocal calls
+        del request
+        calls += 1
+        raise transport_failure
+
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=policy(),
+        controlled_context=context,
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        profile="authenticated",
+        tool_runner=FakeDiscoveryRunner(
+            request_budget, surface=discovery_surface(empty=True)
+        ),
+        vault=vault,
+        object_acquisition_sender=acquire_object,
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=6,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+    try:
+        runtime = FakeResearchRuntime(())
+        compiler = ExperimentCompiler(
+            context=ExperimentCompilerContext(current_time=NOW, execution_ready=True)
+        )
+        selector = ExperimentSelector(compiler, budgets)
+        orchestrator = SecurityResearchOrchestrator(
+            store=store,
+            compiler=compiler,
+            gate=FakeGate(),
+            selector=selector,
+            evaluator=ExperimentEvaluator(),
+            pivot_planner=PivotPlanner(selector),
+            budget_manager=budgets,
+            compiler_context=compiler.context,
+            runtime=runtime,
+            bootstrapper=bootstrapper,
+        )
+        result = orchestrator.run(initial.research_id)
+        state = result.state
+        persisted = store.load_research(initial.research_id)
+        serialized = persisted.model_dump_json()
+
+        assert calls == 1
+        assert state == persisted
+        assert result.completed
+        assert result.stop_reason is OrchestratorStopReason.no_research_hypotheses
+        assert state.status is ResearchRunStatus.stopped
+        assert state.bootstrap_progress[0].modeling_completed
+        assert diagnostic_code in state.diagnostic_codes
+        assert state.bootstrap_progress[0].request_delta.total == 2
+        assert state.budgets[0].request_budget.consumed.total == 2
+        assert request_budget.total == 2
+        assert "private" not in serialized
+        assert SECRET_SENTINEL not in serialized
+        assert store.verify_integrity(initial.research_id).valid
+    finally:
+        vault.close()
+
+
+def test_bootstrap_preserves_successful_sibling_after_transport_failure(tmp_path):
+    store = ResearchStore(tmp_path / "bootstrap-acquisition-sibling.sqlite3")
+    request_budget = RequestBudget(12, per_host_limit=12)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-bootstrap-acquisition-sibling",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-bootstrap-acquisition-sibling",
+        policy=policy(),
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+    vault = CredentialVault()
+    context = controlled(vault)
+    context.object_acquisition.extend(
+        OwnedObjectAcquisition(
+            owner_account_id=account.account_id,
+            collection_url=f"{TARGET}/controlled-owned-resources",
+            object_type="Resource",
+            identifier_field="resourceRef",
+            items_field="items",
+            max_items=1,
+        )
+        for account in context.accounts
+    )
+    calls = 0
+
+    def acquire_object(request):
+        nonlocal calls
+        del request
+        calls += 1
+        if calls == 1:
+            return {
+                "status_code": 200,
+                "body": {"items": [{"resourceRef": "synthetic-owned-first"}]},
+            }
+        raise requests.ConnectionError("private sibling connection detail")
+
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=policy(),
+        controlled_context=context,
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        profile="authenticated",
+        tool_runner=FakeDiscoveryRunner(
+            request_budget, surface=discovery_surface(empty=True)
+        ),
+        vault=vault,
+        object_acquisition_sender=acquire_object,
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=8,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+    try:
+        state = bootstrapper.prepare(initial)
+        serialized = state.model_dump_json()
+
+        assert calls == 2
+        assert state.status is ResearchRunStatus.selecting_experiment
+        assert len(context.objects) == 1
+        assert len(state.objects) == 1
+        assert (
+            "controlled_acquisition_transport_connection_failed"
+            in state.diagnostic_codes
+        )
+        assert state.bootstrap_progress[0].request_delta.total == 3
+        assert state.budgets[0].request_budget.consumed.total == 3
+        assert request_budget.total == 3
+        assert "private sibling" not in serialized
+        assert SECRET_SENTINEL not in serialized
+        assert store.verify_integrity(initial.research_id).valid
+    finally:
+        vault.close()
+
+
 def test_bootstrap_authenticated_graphql_discovery_persists_only_differential_shape(
     tmp_path,
 ):
