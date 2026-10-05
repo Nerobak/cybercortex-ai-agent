@@ -753,6 +753,7 @@ class ExperimentCompiler:
             or template.graphql_surface_id != operation.graphql_surface_id
             or template.operation_type is not operation.operation_type
             or template.selection_fingerprint != operation.selection_fingerprint
+            or template.document_fingerprint != operation.document_fingerprint
             or template.normalized_structure.root_field_ids != operation.root_field_ids
             or semantic_surface.endpoint_id != template.endpoint_id
             or semantic_surface.surface_id != proposal.surface_id

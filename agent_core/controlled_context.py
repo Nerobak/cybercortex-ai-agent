@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from requests.exceptions import (
     ConnectionError as RequestsConnectionError,
     RequestException,
@@ -95,6 +95,12 @@ class OwnedObjectAcquisition(StrictModel):
     tenant_field: str | None = Field(default=None, min_length=1, max_length=200)
     items_field: str | None = Field(default=None, min_length=1, max_length=200)
     max_items: int = Field(default=20, ge=1, le=20)
+    registered_graphql_document_reference: str | None = Field(
+        default=None, min_length=1, max_length=255
+    )
+    graphql_object_variable: str | None = Field(
+        default=None, pattern=r"^[_A-Za-z][_0-9A-Za-z]{0,254}$"
+    )
 
     @field_validator("method")
     @classmethod
@@ -103,6 +109,20 @@ class OwnedObjectAcquisition(StrictModel):
         if not method or len(method) > 16 or not method.isalpha():
             raise ValueError("method must be a conventional HTTP method token")
         return method
+
+    @model_validator(mode="after")
+    def validate_graphql_registration(self) -> "OwnedObjectAcquisition":
+        if self.graphql_object_variable is not None and (
+            self.registered_graphql_document_reference is None
+        ):
+            raise ValueError(
+                "GraphQL object-variable evidence requires a registered document"
+            )
+        if self.registered_graphql_document_reference is not None and (
+            self.method != "POST"
+        ):
+            raise ValueError("registered GraphQL acquisition documents require POST")
+        return self
 
 
 def owned_object_acquisition_reference(config: OwnedObjectAcquisition) -> str:
@@ -534,18 +554,52 @@ class OwnedObjectAcquirer:
                 "The configured owner's session is not available."
             ) from exc
 
+        graphql_document = None
+        if config.registered_graphql_document_reference is not None:
+            if config.method != "POST":
+                raise OwnedObjectAcquisitionError(
+                    "A registered GraphQL acquisition document requires POST."
+                )
+            try:
+                graphql_document = self.vault.get(
+                    config.registered_graphql_document_reference
+                )
+            except (KeyError, RuntimeError) as exc:
+                raise OwnedObjectAcquisitionError(
+                    "The registered GraphQL acquisition document is unavailable."
+                ) from exc
+            from agent_core.research.graphql_ingest import (
+                GraphQLDocumentError,
+                parse_graphql_document,
+            )
+
+            try:
+                parsed_document = parse_graphql_document(graphql_document)
+            except (GraphQLDocumentError, ValueError) as exc:
+                raise OwnedObjectAcquisitionError(
+                    "The registered GraphQL acquisition document is invalid."
+                ) from exc
+            if any(
+                operation.operation_type.value != "query"
+                for operation in parsed_document.operations
+            ):
+                raise OwnedObjectAcquisitionError(
+                    "Controlled GraphQL acquisition requires a read-only query."
+                )
+
         if not getattr(sender, "manages_request_budget", False):
             self.budget.consume("discovery")
         transport_failure_code = None
         try:
-            response = sender(
-                {
-                    "method": config.method,
-                    "url": config.collection_url,
-                    "purpose": "owned_object_acquisition",
-                    "headers": {"Authorization": f"Bearer {token}"},
-                }
-            )
+            request = {
+                "method": config.method,
+                "url": config.collection_url,
+                "purpose": "owned_object_acquisition",
+                "headers": {"Authorization": f"Bearer {token}"},
+            }
+            if graphql_document is not None:
+                request["json"] = {"query": graphql_document}
+            response = sender(request)
         except (RequestsTimeout, TimeoutError):
             transport_failure_code = "controlled_acquisition_transport_timeout"
         except (RequestsConnectionError, ConnectionError):

@@ -139,7 +139,7 @@ def build_registered_graphql_operation_template(
     operation_id: str,
     *,
     selection_paths: Sequence[Sequence[str]] | None = None,
-    variable_bindings: Sequence[GraphQLVariableBinding] = (),
+    variable_bindings: Sequence[GraphQLVariableBinding] | None = None,
     state_change_class: GraphQLExperimentStateChangeClass | None = None,
 ) -> RegisteredGraphQLOperationTemplate:
     """Build a stable typed registration from persisted semantic records."""
@@ -155,6 +155,22 @@ def build_registered_graphql_operation_template(
         for item in state.graphql_variables
         if item.operation_id == operation.operation_id
     }
+    if variable_bindings is None:
+        controlled_object_ids = {item.object_id for item in state.objects}
+        variable_bindings = tuple(
+            GraphQLVariableBinding(
+                variable_id=variable.variable_id,
+                argument_id=str(variable.linked_argument_id),
+                value_source=GraphQLVariableValueSource.controlled_object,
+                value_reference=variable.controlled_value_reference,
+            )
+            for variable in sorted(
+                variables.values(), key=lambda item: item.variable_id
+            )
+            if variable.linked_argument_id is not None
+            and variable.controlled_value_reference is not None
+            and variable.controlled_value_reference in controlled_object_ids
+        )
     argument_bindings = tuple(
         GraphQLArgumentBinding(
             argument_id=str(variable.linked_argument_id),
@@ -181,6 +197,7 @@ def build_registered_graphql_operation_template(
         {
             "operation_id": operation.operation_id,
             "selection_fingerprint": operation.selection_fingerprint,
+            "document_fingerprint": operation.document_fingerprint,
             "paths": [list(item.field_ids) for item in normalized.selection_paths],
             "bindings": [
                 item.model_dump(mode="json")
@@ -205,6 +222,7 @@ def build_registered_graphql_operation_template(
         variable_bindings=tuple(variable_bindings),
         argument_bindings=argument_bindings,
         selection_fingerprint=operation.selection_fingerprint,
+        document_fingerprint=operation.document_fingerprint,
         authentication_requirement=(
             operation.authentication_requirement
             if operation.authentication_requirement
@@ -454,6 +472,7 @@ class GraphQLExperimentCandidateBuilder:
             or semantic_surface.target_id != hypothesis.target_id
             or semantic_surface.surface_id != hypothesis.surface_id
             or operation.selection_fingerprint != template.selection_fingerprint
+            or operation.document_fingerprint != template.document_fingerprint
             or operation.operation_type is not template.operation_type
         ):
             return None
@@ -789,6 +808,7 @@ class GraphQLExperimentCandidateBuilder:
             "object_relationship": sorted(object_refs),
             "mutation_class": safe_mutation_id,
             "selection_fingerprint": template.selection_fingerprint,
+            "document_fingerprint": template.document_fingerprint,
         }
         seed = _digest(semantic)
         return ExperimentCandidate(

@@ -220,6 +220,8 @@ from agent_core.research.graphql_candidates import (
 from agent_core.research.graphql_readiness import (
     GRAPHQL_READINESS_VERSION,
     ControlledObjectDescriptor,
+    GraphQLObjectBindingBasis,
+    RegisteredGraphQLObjectBindingEvidence,
     candidate_ready_graphql_operation_templates,
     derive_candidate_ready_graphql_operations,
 )
@@ -257,6 +259,7 @@ from agent_core.research.graphql_discovery import (
     GraphQLProbeId,
     GraphQLProbeOutcome,
     GraphQLProbeStateChangeClass,
+    RegisteredGraphQLOperationSource,
     GraphQLSemanticAcquirer,
     GraphQLSurfaceDetector,
     GraphQLSurfaceObservation,
@@ -1040,6 +1043,7 @@ __all__ = [
     "GraphQLProbeId",
     "GraphQLProbeOutcome",
     "GraphQLProbeStateChangeClass",
+    "RegisteredGraphQLOperationSource",
     "GraphQLPublicPacketTooLarge",
     "GraphQLPublicSafeSummary",
     "GRAPHQL_REPRODUCTION_VERSION",
@@ -1083,6 +1087,8 @@ __all__ = [
     "GraphQLVariableBinding",
     "GraphQLVariableValueSource",
     "GraphQLVariableRecord",
+    "GraphQLObjectBindingBasis",
+    "RegisteredGraphQLObjectBindingEvidence",
     "GraphQLTraceEvent",
     "GRAPHQL_HYPOTHESIS_VERSION",
     "GRAPHQL_CANDIDATE_VERSION",

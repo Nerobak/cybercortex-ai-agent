@@ -303,6 +303,7 @@ class GraphQLDocumentRenderer:
             operation.graphql_surface_id != template.graphql_surface_id
             or operation.operation_type is not template.operation_type
             or operation.selection_fingerprint != template.selection_fingerprint
+            or operation.document_fingerprint != template.document_fingerprint
             or operation.operation_name is None
             or operation.operation_type is GraphQLOperationType.subscription
         ):

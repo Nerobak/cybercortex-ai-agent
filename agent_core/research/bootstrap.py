@@ -24,6 +24,7 @@ from agent_core.controlled_context import (
     OwnedObjectAcquirer,
     OwnedObjectAcquisitionError,
     OwnedObjectAcquisitionTransportError,
+    owned_object_acquisition_reference,
 )
 from agent_core.credential_vault import CredentialVault
 from agent_core.hypothesis_engine import (
@@ -46,6 +47,7 @@ from agent_core.research.adapters import (
     ControlledContextResearchAdapter,
     adapt_model_hypotheses,
     adapt_surface_hypotheses,
+    digest_for,
     opaque_reference,
     stable_research_identifier,
 )
@@ -63,7 +65,12 @@ from agent_core.research.graphql_discovery import (
     GraphQLAuthenticatedDiscovery,
     GraphQLDiscoveryConfig,
     GraphQLDiscoverySession,
+    RegisteredGraphQLOperationSource,
     GraphQLSemanticAcquirer,
+)
+from agent_core.research.graphql_ingest import (
+    GraphQLDocumentError,
+    parse_graphql_document,
 )
 from agent_core.research.graphql_hypotheses import (
     GraphQLHypothesisGenerator,
@@ -71,6 +78,8 @@ from agent_core.research.graphql_hypotheses import (
 )
 from agent_core.research.graphql_readiness import (
     ControlledObjectDescriptor,
+    GraphQLObjectBindingBasis,
+    RegisteredGraphQLObjectBindingEvidence,
     candidate_ready_graphql_operation_templates,
     derive_candidate_ready_graphql_operations,
 )
@@ -752,6 +761,9 @@ class ResearchBootstrapper:
             occurred_at=self._now(state),
         )
         adapted = self._context_adapter.apply(state, context_records)
+        adapted, operation_bindings, operation_limitations = (
+            self._register_controlled_acquisition_operations(adapted, target, acquired)
+        )
         graphql_limitations: tuple[str, ...] = ()
         if bundle is not None:
             graphql_result = self.graphql_acquirer.acquire(
@@ -771,6 +783,7 @@ class ResearchBootstrapper:
             adapted,
             self._controlled_object_descriptors(adapted),
             occurred_at=self._now(adapted),
+            binding_evidence=operation_bindings,
         )
         diagnostic_codes = set(adapted.diagnostic_codes)
         diagnostic_codes.update(acquisition_diagnostics)
@@ -825,6 +838,7 @@ class ResearchBootstrapper:
             limitations=(
                 *context_records.limitations,
                 *acquisition_limitations,
+                *operation_limitations,
                 *authenticated_limitations,
                 *graphql_limitations,
                 *authenticated_graphql_limitations,
@@ -1069,10 +1083,42 @@ class ResearchBootstrapper:
                     "Controlled object acquisition was deferred because the bootstrap request limit was exhausted."
                 )
                 break
-            decision = self.policy.authorize_url(
-                config.collection_url, method=config.method
+            registered_graphql_post = (
+                config.method == "POST"
+                and config.registered_graphql_document_reference is not None
             )
-            if not decision.allowed or config.method not in {"GET", "HEAD"}:
+            registered_document = None
+            if registered_graphql_post:
+                try:
+                    registered_document = parse_graphql_document(
+                        self.vault.get(config.registered_graphql_document_reference)
+                    )
+                except (KeyError, RuntimeError, GraphQLDocumentError, ValueError):
+                    limitations.append(
+                        "A registered controlled GraphQL acquisition document could "
+                        "not be normalized."
+                    )
+                    continue
+                if any(
+                    operation.operation_type.value != "query"
+                    for operation in registered_document.operations
+                ):
+                    limitations.append(
+                        "A controlled GraphQL acquisition document was not read-only."
+                    )
+                    continue
+            decision = (
+                self.policy.authorize_semantically_read_only_url(
+                    config.collection_url, method=config.method
+                )
+                if registered_document is not None
+                else self.policy.authorize_url(
+                    config.collection_url, method=config.method
+                )
+            )
+            if not decision.allowed or (
+                config.method not in {"GET", "HEAD"} and not registered_graphql_post
+            ):
                 limitations.append(
                     "A controlled object acquisition rule was outside current policy."
                 )
@@ -1100,6 +1146,151 @@ class ResearchBootstrapper:
             tuple(sorted(set(limitations))),
             tuple(sorted(diagnostics)),
         )
+
+    def _register_controlled_acquisition_operations(
+        self,
+        state: ResearchState,
+        target: TargetAsset,
+        acquired: Sequence[ControlledObject],
+    ) -> tuple[
+        ResearchState,
+        tuple[RegisteredGraphQLObjectBindingEvidence, ...],
+        tuple[str, ...],
+    ]:
+        """Bridge successful registered GraphQL acquisitions into semantics."""
+
+        if self.vault is None:
+            return state, (), ()
+        acquired_by_source = {
+            item.source_reference: item
+            for item in acquired
+            if item.source_reference is not None
+        }
+        current = state
+        parsed_by_reference = {}
+        limitations: set[str] = set()
+        for config in self.controlled_context.object_acquisition:
+            document_reference = config.registered_graphql_document_reference
+            acquisition_reference = owned_object_acquisition_reference(config)
+            if (
+                document_reference is None
+                or acquisition_reference not in acquired_by_source
+            ):
+                continue
+            try:
+                parsed = parse_graphql_document(self.vault.get(document_reference))
+            except (KeyError, RuntimeError, GraphQLDocumentError, ValueError):
+                limitations.add(
+                    "A registered controlled GraphQL acquisition document could not "
+                    "be normalized."
+                )
+                continue
+            identity = next(
+                (
+                    item
+                    for item in current.identities
+                    if item.account_reference
+                    == opaque_reference(config.owner_account_id, "account")
+                ),
+                None,
+            )
+            result = self.graphql_acquirer.register_operations(
+                current,
+                (
+                    RegisteredGraphQLOperationSource(
+                        endpoint_url=config.collection_url,
+                        method="POST",
+                        source_kind="registered_graphql_acquisition",
+                        source_reference=acquisition_reference,
+                        document=parsed,
+                        identity_id=(identity.identity_id if identity else None),
+                    ),
+                ),
+                target_id=target.target_id,
+                occurred_at=self._now(current),
+            )
+            current = result.delta.apply(current)
+            limitations.update(result.limitations)
+            parsed_by_reference[acquisition_reference] = (config, parsed)
+
+        bindings: list[RegisteredGraphQLObjectBindingEvidence] = []
+        for acquisition_reference, (config, parsed) in sorted(
+            parsed_by_reference.items()
+        ):
+            if config.graphql_object_variable is None:
+                continue
+            controlled = acquired_by_source[acquisition_reference]
+            research_object = next(
+                (
+                    item
+                    for item in current.objects
+                    if item.object_reference
+                    == opaque_reference(controlled.object_id, "object-reference")
+                    and item.owner_identity_id
+                    == next(
+                        (
+                            identity.identity_id
+                            for identity in current.identities
+                            if identity.account_reference
+                            == opaque_reference(controlled.owner_account_id, "account")
+                        ),
+                        None,
+                    )
+                ),
+                None,
+            )
+            operations = tuple(
+                item
+                for item in current.graphql_operations
+                if getattr(item, "document_fingerprint", None)
+                in {
+                    digest_for(operation.model_dump(mode="json"))
+                    for operation in parsed.operations
+                }
+            )
+            variables = tuple(
+                variable
+                for operation in operations
+                for variable in current.graphql_variables
+                if variable.operation_id == operation.operation_id
+                and variable.name == config.graphql_object_variable
+                and variable.linked_argument_id is not None
+            )
+            if research_object is None or len(variables) != 1:
+                continue
+            variable = variables[0]
+            operation = next(
+                item
+                for item in operations
+                if item.operation_id == variable.operation_id
+            )
+            semantic_surface = next(
+                item
+                for item in current.graphql_surfaces
+                if item.graphql_surface_id == operation.graphql_surface_id
+            )
+            bindings.append(
+                RegisteredGraphQLObjectBindingEvidence(
+                    operation_id=operation.operation_id,
+                    variable_id=variable.variable_id,
+                    argument_id=str(variable.linked_argument_id),
+                    controlled_object_id=research_object.object_id,
+                    binding_basis=(
+                        GraphQLObjectBindingBasis.explicit_cross_surface_relationship
+                        if research_object.surface_id != semantic_surface.surface_id
+                        else GraphQLObjectBindingBasis.registered_graphql_acquisition
+                    ),
+                    evidence_references=tuple(
+                        sorted(
+                            {
+                                *operation.evidence_references,
+                                *research_object.evidence_references,
+                            }
+                        )
+                    ),
+                )
+            )
+        return current, tuple(bindings), tuple(sorted(limitations))
 
     def _discover_controlled_objects(
         self,

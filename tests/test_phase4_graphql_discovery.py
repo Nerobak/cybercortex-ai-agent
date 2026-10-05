@@ -5,6 +5,7 @@ from typing import Any
 
 import requests
 
+from agent_core.capture_ingest import CaptureBundle, CapturedRequest
 from agent_core.controlled_context import ControlledAccount, ControlledContext
 from agent_core.credential_vault import CredentialVault
 from agent_core.policy import AssessmentPolicy, ScopeAsset
@@ -64,6 +65,34 @@ def response(
     result._content = json.dumps(payload).encode("utf-8")
     result._content_consumed = True
     return result
+
+
+def capture_documents(
+    vault: CredentialVault, *documents: tuple[str, str], url: str = ENDPOINT
+) -> CaptureBundle:
+    requests = []
+    for name, document in documents:
+        requests.append(
+            CapturedRequest(
+                request_id=f"capture-{name.casefold()}",
+                source_format="graphql",
+                source_ref="synthetic-authorized-capture",
+                method="POST",
+                url=url,
+                path="/api/gql",
+                body_type="graphql",
+                graphql_operation=name,
+                graphql_operation_type="query",
+                execution_body_ref=vault.put(
+                    document, label=f"captured-graphql-{name.casefold()}"
+                ),
+            )
+        )
+    return CaptureBundle(
+        source_format="graphql",
+        source_ref="synthetic-authorized-capture",
+        requests=requests,
+    )
 
 
 def session_for(
@@ -398,17 +427,13 @@ def test_semantic_acquirer_is_passive_first_when_document_evidence_is_sufficient
     from test_phase4_graphql_semantics import semantic_state
 
     state = semantic_state()
+    vault = CredentialVault()
     result = acquirer.acquire(
         state,
-        [
-            {
-                "url": ENDPOINT,
-                "query": "query Viewer { viewer { id } }",
-                "source_reference": "capture:viewer",
-            }
-        ],
+        capture_documents(vault, ("Viewer", "query Viewer { viewer { id } }")),
         target_id="target-1",
         target_url=TARGET,
+        vault=vault,
         occurred_at="2026-09-29T12:00:00+00:00",
     )
     enriched = result.delta.apply(state)
@@ -426,22 +451,17 @@ def test_semantic_acquirer_preserves_multiple_documents_from_one_endpoint():
     from test_phase4_graphql_semantics import semantic_state
 
     state = semantic_state()
+    vault = CredentialVault()
     result = GraphQLSemanticAcquirer().acquire(
         state,
-        [
-            {
-                "url": ENDPOINT,
-                "query": "query FirstObserved { firstObserved { id } }",
-                "source_reference": "capture:first",
-            },
-            {
-                "url": ENDPOINT,
-                "query": "query SecondObserved { secondObserved { id } }",
-                "source_reference": "capture:second",
-            },
-        ],
+        capture_documents(
+            vault,
+            ("FirstObserved", "query FirstObserved { firstObserved { id } }"),
+            ("SecondObserved", "query SecondObserved { secondObserved { id } }"),
+        ),
         target_id="target-1",
         target_url=TARGET,
+        vault=vault,
         occurred_at="2026-09-29T12:00:00+00:00",
     )
     enriched = result.delta.apply(state)
@@ -612,17 +632,17 @@ def test_restart_enriches_a_persisted_partial_surface_without_protocol_reprobe()
     from test_phase4_graphql_semantics import semantic_state
 
     initial = semantic_state()
+    vault = CredentialVault()
     partial_result = GraphQLSemanticAcquirer().acquire(
         initial,
-        [
-            {
-                "url": TARGET + "/restart/graphql",
-                "query": "query Restarted { restarted { id } }",
-                "source_reference": "capture:restart",
-            }
-        ],
+        capture_documents(
+            vault,
+            ("Restarted", "query Restarted { restarted { id } }"),
+            url=TARGET + "/restart/graphql",
+        ),
         target_id="target-1",
         target_url=TARGET,
+        vault=vault,
         occurred_at="2026-09-29T12:00:00+00:00",
     )
     persisted = partial_result.delta.apply(initial)

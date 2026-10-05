@@ -503,6 +503,103 @@ def test_blind_bootstrap_passively_populates_graphql_semantics_and_graph(tmp_pat
         vault.close()
 
 
+def test_bootstrap_registers_controlled_graphql_acquisition_before_readiness(tmp_path):
+    store = ResearchStore(tmp_path / "registered-graphql-acquisition.sqlite3")
+    request_budget = RequestBudget(10, per_host_limit=10)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    selected_policy = policy(allow_graphql=True)
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-registered-graphql-acquisition",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-registered-graphql-acquisition",
+        policy=selected_policy,
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+    vault = CredentialVault()
+    context = controlled(vault)
+    document = "query OwnedResources { ownedResources { resourceRef } }"
+    document_reference = vault.put(document, label="registered-graphql-acquisition")
+    context.object_acquisition.append(
+        OwnedObjectAcquisition(
+            owner_account_id="account-a",
+            collection_url=f"{TARGET}/api/gql",
+            method="POST",
+            object_type="Resource",
+            identifier_field="resourceRef",
+            items_field="items",
+            registered_graphql_document_reference=document_reference,
+        )
+    )
+
+    class GraphQLSurfaceRunner(FakeDiscoveryRunner):
+        def run(self, target, **kwargs):
+            result = super().run(target, **kwargs)
+            result["observed_candidates"] = [
+                {
+                    "url": f"{TARGET}/api/gql",
+                    "method": "POST",
+                    "response": {"data": {"__typename": "Query"}},
+                }
+            ]
+            return result
+
+    wire_requests = []
+
+    def acquire_object(request):
+        wire_requests.append(request)
+        return {
+            "status_code": 200,
+            "body": {"items": [{"resourceRef": "controlled-wire-value"}]},
+        }
+
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=selected_policy,
+        controlled_context=context,
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        profile="authenticated",
+        tool_runner=GraphQLSurfaceRunner(
+            request_budget, surface=discovery_surface(empty=True)
+        ),
+        vault=vault,
+        object_acquisition_sender=acquire_object,
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=6,
+            maximum_graphql_discovery_requests=0,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+    try:
+        state = bootstrapper.prepare(initial)
+        templates = bootstrapper.compiler_context(
+            state, ExperimentCompilerContext(current_time=NOW)
+        ).graphql_operation_templates
+
+        assert request_budget.total == 2
+        assert len(wire_requests) == 1
+        assert wire_requests[0]["json"] == {"query": document}
+        assert len(state.objects) == 1
+        assert len(state.graphql_operations) == 1
+        assert state.graphql_operations[0].operation_name == "OwnedResources"
+        assert state.graphql_operations[0].document_fingerprint is not None
+        assert len(templates) == 1
+        assert "graphql_readiness_operation_ready" in state.diagnostic_codes
+        assert state.bootstrap_progress[0].model_usage_delta.attempted_calls == 0
+        assert store.verify_integrity(state.research_id).valid
+    finally:
+        vault.close()
+
+
 def test_blind_bootstrap_uses_one_registered_probe_for_a_path_only_candidate(
     tmp_path,
 ):

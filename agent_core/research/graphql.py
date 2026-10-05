@@ -374,6 +374,7 @@ class RegisteredGraphQLOperationTemplate(ResearchContract):
         default=(), max_length=MAX_GRAPHQL_VARIABLES_PER_OPERATION
     )
     selection_fingerprint: Sha256Digest
+    document_fingerprint: Sha256Digest | None = None
     authentication_requirement: GraphQLAuthenticationRequirement
     state_change_class: GraphQLExperimentStateChangeClass
     workflow_id: WorkflowId | None = None
@@ -779,6 +780,7 @@ class GraphQLOperationRecord(ResearchContract):
         default=(), max_length=MAX_GRAPHQL_VARIABLES_PER_OPERATION
     )
     selection_fingerprint: Sha256Digest
+    document_fingerprint: Sha256Digest | None = None
     authentication_requirement: GraphQLAuthenticationRequirement = (
         GraphQLAuthenticationRequirement.unknown
     )
@@ -1442,6 +1444,7 @@ def _merge_semantic_record(left: Any, right: Any, identifier: str) -> Any:
             "operation_type",
             "operation_name",
             "selection_fingerprint",
+            "document_fingerprint",
             "workflow_id",
         ):
             if getattr(left, name) != getattr(right, name):
@@ -1635,6 +1638,15 @@ def build_graphql_graph_assertions(
     fields = {item.field_id: item for item in state.graphql_fields}
     arguments = {item.argument_id: item for item in state.graphql_arguments}
     variables = {item.variable_id: item for item in state.graphql_variables}
+    objects = {item.object_id: item for item in state.objects}
+    semantic_surfaces = {
+        item.graphql_surface_id: item for item in state.graphql_surfaces
+    }
+    registered_binding_provenance = {
+        item.provenance_id
+        for item in state.provenance
+        if item.producer_name == "graphql-registered-operation-binding"
+    }
 
     for item in state.graphql_types:
         add(
@@ -1753,6 +1765,27 @@ def build_graphql_graph_assertions(
                 item.evidence_references,
                 item.provenance_id,
             )
+            controlled_object = objects.get(semantics.research_object_id)
+            semantic_surface = semantic_surfaces.get(owner.graphql_surface_id)
+            if (
+                controlled_object is not None
+                and semantic_surface is not None
+                and controlled_object.surface_id != semantic_surface.surface_id
+                and item.provenance_id in registered_binding_provenance
+            ):
+                for relation in (
+                    ResearchPredicate.references_same_object,
+                    ResearchPredicate.crosses_surface,
+                ):
+                    add(
+                        EntityKind.graphql_argument,
+                        item.argument_id,
+                        relation,
+                        EntityKind.object,
+                        controlled_object.object_id,
+                        item.evidence_references,
+                        item.provenance_id,
+                    )
         if item.parameter_id is not None:
             add(
                 EntityKind.graphql_argument,
@@ -1899,6 +1932,7 @@ class GraphQLPublicOperationSummary(ResearchContract):
     root_field_ids: tuple[GraphQLFieldId, ...]
     variable_ids: tuple[GraphQLVariableId, ...]
     selection_fingerprint: Sha256Digest
+    document_fingerprint: Sha256Digest | None
     authentication_requirement: GraphQLAuthenticationRequirement
     state_change_class: GraphQLStateChangeClass
     evidence_references: tuple[EvidenceArtifactId, ...]
@@ -2017,6 +2051,7 @@ def build_public_safe_graphql_summary(
                 "root_field_ids": item.root_field_ids,
                 "variable_ids": item.variable_ids,
                 "selection_fingerprint": item.selection_fingerprint,
+                "document_fingerprint": item.document_fingerprint,
                 "authentication_requirement": item.authentication_requirement,
                 "state_change_class": item.state_change_class,
                 "evidence_references": item.evidence_references,

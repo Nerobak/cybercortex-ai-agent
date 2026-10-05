@@ -2251,6 +2251,9 @@ class GraphQLSemanticIngestor:
                     root_field_ids=operation_roots,
                     variable_ids=tuple(operation_variable_ids),
                     selection_fingerprint=parsed_operation.selection_fingerprint,
+                    document_fingerprint=digest_for(
+                        parsed_operation.model_dump(mode="json")
+                    ),
                     authentication_requirement=auth_requirement,
                     state_change_class=(
                         GraphQLStateChangeClass.read_only

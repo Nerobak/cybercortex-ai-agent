@@ -795,6 +795,7 @@ def _validate_current_semantics(
         or source_template.graphql_surface_id != surface.graphql_surface_id
         or source_template.endpoint_id != surface.endpoint_id
         or source_template.selection_fingerprint != operation.selection_fingerprint
+        or source_template.document_fingerprint != operation.document_fingerprint
     ):
         raise ReproductionPlanningError("graphql_schema_changed_replan_required")
     registered_fields = {
@@ -1115,6 +1116,7 @@ def validate_graphql_reproduction_context(
             or template.graphql_surface_id != plan.graphql_surface_id
             or template.endpoint_id != plan.endpoint_id
             or template.selection_fingerprint != plan.graphql_selection_fingerprint
+            or template.document_fingerprint != operation.document_fingerprint
         ):
             raise ReproductionPlanningError("graphql_schema_changed_replan_required")
     registered_fields = {
@@ -1298,6 +1300,7 @@ def _equivalent_template_option(
             and item.graphql_surface_id == source_template.graphql_surface_id
             and item.endpoint_id == source_template.endpoint_id
             and item.selection_fingerprint == source_template.selection_fingerprint
+            and item.document_fingerprint == source_template.document_fingerprint
             and item.normalized_structure == source_template.normalized_structure
             and item.argument_bindings == source_template.argument_bindings
             and item.state_change_class is source_template.state_change_class

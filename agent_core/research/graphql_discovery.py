@@ -11,7 +11,7 @@ import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from pydantic import (
@@ -137,6 +137,31 @@ class GraphQLDetectedDocument(ResearchContract):
     response: GraphQLResponseObservation | None = None
 
 
+class RegisteredGraphQLOperationSource(ResearchContract):
+    """A parsed document from one explicitly trusted, non-model operation source."""
+
+    endpoint_url: StrictStr = Field(min_length=1, max_length=2_048)
+    method: Literal["GET", "POST"] = "POST"
+    source_kind: Literal[
+        "registered_graphql_acquisition",
+        "registered_graphql_discovery",
+        "trusted_typed_operation",
+    ]
+    source_reference: StrictStr = Field(min_length=1, max_length=255)
+    document: ParsedGraphQLDocument
+    identity_id: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    response: GraphQLResponseObservation | None = None
+
+    @model_validator(mode="after")
+    def validate_safe_source(self) -> "RegisteredGraphQLOperationSource":
+        if _safe_url(self.endpoint_url, None) != self.endpoint_url:
+            raise ValueError("registered GraphQL endpoint must be a safe absolute URL")
+        reject_secret_material(
+            self.model_dump(mode="json"), location="registered GraphQL operation source"
+        )
+        return self
+
+
 class GraphQLDetectionBatch(ResearchContract):
     observations: tuple[GraphQLSurfaceObservation, ...] = Field(
         default=(), max_length=MAX_GRAPHQL_DISCOVERY_OBSERVATIONS
@@ -241,6 +266,8 @@ GRAPHQL_PROBE_REGISTRY: Mapping[GraphQLProbeId, GraphQLProbeDefinition] = {
         timeout_bound_seconds=10.0,
     ),
 }
+
+_REGISTERED_CAPTURE_AUTHORITY = object()
 
 
 class GraphQLDiscoveryProbe(ResearchContract):
@@ -445,6 +472,7 @@ class GraphQLSurfaceDetector:
                     parsed_document = parse_graphql_document(document_text)
                 except (GraphQLDocumentError, ValueError):
                     parsed_document = None
+            registered_operation_source = self._registered_operation_source(item)
             response_value = item.get("response")
             response: GraphQLResponseObservation | None = (
                 item.get("response_observation")
@@ -516,7 +544,9 @@ class GraphQLSurfaceDetector:
                     str(item["identity_id"]) if item.get("identity_id") else None
                 ),
                 request_document_digest=(
-                    parsed_document.document_digest if parsed_document else None
+                    parsed_document.document_digest
+                    if parsed_document is not None and registered_operation_source
+                    else None
                 ),
                 response_evidence_digest=(
                     response.evidence_digest if response else None
@@ -524,7 +554,7 @@ class GraphQLSurfaceDetector:
                 response_truncated=bool(response and response.truncated),
             )
             observations.append(observation)
-            if parsed_document is not None:
+            if parsed_document is not None and registered_operation_source:
                 documents.append(
                     GraphQLDetectedDocument(
                         observation_id=observation.observation_id,
@@ -533,6 +563,12 @@ class GraphQLSurfaceDetector:
                     )
                 )
         return self._deduplicate(observations, documents)
+
+    @staticmethod
+    def _registered_operation_source(item: Mapping[str, Any]) -> bool:
+        """Accept executable semantics only from an explicit trusted source."""
+
+        return item.get("_operation_authority") is _REGISTERED_CAPTURE_AUTHORITY
 
     @staticmethod
     def _bounded_entries(evidence: Any) -> list[dict[str, Any]]:
@@ -762,6 +798,7 @@ class GraphQLSurfaceDetector:
                 "content_type": getattr(
                     getattr(request, "response", None), "content_type", None
                 ),
+                "_operation_authority": _REGISTERED_CAPTURE_AUTHORITY,
             }
             body_reference = getattr(request, "execution_body_ref", None)
             if body_reference and vault is not None:
@@ -1097,6 +1134,113 @@ class GraphQLSemanticAcquirer:
         self.detector = detector or GraphQLSurfaceDetector()
         self.ingestor = ingestor or GraphQLSemanticIngestor()
         self.session = session
+
+    def register_operations(
+        self,
+        state: ResearchState,
+        sources: Sequence[RegisteredGraphQLOperationSource],
+        *,
+        target_id: str,
+        occurred_at: str | None = None,
+    ) -> GraphQLAcquisitionResult:
+        """Import trusted parsed operations without transport or model activity."""
+
+        deltas: list[GraphQLSemanticDelta] = []
+        observations: list[GraphQLSurfaceObservation] = []
+        limitations: set[str] = set()
+        target = next(
+            (item for item in state.targets if item.target_id == target_id), None
+        )
+        if target is None:
+            raise ValueError("registered GraphQL operation target is unavailable")
+        target_url = urlparse(target.canonical_reference)
+        for source in sources:
+            source_url = urlparse(source.endpoint_url)
+            if (
+                source_url.scheme != target_url.scheme
+                or source_url.netloc != target_url.netloc
+                or (
+                    target_url.path not in {"", "/"}
+                    and not source_url.path.startswith(
+                        target_url.path.rstrip("/") + "/"
+                    )
+                    and source_url.path != target_url.path
+                )
+            ):
+                limitations.add(
+                    "A registered GraphQL operation source was outside its canonical "
+                    "target boundary."
+                )
+                continue
+            if source.identity_id is not None and not any(
+                item.identity_id == source.identity_id
+                and item.controlled
+                and item.eligibility.value == "eligible"
+                for item in state.identities
+            ):
+                limitations.add(
+                    "A registered authenticated GraphQL operation lacked an eligible "
+                    "controlled identity."
+                )
+                continue
+            safe_digest_input = {
+                "endpoint_url": source.endpoint_url,
+                "method": source.method,
+                "source_kind": source.source_kind,
+                "source_reference": source.source_reference,
+                "document_digest": source.document.document_digest,
+                "identity_id": source.identity_id,
+            }
+            observation = GraphQLSurfaceObservation(
+                observation_id=stable_research_identifier(
+                    "graphql-observation",
+                    target_id,
+                    source.endpoint_url,
+                    source.source_reference,
+                    source.document.document_digest,
+                ),
+                target_id=target_id,
+                endpoint_url=source.endpoint_url,
+                method=source.method,
+                confidence=GraphQLDiscoveryConfidence.observed,
+                evidence_signals=(
+                    "graphql_document",
+                    "registered_graphql_operation",
+                ),
+                source_kind=source.source_kind,
+                source_reference=opaque_reference(
+                    source.source_reference, "graphql-source"
+                ),
+                evidence_digest=digest_for(safe_digest_input),
+                identity_id=source.identity_id,
+                request_document_digest=source.document.document_digest,
+                response_evidence_digest=(
+                    source.response.evidence_digest if source.response else None
+                ),
+                response_truncated=bool(source.response and source.response.truncated),
+            )
+            try:
+                deltas.append(
+                    self.ingestor.from_document(
+                        state,
+                        observation,
+                        source.document,
+                        occurred_at=occurred_at,
+                        response=source.response,
+                    )
+                )
+                observations.append(observation)
+            except (GraphQLDocumentError, ValueError):
+                limitations.add(
+                    "A registered GraphQL operation source was incompatible with "
+                    "canonical semantic state."
+                )
+        return GraphQLAcquisitionResult(
+            delta=GraphQLSemanticDelta.combine(deltas),
+            observations=tuple(observations),
+            request_delta=RequestDelta(),
+            limitations=tuple(sorted(limitations)),
+        )
 
     def acquire(
         self,

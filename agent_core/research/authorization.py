@@ -843,6 +843,7 @@ class ResearchExecutionGate:
             or template.graphql_surface_id != operation.graphql_surface_id
             or template.operation_type is not operation.operation_type
             or template.selection_fingerprint != operation.selection_fingerprint
+            or template.document_fingerprint != operation.document_fingerprint
             or template.endpoint_id != experiment.target.endpoint_id
         ):
             raise ContextMismatchError(ResearchAuthorizationErrorCode.context_mismatch)

@@ -16,14 +16,15 @@ from agent_core.research import (
     ExperimentCompiler,
     ExperimentCompilerContext,
     ExperimentRegistry,
-    GraphQLCandidateKind,
     GraphQLExperimentCandidateBuilder,
     GraphQLHypothesisGenerator,
+    GraphQLObjectBindingBasis,
     GraphQLObjectReferenceSemantics,
     Identity,
     IdentityEligibility,
     PublicSafeCandidatePacketBuilder,
     ResearchPredicate,
+    RegisteredGraphQLObjectBindingEvidence,
     ResearchBudgetManager,
     ResearchState,
     build_graphql_graph_assertions,
@@ -87,7 +88,26 @@ def _schema_without_controlled_objects() -> ResearchState:
     )
 
 
-def test_controlled_schema_evidence_becomes_candidate_ready_without_query_guessing():
+def _with_registered_operation(state: ResearchState) -> ResearchState:
+    registered = semantic_state()
+    return ResearchState.model_validate(
+        {
+            **state.model_dump(mode="python"),
+            "graphql_operations": tuple(
+                item.model_copy(
+                    update={"document_fingerprint": item.selection_fingerprint}
+                )
+                for item in registered.graphql_operations
+            ),
+            "graphql_variables": tuple(
+                item.model_copy(update={"controlled_value_reference": None})
+                for item in registered.graphql_variables
+            ),
+        }
+    )
+
+
+def test_schema_and_controlled_object_cannot_synthesize_registered_operation():
     base = semantic_state()
     schema_arguments = tuple(
         item.model_copy(
@@ -122,39 +142,11 @@ def test_controlled_schema_evidence_becomes_candidate_ready_without_query_guessi
         },
         occurred_at=TS,
     )
-    templates = candidate_ready_graphql_operation_templates(ready)
-    generation = GraphQLHypothesisGenerator().generate_result(ready)
-    prepared = ResearchState.model_validate(
-        {
-            **ready.model_dump(mode="python"),
-            "hypotheses": generation.hypotheses,
-            "provenance": (*ready.provenance, *generation.provenance),
-        }
-    )
-    context = ExperimentCompilerContext(
-        current_time=TS,
-        graphql_operation_templates=templates,
-        policy_reference="policy-graphql-readiness",
-    )
-    registry = ExperimentRegistry()
-    budgets = ResearchBudgetManager()
-    compiler = ExperimentCompiler(registry, context)
-    candidates = GraphQLExperimentCandidateBuilder(registry, budgets, compiler).build(
-        prepared, compiler_context=context
-    )
-
-    assert limitations == ()
-    assert len(ready.graphql_operations) == 1
-    assert len(ready.graphql_variables) == 1
-    assert len(templates) == 1
-    assert ready.graphql_operations[0].state_change_class.value == "read_only"
-    assert any(
-        item.graphql_candidate_kind is GraphQLCandidateKind.object_authorization
-        and item.controlled_object_id == base.objects[0].object_id
-        and item.ownership_evidence_references
-        and item.graphql_variable_bindings
-        for item in candidates
-    )
+    assert limitations == ("graphql_readiness_missing_registered_operation_evidence",)
+    assert ready.graphql_operations == ()
+    assert ready.graphql_variables == ()
+    assert candidate_ready_graphql_operation_templates(ready) == ()
+    assert GraphQLHypothesisGenerator().generate_result(ready).hypotheses == ()
 
 
 def test_multi_surface_controlled_acquisition_reaches_graphql_candidate_readiness():
@@ -203,8 +195,25 @@ def test_multi_surface_controlled_acquisition_reaches_graphql_candidate_readines
         for item in controlled.objects
     }
 
+    controlled = _with_registered_operation(controlled)
+    operation = controlled.graphql_operations[0]
+    variable = controlled.graphql_variables[0]
     ready, limitations = derive_candidate_ready_graphql_operations(
-        controlled, descriptors, occurred_at=TS
+        controlled,
+        descriptors,
+        occurred_at=TS,
+        binding_evidence=(
+            RegisteredGraphQLObjectBindingEvidence(
+                operation_id=operation.operation_id,
+                variable_id=variable.variable_id,
+                argument_id=str(variable.linked_argument_id),
+                controlled_object_id=controlled.objects[0].object_id,
+                binding_basis=(
+                    GraphQLObjectBindingBasis.explicit_cross_surface_relationship
+                ),
+                evidence_references=controlled.objects[0].evidence_references,
+            ),
+        ),
     )
     templates = candidate_ready_graphql_operation_templates(ready)
     graph = build_graphql_graph_assertions(ready, asserted_at=TS)
@@ -249,6 +258,68 @@ def test_multi_surface_controlled_acquisition_reaches_graphql_candidate_readines
     assert "Authorization" not in serialized_packet
 
 
+def test_name_only_cross_surface_match_cannot_bind_registered_operation():
+    schema_only = _schema_without_controlled_objects()
+    acquisition = OwnedObjectAcquisition(
+        owner_account_id="account-a",
+        collection_url=f"{TARGET}/resources/{{resourceRef}}",
+        object_type="Resource",
+        identifier_field="resourceRef",
+    )
+    context = ControlledContext(
+        accounts=[ControlledAccount(account_id="account-a")],
+        object_acquisition=[acquisition],
+    )
+    acquired = ControlledObject(
+        object_id="name-matches-but-is-not-evidence",
+        owner_account_id="account-a",
+        object_type="Resource",
+        ownership_basis="owner_scoped_authenticated_collection",
+        source_reference=owned_object_acquisition_reference(acquisition),
+    )
+    adapter = ControlledContextResearchAdapter()
+    records = adapter.adapt_acquired_objects(
+        (acquired,),
+        context,
+        schema_only,
+        policy=_controlled_policy(),
+        target_id="target-1",
+        occurred_at=TS,
+    )
+    controlled = _with_registered_operation(adapter.apply(schema_only, records))
+    operation = controlled.graphql_operations[0]
+    variable = controlled.graphql_variables[0]
+
+    ready, limitations = derive_candidate_ready_graphql_operations(
+        controlled,
+        {
+            controlled.objects[0].object_id: ControlledObjectDescriptor(
+                object_type="Resource", identifier_field="resourceRef"
+            )
+        },
+        occurred_at=TS,
+        binding_evidence=(
+            RegisteredGraphQLObjectBindingEvidence(
+                operation_id=operation.operation_id,
+                variable_id=variable.variable_id,
+                argument_id=str(variable.linked_argument_id),
+                controlled_object_id=controlled.objects[0].object_id,
+                binding_basis=GraphQLObjectBindingBasis.typed_object_relationship,
+                evidence_references=controlled.objects[0].evidence_references,
+            ),
+        ),
+    )
+
+    assert limitations == ()
+    assert ready.graphql_variables[0].controlled_value_reference is None
+    assert candidate_ready_graphql_operation_templates(ready)[0].variable_bindings == ()
+    assert not any(
+        item.relation is ResearchPredicate.references_same_object
+        and item.target.entity_id == controlled.objects[0].object_id
+        for item in build_graphql_graph_assertions(ready, asserted_at=TS)
+    )
+
+
 def test_graphql_acquisition_provenance_registers_stable_safe_operation_template():
     schema_only = _schema_without_controlled_objects()
     acquisition = OwnedObjectAcquisition(
@@ -257,6 +328,8 @@ def test_graphql_acquisition_provenance_registers_stable_safe_operation_template
         method="POST",
         object_type="Resource",
         identifier_field="resourceRef",
+        registered_graphql_document_reference="cred_synthetic_document",
+        graphql_object_variable="resourceRef",
     )
     context = ControlledContext(
         accounts=[ControlledAccount(account_id="account-a")],
@@ -282,6 +355,9 @@ def test_graphql_acquisition_provenance_registers_stable_safe_operation_template
     controlled = adapter.apply(schema_only, records)
     research_object = controlled.objects[0]
 
+    controlled = _with_registered_operation(controlled)
+    operation = controlled.graphql_operations[0]
+    variable = controlled.graphql_variables[0]
     ready, limitations = derive_candidate_ready_graphql_operations(
         controlled,
         {
@@ -290,6 +366,16 @@ def test_graphql_acquisition_provenance_registers_stable_safe_operation_template
             )
         },
         occurred_at=TS,
+        binding_evidence=(
+            RegisteredGraphQLObjectBindingEvidence(
+                operation_id=operation.operation_id,
+                variable_id=variable.variable_id,
+                argument_id=str(variable.linked_argument_id),
+                controlled_object_id=research_object.object_id,
+                binding_basis=GraphQLObjectBindingBasis.registered_graphql_acquisition,
+                evidence_references=research_object.evidence_references,
+            ),
+        ),
     )
     first = candidate_ready_graphql_operation_templates(ready)
     second = candidate_ready_graphql_operation_templates(ready)
@@ -377,5 +463,7 @@ def test_graphql_readiness_reports_missing_controlled_object_precisely():
     )
 
     assert ready.graphql_operations == ()
-    assert limitations == ("graphql_readiness_missing_controlled_object",)
-    assert ready.diagnostic_codes == ("graphql_readiness_missing_controlled_object",)
+    assert limitations == ("graphql_readiness_missing_registered_operation_evidence",)
+    assert ready.diagnostic_codes == (
+        "graphql_readiness_missing_registered_operation_evidence",
+    )

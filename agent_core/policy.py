@@ -361,6 +361,18 @@ class AssessmentPolicy(StrictModel):
             remaining_request_budget=decision.remaining_request_budget,
         )
 
+    def authorize_semantically_read_only_url(
+        self, url: str, *, method: str
+    ) -> PolicyDecision:
+        """Authorize a transport whose caller has proven read-only semantics.
+
+        This preserves every ordinary scope, method, authorization, exclusion,
+        and testing-window check. It only avoids inferring state change from an
+        HTTP verb, as required by registered read-only GraphQL queries.
+        """
+
+        return self._authorize_url_base(url, method=method)
+
     def authorize_oast(self, callback_url: str) -> PolicyDecision:
         """Authorize use of one exact callback host without widening target scope."""
         reasons: list[str] = []
