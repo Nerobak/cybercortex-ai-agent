@@ -1338,6 +1338,24 @@ def _merge_tuple(left: tuple[Any, ...], right: tuple[Any, ...]) -> tuple[Any, ..
     return tuple(by_json[key] for key in sorted(by_json))
 
 
+def _same_graphql_type_structure(
+    left: GraphQLTypeReference, right: GraphQLTypeReference
+) -> bool:
+    """Compare executable GraphQL type syntax without resolution metadata."""
+
+    return left.named_type == right.named_type and left.wrappers == right.wrappers
+
+
+def _more_resolved_graphql_type(
+    left: GraphQLTypeReference, right: GraphQLTypeReference
+) -> GraphQLTypeReference:
+    if not _same_graphql_type_structure(left, right):
+        raise GraphQLSemanticConflict("conflicting GraphQL type structure")
+    if left.unresolved_external and not right.unresolved_external:
+        return right
+    return left
+
+
 def _merge_semantic_record(left: Any, right: Any, identifier: str) -> Any:
     if type(left) is not type(right):
         raise GraphQLSemanticConflict(f"conflicting record types for {identifier}")
@@ -1412,16 +1430,34 @@ def _merge_semantic_record(left: Any, right: Any, identifier: str) -> Any:
                 left.authorization_semantics, right.authorization_semantics
             )
     elif isinstance(left, GraphQLArgumentRecord):
-        for name in ("field_id", "name", "default_presence", "parameter_id"):
+        for name in ("field_id", "name", "default_presence"):
             if getattr(left, name) != getattr(right, name):
                 raise GraphQLSemanticConflict(f"conflicting GraphQL argument {name}")
+        if (
+            left.parameter_id is not None
+            and right.parameter_id is not None
+            and left.parameter_id != right.parameter_id
+        ):
+            raise GraphQLSemanticConflict("conflicting GraphQL argument parameter_id")
+        if left.parameter_id is None:
+            payload["parameter_id"] = right.parameter_id
         if left.input_type != right.input_type:
-            if left.input_type.unresolved_external:
+            if _same_graphql_type_structure(left.input_type, right.input_type):
+                resolved = _more_resolved_graphql_type(
+                    left.input_type, right.input_type
+                )
+                payload["input_type"] = resolved
+                payload["nullable"] = resolved.nullable
+                payload["list_depth"] = resolved.list_depth
+            elif (
+                not left.input_type.unresolved_external
+                and not right.input_type.unresolved_external
+            ):
+                raise GraphQLSemanticConflict("conflicting GraphQL argument input type")
+            elif left.input_type.unresolved_external:
                 payload["input_type"] = right.input_type
                 payload["nullable"] = right.nullable
                 payload["list_depth"] = right.list_depth
-            elif not right.input_type.unresolved_external:
-                raise GraphQLSemanticConflict("conflicting GraphQL argument input type")
         payload["semantic_role"] = _merge_scalar(
             left.semantic_role,
             right.semantic_role,
@@ -1468,14 +1504,18 @@ def _merge_semantic_record(left: Any, right: Any, identifier: str) -> Any:
         for name in (
             "operation_id",
             "name",
-            "input_type",
-            "nullable",
-            "list_depth",
             "linked_argument_id",
             "controlled_value_reference",
         ):
             if getattr(left, name) != getattr(right, name):
                 raise GraphQLSemanticConflict(f"conflicting GraphQL variable {name}")
+        if left.input_type != right.input_type:
+            if not _same_graphql_type_structure(left.input_type, right.input_type):
+                raise GraphQLSemanticConflict("conflicting GraphQL variable input_type")
+            resolved = _more_resolved_graphql_type(left.input_type, right.input_type)
+            payload["input_type"] = resolved
+            payload["nullable"] = resolved.nullable
+            payload["list_depth"] = resolved.list_depth
         payload["semantic_role"] = _merge_scalar(
             left.semantic_role,
             right.semantic_role,

@@ -1191,6 +1191,30 @@ class GraphQLSemanticDelta(ResearchContract):
         semantic("graphql_arguments", self.arguments, "argument_id")
         semantic("graphql_operations", self.operations, "operation_id")
         semantic("graphql_variables", self.variables, "variable_id")
+        canonical_arguments = {
+            item.argument_id: item for item in payload["graphql_arguments"]
+        }
+        normalized_variables = []
+        for variable in payload["graphql_variables"]:
+            argument = (
+                canonical_arguments.get(variable.linked_argument_id)
+                if variable.linked_argument_id is not None
+                else None
+            )
+            if (
+                argument is not None
+                and variable.input_type.to_syntax() == argument.input_type.to_syntax()
+                and variable.input_type != argument.input_type
+            ):
+                variable = variable.model_copy(
+                    update={
+                        "input_type": argument.input_type,
+                        "nullable": argument.input_type.nullable,
+                        "list_depth": argument.input_type.list_depth,
+                    }
+                )
+            normalized_variables.append(variable)
+        payload["graphql_variables"] = tuple(normalized_variables)
         observations = {item.observation_id: item for item in state.observations}
         for item in (*self.auth_observations, *conflict_observations):
             observations.setdefault(item.observation_id, item)

@@ -69,6 +69,7 @@ from agent_core.research.graphql_discovery import (
     GraphQLSemanticAcquirer,
     PublicGraphQLOperationAcquirer,
     PublicGraphQLOperationAcquisitionConfig,
+    PublicGraphQLOperationValidationDiagnostic,
     RegisteredGraphQLOperationSource,
 )
 from agent_core.research.graphql_ingest import (
@@ -477,6 +478,9 @@ class ResearchBootstrapper:
                 )
             else:
                 state = current
+        except Exception as exc:
+            self._persist_fatal_bootstrap_failure(state, exc)
+            raise
         finally:
             self._restore_authoritative_budget()
         return state
@@ -1382,17 +1386,50 @@ class ResearchBootstrapper:
             surface_reference=surface.graphql_surface_id,
             method=endpoint.method.value,
         )
+        diagnostic_codes = self._public_graphql_diagnostic_codes(result.diagnostics)
         if not result.sources:
-            return state, result.limitations
+            return self._with_diagnostic_codes(
+                state, diagnostic_codes
+            ), result.limitations
         registered = self.graphql_acquirer.register_operations(
             state,
             result.sources,
             target_id=target.target_id,
             occurred_at=self._now(state),
         )
+        diagnostic_codes.update(
+            self._public_graphql_diagnostic_codes(registered.diagnostics)
+        )
         return (
-            registered.delta.apply(state),
+            self._with_diagnostic_codes(
+                registered.delta.apply(state), diagnostic_codes
+            ),
             tuple(sorted({*result.limitations, *registered.limitations})),
+        )
+
+    @staticmethod
+    def _public_graphql_diagnostic_codes(
+        diagnostics: Sequence[PublicGraphQLOperationValidationDiagnostic],
+    ) -> set[str]:
+        return {
+            code for diagnostic in diagnostics for code in diagnostic.persistence_codes
+        }
+
+    @staticmethod
+    def _with_diagnostic_codes(
+        state: ResearchState, diagnostic_codes: Sequence[str] | set[str]
+    ) -> ResearchState:
+        if not diagnostic_codes:
+            return state
+        required = tuple(sorted(set(diagnostic_codes)))[:100]
+        retained = tuple(
+            item for item in state.diagnostic_codes if item not in set(required)
+        )[: max(0, 100 - len(required))]
+        return ResearchState.model_validate(
+            {
+                **state.model_dump(mode="python"),
+                "diagnostic_codes": tuple(sorted((*required, *retained))),
+            }
         )
 
     def _discover_authenticated_graphql(
@@ -1609,6 +1646,99 @@ class ResearchBootstrapper:
             state=lifecycle,
             events=(event,),
             graph_assertions=tuple(new_assertions),
+        )
+
+    def _persist_fatal_bootstrap_failure(
+        self, state: ResearchState, exc: Exception
+    ) -> ResearchState:
+        """Checkpoint authoritative ledgers and terminalize an unexpected failure."""
+
+        current = self.store.load_research(state.research_id)
+        if current.status in {ResearchRunStatus.stopped, ResearchRunStatus.failed}:
+            return current
+        synchronized_budget = self.budget_manager.state(current)
+        progress = self._progress(current)
+        timestamp = self._now(current)
+        failure_progress = ResearchBootstrapProgress(
+            bootstrap_id=(
+                progress.bootstrap_id
+                if progress is not None
+                else stable_research_identifier(
+                    "bootstrap", current.research_id, self.target_id
+                )
+            ),
+            target_id=self.target_id,
+            discovery_plan_reference=(
+                progress.discovery_plan_reference if progress is not None else None
+            ),
+            discovery_completed=bool(progress and progress.discovery_completed),
+            modeling_completed=bool(progress and progress.modeling_completed),
+            hypothesizing_completed=bool(progress and progress.hypothesizing_completed),
+            request_delta=synchronized_budget.request_budget.consumed,
+            model_usage_delta=synchronized_budget.model_budget.usage,
+            started_at=progress.started_at
+            if progress is not None
+            else current.created_at,
+            updated_at=timestamp,
+            limitations=tuple(
+                sorted(
+                    (
+                        "bootstrap_unexpected_failure",
+                        *tuple(
+                            item
+                            for item in (
+                                progress.limitations if progress is not None else ()
+                            )
+                            if item != "bootstrap_unexpected_failure"
+                        )[:99],
+                    )
+                )
+            ),
+            provenance_id=self._transition_provenance(current),
+        )
+        exception_class = (
+            "".join(
+                character
+                for character in type(exc).__name__[:80]
+                if character.isalnum() or character in {"_", "-"}
+            )
+            or "Exception"
+        )
+        failure_diagnostic_codes = {
+            "bootstrap_failure",
+            "bootstrap_failure_stage_prepare",
+            "bootstrap_failure_code_unexpected_exception",
+            f"bootstrap_failure_exception_{exception_class}",
+            "bootstrap_failure_invariant_orchestration",
+        }
+        retained_diagnostic_codes = tuple(
+            item
+            for item in current.diagnostic_codes
+            if item not in failure_diagnostic_codes
+        )[: max(0, 100 - len(failure_diagnostic_codes))]
+        diagnostic_codes = {
+            *failure_diagnostic_codes,
+            *retained_diagnostic_codes,
+        }
+        budgets = {item.budget_reference: item for item in current.budgets}
+        budgets[synchronized_budget.budget_reference] = synchronized_budget
+        progresses = {item.bootstrap_id: item for item in current.bootstrap_progress}
+        progresses[failure_progress.bootstrap_id] = failure_progress
+        checkpoint = ResearchState.model_validate(
+            {
+                **current.model_dump(mode="python"),
+                "bootstrap_progress": tuple(
+                    progresses[key] for key in sorted(progresses)
+                ),
+                "budgets": tuple(budgets[key] for key in sorted(budgets)),
+                "diagnostic_codes": tuple(sorted(diagnostic_codes)),
+            }
+        )
+        return self._transition(
+            current,
+            ResearchRunStatus.failed,
+            "bootstrap_unexpected_failure",
+            replacement=checkpoint,
         )
 
     def _updated_progress(

@@ -432,6 +432,81 @@ def test_blind_bootstrap_discovers_models_hypothesizes_and_compiles(tmp_path):
         vault.close()
 
 
+def test_fatal_bootstrap_failure_checkpoints_ledgers_and_terminalizes(tmp_path):
+    store = ResearchStore(tmp_path / "fatal-bootstrap.sqlite3")
+    request_budget = RequestBudget(10, per_host_limit=10)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-fatal-bootstrap",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-fatal-bootstrap",
+        policy=policy(),
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+
+    class ThreeRequestRunner(FakeDiscoveryRunner):
+        def run(self, target, **kwargs):
+            result = super().run(target, **kwargs)
+            self.budget.consume("discovery", host="blind.example")
+            self.budget.consume("discovery", host="blind.example")
+            return result
+
+    class FailingSurfaceAdapter:
+        def adapt(self, *_args, **_kwargs):
+            raise RuntimeError(f"unexpected {SECRET_SENTINEL}")
+
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=policy(),
+        controlled_context=ControlledContext(),
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        tool_runner=ThreeRequestRunner(
+            request_budget, surface=discovery_surface(empty=True)
+        ),
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=6,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+    bootstrapper._surface_adapter = FailingSurfaceAdapter()
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        bootstrapper.prepare(initial)
+
+    persisted = store.load_research(initial.research_id)
+    serialized = persisted.model_dump_json()
+    with store.connect() as connection:
+        event = connection.execute(
+            "SELECT event_json FROM research_events "
+            "WHERE research_id=? ORDER BY event_sequence DESC LIMIT 1",
+            (initial.research_id,),
+        ).fetchone()
+
+    assert request_budget.total == 3
+    assert persisted.status is ResearchRunStatus.failed
+    assert persisted.bootstrap_progress[0].request_delta.total == 3
+    assert persisted.budgets[0].request_budget.consumed.total == 3
+    assert persisted.budgets[0].model_budget.usage.attempted_calls == 0
+    assert "bootstrap_failure_stage_prepare" in persisted.diagnostic_codes
+    assert "bootstrap_failure_exception_RuntimeError" in persisted.diagnostic_codes
+    event_payload = json.loads(event["event_json"])
+    assert event_payload["event_type"] == "research_failed"
+    assert event_payload["payload"]["reason_code"] == ("bootstrap_unexpected_failure")
+    assert SECRET_SENTINEL not in serialized
+    assert SECRET_SENTINEL not in event["event_json"]
+    assert store.verify_integrity(initial.research_id).valid
+
+
 def test_blind_bootstrap_passively_populates_graphql_semantics_and_graph(tmp_path):
     store = ResearchStore(tmp_path / "blind-graphql.sqlite3")
     request_budget = RequestBudget(10, per_host_limit=10)
@@ -560,14 +635,21 @@ def test_bootstrap_prioritizes_bounded_public_graphql_operation_source(tmp_path)
         response.headers["Content-Type"] = (
             "text/html" if url == TARGET else "application/javascript"
         )
-        response._content = (
-            b'<html><script src="/client.js"></script></html>'
-            if url == TARGET
-            else (
-                b"const viewerOperation = `query CurrentViewer "
-                b"{ viewer { id displayName } }`;"
+        if url == TARGET:
+            response._content = (
+                b'<html><script src="/invalid.js"></script>'
+                b'<script src="/valid.js"></script></html>'
             )
-        )
+        elif url.endswith("/invalid.js"):
+            response._content = (
+                b"const invalidViewer = `query InvalidViewer($viewerRef: String!) "
+                b"{ viewer(viewerRef: $viewerRef) { id displayName } }`;"
+            )
+        else:
+            response._content = (
+                b"const viewerOperation = `query CurrentViewer($viewerRef: ID!) "
+                b"{ viewer(viewerRef: $viewerRef) { id displayName } }`;"
+            )
         response._content_consumed = True
         return response
 
@@ -601,13 +683,85 @@ def test_bootstrap_prioritizes_bounded_public_graphql_operation_source(tmp_path)
                         "query_operations": [
                             {
                                 "name": "viewer",
-                                "arguments": [],
+                                "arguments": ["viewerRef"],
                                 "return_type": "Viewer",
                             }
                         ],
                         "mutation_operations": [],
                         "subscription_operations": [],
                         "planning_only": True,
+                    }
+                },
+                "graphql_introspection_checker": {
+                    "output": {
+                        "success": True,
+                        "introspection_status": "introspection_available",
+                        "network_checked": True,
+                        "evidence": {
+                            "endpoint": f"{TARGET}/api/gql",
+                            "response_summary": {
+                                "data": {
+                                    "__schema": {
+                                        "queryType": {"name": "Query"},
+                                        "types": [
+                                            {
+                                                "kind": "OBJECT",
+                                                "name": "Query",
+                                                "fields": [
+                                                    {
+                                                        "name": "viewer",
+                                                        "args": [
+                                                            {
+                                                                "name": "viewerRef",
+                                                                "defaultValue": None,
+                                                                "type": {
+                                                                    "kind": "NON_NULL",
+                                                                    "ofType": {
+                                                                        "kind": "SCALAR",
+                                                                        "name": "ID",
+                                                                    },
+                                                                },
+                                                            }
+                                                        ],
+                                                        "type": {
+                                                            "kind": "OBJECT",
+                                                            "name": "Viewer",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "kind": "OBJECT",
+                                                "name": "Viewer",
+                                                "fields": [
+                                                    {
+                                                        "name": "id",
+                                                        "args": [],
+                                                        "type": {
+                                                            "kind": "SCALAR",
+                                                            "name": "ID",
+                                                        },
+                                                    },
+                                                    {
+                                                        "name": "displayName",
+                                                        "args": [],
+                                                        "type": {
+                                                            "kind": "SCALAR",
+                                                            "name": "String",
+                                                        },
+                                                    },
+                                                ],
+                                            },
+                                            {"kind": "SCALAR", "name": "ID"},
+                                            {
+                                                "kind": "SCALAR",
+                                                "name": "String",
+                                            },
+                                        ],
+                                    }
+                                }
+                            },
+                        },
                     }
                 },
             }
@@ -649,8 +803,8 @@ def test_bootstrap_prioritizes_bounded_public_graphql_operation_source(tmp_path)
         limits=ResearchBootstrapLimits(
             maximum_discovery_target_requests=7,
             maximum_graphql_discovery_requests=0,
-            maximum_public_graphql_source_requests=2,
-            maximum_public_graphql_assets=1,
+            maximum_public_graphql_source_requests=3,
+            maximum_public_graphql_assets=2,
             maximum_bootstrap_model_calls=0,
         ),
         now=lambda: NOW,
@@ -658,9 +812,15 @@ def test_bootstrap_prioritizes_bounded_public_graphql_operation_source(tmp_path)
     try:
         state = bootstrapper.prepare(initial)
 
-        assert public_requests == [("GET", TARGET), ("GET", f"{TARGET}/client.js")]
+        assert public_requests == [
+            ("GET", TARGET),
+            ("GET", f"{TARGET}/invalid.js"),
+            ("GET", f"{TARGET}/valid.js"),
+        ]
         assert len(acquisition_calls) == 2
-        assert request_budget.total == 5
+        assert request_budget.total == 6
+        assert state.bootstrap_progress[0].request_delta.total == 6
+        assert state.budgets[0].request_budget.consumed.total == 6
         assert len(state.identities) == 2
         assert len(state.objects) == 2
         assert len({item.owner_identity_id for item in state.objects}) == 2
@@ -675,6 +835,17 @@ def test_bootstrap_prioritizes_bounded_public_graphql_operation_source(tmp_path)
             for item in state.objects
         )
         assert len(state.graphql_operations) == 1
+        assert len(state.graphql_variables) == 1
+        assert state.graphql_variables[0].input_type == (
+            state.graphql_arguments[0].input_type
+        )
+        assert {
+            "public_graphql_operation_validation_rejected",
+            "public_graphql_operation_canonical_state_validation_rejected",
+            "public_graphql_operation_stage_canonical_state_validation",
+            "public_graphql_operation_exception_ValidationError",
+            "public_graphql_operation_invariant_canonical_state_contract",
+        }.issubset(state.diagnostic_codes)
         assert len(candidate_ready_graphql_operation_templates(state)) == 1
         assert (
             candidate_ready_graphql_operation_templates(state)[0].variable_bindings

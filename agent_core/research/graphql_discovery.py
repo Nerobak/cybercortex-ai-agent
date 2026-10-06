@@ -24,6 +24,7 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StrictStr,
+    ValidationError,
     model_validator,
 )
 from requests import RequestException
@@ -99,6 +100,148 @@ class GraphQLProbeId(str, Enum):
 
 class GraphQLProbeStateChangeClass(str, Enum):
     none = "none"
+
+
+class PublicGraphQLOperationValidationStage(str, Enum):
+    parser = "parser"
+    public_source_validation = "public_source_validation"
+    observation_validation = "observation_validation"
+    semantic_delta_validation = "semantic_delta_validation"
+    canonical_state_validation = "canonical_state_validation"
+    template_validation = "template_validation"
+
+
+class PublicGraphQLOperationValidationDiagnostic(ResearchContract):
+    """Input-free classification for one rejected public operation source."""
+
+    component: Literal["public_graphql_operation"] = "public_graphql_operation"
+    stage: PublicGraphQLOperationValidationStage
+    error_code: StrictStr = Field(
+        pattern=(
+            r"^public_graphql_operation_(?:parser|source|observation|semantic_delta|"
+            r"canonical_state|template)_validation_rejected$"
+        )
+    )
+    exception_class: Literal[
+        "GraphQLDocumentError",
+        "SecretMaterialRejected",
+        "ValidationError",
+        "ValueError",
+    ]
+    invariant_category: Literal[
+        "document_syntax",
+        "public_source_contract",
+        "surface_observation_contract",
+        "semantic_delta_contract",
+        "canonical_state_contract",
+        "operation_template_contract",
+    ]
+
+    @model_validator(mode="after")
+    def validate_classification(self) -> "PublicGraphQLOperationValidationDiagnostic":
+        expected = {
+            PublicGraphQLOperationValidationStage.parser: (
+                "public_graphql_operation_parser_validation_rejected",
+                "document_syntax",
+            ),
+            PublicGraphQLOperationValidationStage.public_source_validation: (
+                "public_graphql_operation_source_validation_rejected",
+                "public_source_contract",
+            ),
+            PublicGraphQLOperationValidationStage.observation_validation: (
+                "public_graphql_operation_observation_validation_rejected",
+                "surface_observation_contract",
+            ),
+            PublicGraphQLOperationValidationStage.semantic_delta_validation: (
+                "public_graphql_operation_semantic_delta_validation_rejected",
+                "semantic_delta_contract",
+            ),
+            PublicGraphQLOperationValidationStage.canonical_state_validation: (
+                "public_graphql_operation_canonical_state_validation_rejected",
+                "canonical_state_contract",
+            ),
+            PublicGraphQLOperationValidationStage.template_validation: (
+                "public_graphql_operation_template_validation_rejected",
+                "operation_template_contract",
+            ),
+        }[self.stage]
+        if (self.error_code, self.invariant_category) != expected:
+            raise ValueError("public GraphQL validation classification is inconsistent")
+        return self
+
+    @property
+    def persistence_codes(self) -> tuple[str, ...]:
+        return (
+            "public_graphql_operation_validation_rejected",
+            self.error_code,
+            f"public_graphql_operation_stage_{self.stage.value}",
+            f"public_graphql_operation_exception_{self.exception_class}",
+            f"public_graphql_operation_invariant_{self.invariant_category}",
+        )
+
+
+_VALIDATION_DIAGNOSTIC_FIELDS = {
+    PublicGraphQLOperationValidationStage.parser: (
+        "public_graphql_operation_parser_validation_rejected",
+        "document_syntax",
+    ),
+    PublicGraphQLOperationValidationStage.public_source_validation: (
+        "public_graphql_operation_source_validation_rejected",
+        "public_source_contract",
+    ),
+    PublicGraphQLOperationValidationStage.observation_validation: (
+        "public_graphql_operation_observation_validation_rejected",
+        "surface_observation_contract",
+    ),
+    PublicGraphQLOperationValidationStage.semantic_delta_validation: (
+        "public_graphql_operation_semantic_delta_validation_rejected",
+        "semantic_delta_contract",
+    ),
+    PublicGraphQLOperationValidationStage.canonical_state_validation: (
+        "public_graphql_operation_canonical_state_validation_rejected",
+        "canonical_state_contract",
+    ),
+    PublicGraphQLOperationValidationStage.template_validation: (
+        "public_graphql_operation_template_validation_rejected",
+        "operation_template_contract",
+    ),
+}
+
+
+def _public_graphql_validation_diagnostic(
+    stage: PublicGraphQLOperationValidationStage,
+    exc: GraphQLDocumentError | SecretMaterialRejected | ValidationError | ValueError,
+) -> PublicGraphQLOperationValidationDiagnostic:
+    code, invariant = _VALIDATION_DIAGNOSTIC_FIELDS[stage]
+    exception_class = type(exc).__name__
+    if exception_class not in {
+        "GraphQLDocumentError",
+        "SecretMaterialRejected",
+        "ValidationError",
+        "ValueError",
+    }:
+        exception_class = "ValueError"
+    return PublicGraphQLOperationValidationDiagnostic(
+        stage=stage,
+        error_code=code,
+        exception_class=exception_class,
+        invariant_category=invariant,
+    )
+
+
+def _bounded_validation_diagnostics(
+    values: Sequence[PublicGraphQLOperationValidationDiagnostic],
+) -> tuple[PublicGraphQLOperationValidationDiagnostic, ...]:
+    unique = {
+        (
+            item.stage.value,
+            item.error_code,
+            item.exception_class,
+            item.invariant_category,
+        ): item
+        for item in values
+    }
+    return tuple(unique[key] for key in sorted(unique))[:100]
 
 
 class GraphQLSurfaceObservation(ResearchContract):
@@ -253,6 +396,9 @@ class PublicGraphQLOperationAcquisitionResult(ResearchContract):
     request_delta: RequestDelta = Field(default_factory=RequestDelta)
     assets_examined: StrictInt = Field(default=0, ge=0, le=MAX_PUBLIC_GRAPHQL_ASSETS)
     limitations: tuple[StrictStr, ...] = Field(default=(), max_length=100)
+    diagnostics: tuple[PublicGraphQLOperationValidationDiagnostic, ...] = Field(
+        default=(), max_length=100
+    )
 
     @model_validator(mode="after")
     def public_safe(self) -> "PublicGraphQLOperationAcquisitionResult":
@@ -394,6 +540,9 @@ class GraphQLAcquisitionResult(ResearchContract):
     probe_outcomes: tuple[GraphQLProbeOutcome, ...] = Field(default=(), max_length=64)
     request_delta: RequestDelta = Field(default_factory=RequestDelta)
     limitations: tuple[StrictStr, ...] = Field(default=(), max_length=100)
+    diagnostics: tuple[PublicGraphQLOperationValidationDiagnostic, ...] = Field(
+        default=(), max_length=100
+    )
 
     @model_validator(mode="after")
     def no_findings_or_secrets(self) -> "GraphQLAcquisitionResult":
@@ -667,7 +816,10 @@ def _exact_public_graphql_documents(
     *,
     source_kind: str,
     maximum_documents: int,
-) -> tuple[tuple[ParsedGraphQLDocument, ...], bool]:
+) -> tuple[
+    tuple[ParsedGraphQLDocument, ...],
+    tuple[PublicGraphQLOperationValidationDiagnostic, ...],
+]:
     """Extract whole explicit literals and validate them with the bounded parser."""
 
     values: tuple[str, ...]
@@ -686,7 +838,7 @@ def _exact_public_graphql_documents(
             else _javascript_string_literals(source)
         )
     documents: list[ParsedGraphQLDocument] = []
-    rejected = False
+    diagnostics: list[PublicGraphQLOperationValidationDiagnostic] = []
     for value in values:
         if len(documents) >= maximum_documents:
             break
@@ -699,12 +851,19 @@ def _exact_public_graphql_documents(
                     "public GraphQL document contains personal literal material"
                 )
             parsed = parse_graphql_document(value)
-        except (GraphQLDocumentError, SecretMaterialRejected, ValueError):
-            rejected = True
+        except (GraphQLDocumentError, SecretMaterialRejected, ValueError) as exc:
+            diagnostics.append(
+                _public_graphql_validation_diagnostic(
+                    PublicGraphQLOperationValidationStage.parser, exc
+                )
+            )
             continue
         documents.append(parsed)
     deduplicated = {document.document_digest: document for document in documents}
-    return tuple(deduplicated[key] for key in sorted(deduplicated)), rejected
+    return (
+        tuple(deduplicated[key] for key in sorted(deduplicated)),
+        _bounded_validation_diagnostics(diagnostics),
+    )
 
 
 class PublicGraphQLOperationAcquirer:
@@ -742,7 +901,34 @@ class PublicGraphQLOperationAcquirer:
         )
         limitations: set[str] = set()
         sources: list[RegisteredGraphQLOperationSource] = []
+        diagnostics: list[PublicGraphQLOperationValidationDiagnostic] = []
         assets_examined = 0
+
+        def register_source(
+            *,
+            source_kind: str,
+            source_locator: str,
+            document: ParsedGraphQLDocument,
+        ) -> None:
+            try:
+                sources.append(
+                    self._source(
+                        endpoint_url=endpoint_url,
+                        source_kind=source_kind,
+                        source_locator=source_locator,
+                        surface_reference=surface_reference,
+                        document=document,
+                        method=method,
+                    )
+                )
+            except ValidationError as exc:
+                limitations.add("public_graphql_operation_validation_rejected")
+                diagnostics.append(
+                    _public_graphql_validation_diagnostic(
+                        PublicGraphQLOperationValidationStage.public_source_validation,
+                        exc,
+                    )
+                )
 
         def fetch(url: str, byte_limit: int, accept: str) -> tuple[str, str] | None:
             consumed = RequestDelta.from_snapshots(
@@ -820,16 +1006,12 @@ class PublicGraphQLOperationAcquirer:
                             )
                             if rejected:
                                 limitations.add("public_graphql_document_rejected")
+                                diagnostics.extend(rejected)
                             for document in documents:
-                                sources.append(
-                                    self._source(
-                                        endpoint_url=endpoint_url,
-                                        source_kind=kind,
-                                        source_locator=f"inline:{index}",
-                                        surface_reference=surface_reference,
-                                        document=document,
-                                        method=method,
-                                    )
+                                register_source(
+                                    source_kind=kind,
+                                    source_locator=f"inline:{index}",
+                                    document=document,
                                 )
                         seen_assets: set[str] = set()
                         for reference, kind in parser.asset_references:
@@ -888,16 +1070,12 @@ class PublicGraphQLOperationAcquirer:
                             )
                             if rejected:
                                 limitations.add("public_graphql_document_rejected")
+                                diagnostics.extend(rejected)
                             for document in documents:
-                                sources.append(
-                                    self._source(
-                                        endpoint_url=endpoint_url,
-                                        source_kind=kind,
-                                        source_locator=asset_url,
-                                        surface_reference=surface_reference,
-                                        document=document,
-                                        method=method,
-                                    )
+                                register_source(
+                                    source_kind=kind,
+                                    source_locator=asset_url,
+                                    document=document,
                                 )
                 else:
                     limitations.add("public_graphql_page_content_type_rejected")
@@ -908,6 +1086,7 @@ class PublicGraphQLOperationAcquirer:
             request_delta=RequestDelta.from_snapshots(before, after),
             assets_examined=assets_examined,
             limitations=tuple(sorted(limitations)),
+            diagnostics=_bounded_validation_diagnostics(diagnostics),
         )
 
     @staticmethod
@@ -1673,6 +1852,8 @@ class GraphQLSemanticAcquirer:
         deltas: list[GraphQLSemanticDelta] = []
         observations: list[GraphQLSurfaceObservation] = []
         limitations: set[str] = set()
+        diagnostics: list[PublicGraphQLOperationValidationDiagnostic] = []
+        working = state
         target = next(
             (item for item in state.targets if item.target_id == target_id), None
         )
@@ -1716,55 +1897,132 @@ class GraphQLSemanticAcquirer:
                 "document_digest": source.document.document_digest,
                 "identity_id": source.identity_id,
             }
-            observation = GraphQLSurfaceObservation(
-                observation_id=stable_research_identifier(
-                    "graphql-observation",
-                    target_id,
-                    source.endpoint_url,
-                    source.source_reference,
-                    source.document.document_digest,
-                ),
-                target_id=target_id,
-                endpoint_url=source.endpoint_url,
-                method=source.method,
-                confidence=GraphQLDiscoveryConfidence.observed,
-                evidence_signals=(
-                    "graphql_document",
-                    "registered_graphql_operation",
-                ),
-                source_kind=source.source_kind,
-                source_reference=opaque_reference(
-                    source.source_reference, "graphql-source"
-                ),
-                evidence_digest=digest_for(safe_digest_input),
-                identity_id=source.identity_id,
-                request_document_digest=source.document.document_digest,
-                response_evidence_digest=(
-                    source.response.evidence_digest if source.response else None
-                ),
-                response_truncated=bool(source.response and source.response.truncated),
-            )
             try:
-                deltas.append(
-                    self.ingestor.from_document(
-                        state,
-                        observation,
-                        source.document,
-                        occurred_at=occurred_at,
-                        response=source.response,
+                observation = GraphQLSurfaceObservation(
+                    observation_id=stable_research_identifier(
+                        "graphql-observation",
+                        target_id,
+                        source.endpoint_url,
+                        source.source_reference,
+                        source.document.document_digest,
+                    ),
+                    target_id=target_id,
+                    endpoint_url=source.endpoint_url,
+                    method=source.method,
+                    confidence=GraphQLDiscoveryConfidence.observed,
+                    evidence_signals=(
+                        "graphql_document",
+                        "registered_graphql_operation",
+                    ),
+                    source_kind=source.source_kind,
+                    source_reference=opaque_reference(
+                        source.source_reference, "graphql-source"
+                    ),
+                    evidence_digest=digest_for(safe_digest_input),
+                    identity_id=source.identity_id,
+                    request_document_digest=source.document.document_digest,
+                    response_evidence_digest=(
+                        source.response.evidence_digest if source.response else None
+                    ),
+                    response_truncated=bool(
+                        source.response and source.response.truncated
+                    ),
+                )
+            except ValidationError as exc:
+                limitations.add("public_graphql_operation_validation_rejected")
+                diagnostics.append(
+                    _public_graphql_validation_diagnostic(
+                        PublicGraphQLOperationValidationStage.observation_validation,
+                        exc,
                     )
                 )
-                observations.append(observation)
-            except (GraphQLDocumentError, ValueError):
-                limitations.add(
-                    "A registered GraphQL operation source was incompatible with "
-                    "canonical semantic state."
+                continue
+            try:
+                delta = self.ingestor.from_document(
+                    working,
+                    observation,
+                    source.document,
+                    occurred_at=occurred_at,
+                    response=source.response,
                 )
+            except GraphQLDocumentError as exc:
+                limitations.add("public_graphql_operation_validation_rejected")
+                diagnostics.append(
+                    _public_graphql_validation_diagnostic(
+                        PublicGraphQLOperationValidationStage.semantic_delta_validation,
+                        exc,
+                    )
+                )
+                continue
+            except ValidationError as exc:
+                limitations.add("public_graphql_operation_validation_rejected")
+                diagnostics.append(
+                    _public_graphql_validation_diagnostic(
+                        PublicGraphQLOperationValidationStage.semantic_delta_validation,
+                        exc,
+                    )
+                )
+                continue
+            try:
+                candidate = delta.apply(working)
+            except (ValidationError, SecretMaterialRejected) as exc:
+                limitations.add("public_graphql_operation_validation_rejected")
+                diagnostics.append(
+                    _public_graphql_validation_diagnostic(
+                        PublicGraphQLOperationValidationStage.canonical_state_validation,
+                        exc,
+                    )
+                )
+                continue
+            try:
+                from agent_core.research.graphql_readiness import (
+                    candidate_ready_graphql_operation_templates,
+                )
+
+                candidate_ready_graphql_operation_templates(candidate)
+            except ValidationError as exc:
+                limitations.add("public_graphql_operation_validation_rejected")
+                diagnostics.append(
+                    _public_graphql_validation_diagnostic(
+                        PublicGraphQLOperationValidationStage.template_validation,
+                        exc,
+                    )
+                )
+                continue
+            working = candidate
+            deltas.append(delta)
+            observations.append(observation)
+        try:
+            combined = GraphQLSemanticDelta.combine(deltas)
+        except (ValidationError, SecretMaterialRejected) as exc:
+            limitations.add("public_graphql_operation_validation_rejected")
+            diagnostics.append(
+                _public_graphql_validation_diagnostic(
+                    PublicGraphQLOperationValidationStage.semantic_delta_validation,
+                    exc,
+                )
+            )
+            combined = GraphQLSemanticDelta()
+            observations.clear()
+        if deltas:
+            try:
+                combined.apply(state)
+            except (ValidationError, SecretMaterialRejected) as exc:
+                limitations.add("public_graphql_operation_validation_rejected")
+                diagnostics.append(
+                    _public_graphql_validation_diagnostic(
+                        PublicGraphQLOperationValidationStage.canonical_state_validation,
+                        exc,
+                    )
+                )
+                combined = GraphQLSemanticDelta()
+                observations.clear()
         return GraphQLAcquisitionResult(
-            delta=GraphQLSemanticDelta.combine(deltas),
+            delta=combined,
             observations=tuple(observations),
             request_delta=RequestDelta(),
             limitations=tuple(sorted(limitations)),
+            diagnostics=_bounded_validation_diagnostics(diagnostics),
         )
 
     def acquire(
@@ -2453,5 +2711,7 @@ __all__ = [
     "PublicGraphQLOperationAcquirer",
     "PublicGraphQLOperationAcquisitionConfig",
     "PublicGraphQLOperationAcquisitionResult",
+    "PublicGraphQLOperationValidationDiagnostic",
+    "PublicGraphQLOperationValidationStage",
     "RegisteredGraphQLOperationSource",
 ]

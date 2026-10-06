@@ -265,6 +265,8 @@ from agent_core.research.graphql_discovery import (
     PublicGraphQLOperationAcquirer,
     PublicGraphQLOperationAcquisitionConfig,
     PublicGraphQLOperationAcquisitionResult,
+    PublicGraphQLOperationValidationDiagnostic,
+    PublicGraphQLOperationValidationStage,
     RegisteredGraphQLOperationSource,
 )
 from agent_core.research.graphql_ingest import (
@@ -1091,6 +1093,8 @@ __all__ = [
     "PublicGraphQLOperationAcquirer",
     "PublicGraphQLOperationAcquisitionConfig",
     "PublicGraphQLOperationAcquisitionResult",
+    "PublicGraphQLOperationValidationDiagnostic",
+    "PublicGraphQLOperationValidationStage",
     "RegisteredGraphQLOperationSource",
     "GraphQLVariableRecord",
     "GraphQLObjectBindingBasis",
