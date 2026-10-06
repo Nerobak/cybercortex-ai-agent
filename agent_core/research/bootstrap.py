@@ -59,14 +59,17 @@ from agent_core.research.candidates import ExperimentCandidateBuilder
 from agent_core.research.compiler import ExperimentCompilerContext
 from agent_core.research.graphql import (
     GraphQLAuthenticationRequirement,
+    GraphQLSchemaState,
     build_graphql_graph_assertions,
 )
 from agent_core.research.graphql_discovery import (
     GraphQLAuthenticatedDiscovery,
     GraphQLDiscoveryConfig,
     GraphQLDiscoverySession,
-    RegisteredGraphQLOperationSource,
     GraphQLSemanticAcquirer,
+    PublicGraphQLOperationAcquirer,
+    PublicGraphQLOperationAcquisitionConfig,
+    RegisteredGraphQLOperationSource,
 )
 from agent_core.research.graphql_ingest import (
     GraphQLDocumentError,
@@ -122,6 +125,8 @@ class BootstrapStopReason(str, Enum):
 class ResearchBootstrapLimits(ResearchContract):
     maximum_discovery_target_requests: StrictInt = Field(default=30, ge=1, le=5_000)
     maximum_graphql_discovery_requests: StrictInt = Field(default=3, ge=0, le=20)
+    maximum_public_graphql_source_requests: StrictInt = Field(default=2, ge=0, le=4)
+    maximum_public_graphql_assets: StrictInt = Field(default=2, ge=0, le=4)
     minimum_post_bootstrap_request_reserve: StrictInt = Field(default=4, ge=1, le=1_000)
     maximum_discovered_endpoints: StrictInt = Field(default=500, ge=1, le=5_000)
     maximum_parameters_imported: StrictInt = Field(default=1_000, ge=1, le=10_000)
@@ -321,6 +326,20 @@ class ResearchBootstrapper:
             session=graphql_session,
         )
         self._graphql_session = graphql_session
+        self.public_graphql_operation_acquirer = (
+            PublicGraphQLOperationAcquirer(
+                client=candidate_transport,
+                policy=policy,
+                config=PublicGraphQLOperationAcquisitionConfig(
+                    maximum_requests=(
+                        self.limits.maximum_public_graphql_source_requests
+                    ),
+                    maximum_assets=self.limits.maximum_public_graphql_assets,
+                ),
+            )
+            if isinstance(candidate_transport, ScopedHTTPClient)
+            else None
+        )
         self.graphql_authenticated_discovery = (
             GraphQLAuthenticatedDiscovery(
                 session=graphql_session,
@@ -776,6 +795,9 @@ class ResearchBootstrapper:
             )
             adapted = graphql_result.delta.apply(adapted)
             graphql_limitations = graphql_result.limitations
+        adapted, public_graphql_limitations = self._acquire_public_graphql_operations(
+            adapted, target
+        )
         adapted, authenticated_graphql_limitations = (
             self._discover_authenticated_graphql(adapted, target)
         )
@@ -841,6 +863,7 @@ class ResearchBootstrapper:
                 *operation_limitations,
                 *authenticated_limitations,
                 *graphql_limitations,
+                *public_graphql_limitations,
                 *authenticated_graphql_limitations,
                 *readiness_limitations,
             ),
@@ -1315,6 +1338,62 @@ class ResearchBootstrapper:
             maximum_requests=maximum_requests,
         )
         return result.objects, result.limitations
+
+    def _acquire_public_graphql_operations(
+        self, state: ResearchState, target: TargetAsset
+    ) -> tuple[ResearchState, tuple[str, ...]]:
+        """Prioritize exact public documents only at the GraphQL readiness gap."""
+
+        acquirer = self.public_graphql_operation_acquirer
+        if (
+            acquirer is None
+            or state.graphql_operations
+            or not any(
+                identity.controlled and identity.eligibility.value == "eligible"
+                for identity in state.identities
+            )
+            or not state.graphql_types
+            or not state.graphql_fields
+        ):
+            return state, ()
+        endpoint_by_id = {item.endpoint_id: item for item in state.endpoints}
+        eligible_surfaces = tuple(
+            sorted(
+                (
+                    surface
+                    for surface in state.graphql_surfaces
+                    if surface.target_id == target.target_id
+                    and surface.schema_state is not GraphQLSchemaState.unknown
+                    and surface.endpoint_id in endpoint_by_id
+                ),
+                key=lambda item: item.graphql_surface_id,
+            )
+        )
+        if len(eligible_surfaces) != 1:
+            return state, ()
+        surface = eligible_surfaces[0]
+        endpoint = endpoint_by_id[surface.endpoint_id]
+        result = acquirer.acquire(
+            target_url=target.canonical_reference,
+            endpoint_url=urljoin(
+                target.canonical_reference,
+                endpoint.route_template,
+            ),
+            surface_reference=surface.graphql_surface_id,
+            method=endpoint.method.value,
+        )
+        if not result.sources:
+            return state, result.limitations
+        registered = self.graphql_acquirer.register_operations(
+            state,
+            result.sources,
+            target_id=target.target_id,
+            occurred_at=self._now(state),
+        )
+        return (
+            registered.delta.apply(state),
+            tuple(sorted({*result.limitations, *registered.limitations})),
+        )
 
     def _discover_authenticated_graphql(
         self, state: ResearchState, target: TargetAsset

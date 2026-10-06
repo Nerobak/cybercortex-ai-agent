@@ -1,16 +1,20 @@
 """Passive-first, policy-bound GraphQL surface discovery.
 
-Only fixed read-only probe documents defined in this module can reach the
-shared scoped transport. Discovery results retain structural evidence and
+Only fixed read-only probe documents defined in this module can be sent as
+GraphQL requests. Public-source acquisition uses bounded same-origin GETs and
+never executes an extracted document. Results retain structural evidence and
 digests, never raw response values, variable values, or credentials.
 """
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
+from html.parser import HTMLParser
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -22,9 +26,10 @@ from pydantic import (
     StrictStr,
     model_validator,
 )
+from requests import RequestException
 
 from agent_core.policy import AssessmentPolicy
-from agent_core.request_budget import RequestBudget, RequestDelta
+from agent_core.request_budget import RequestBudget, RequestBudgetExceeded, RequestDelta
 from agent_core.controlled_context import ControlledAccount, ControlledContext
 from agent_core.credential_vault import CredentialVault
 from agent_core.research.adapters import (
@@ -51,7 +56,10 @@ from agent_core.research.graphql_ingest import (
     analyze_graphql_response,
     parse_graphql_document,
 )
-from agent_core.research.provenance import reject_secret_material
+from agent_core.research.provenance import (
+    SecretMaterialRejected,
+    reject_secret_material,
+)
 from agent_core.research.types import ResearchContract
 from agent_core.research.state import ResearchState
 from tools.safe_http import (
@@ -64,6 +72,11 @@ GRAPHQL_DISCOVERY_VERSION = "phase4-graphql-discovery-v1"
 MAX_GRAPHQL_DISCOVERY_OBSERVATIONS = MAX_GRAPHQL_SURFACES
 MAX_GRAPHQL_DISCOVERY_SIGNALS = 16
 MAX_GRAPHQL_DISCOVERY_TIMEOUT_SECONDS = 15.0
+MAX_PUBLIC_GRAPHQL_PAGE_BYTES = 65_536
+MAX_PUBLIC_GRAPHQL_ASSET_BYTES = 131_072
+MAX_PUBLIC_GRAPHQL_ASSETS = 4
+MAX_PUBLIC_GRAPHQL_DOCUMENTS = 32
+MAX_PUBLIC_GRAPHQL_SOURCE_REQUESTS = 4
 
 
 class GraphQLDiscoveryConfidence(str, Enum):
@@ -143,6 +156,8 @@ class RegisteredGraphQLOperationSource(ResearchContract):
     endpoint_url: StrictStr = Field(min_length=1, max_length=2_048)
     method: Literal["GET", "POST"] = "POST"
     source_kind: Literal[
+        "public_client_asset",
+        "public_persisted_manifest",
         "registered_graphql_acquisition",
         "registered_graphql_discovery",
         "trusted_typed_operation",
@@ -200,6 +215,52 @@ class GraphQLDiscoveryConfig(ResearchContract):
     maximum_arguments: StrictInt = Field(
         default=MAX_GRAPHQL_ARGUMENTS, ge=1, le=MAX_GRAPHQL_ARGUMENTS
     )
+
+
+class PublicGraphQLOperationAcquisitionConfig(ResearchContract):
+    """Hard limits for passive public application-operation acquisition."""
+
+    maximum_requests: StrictInt = Field(
+        default=2, ge=0, le=MAX_PUBLIC_GRAPHQL_SOURCE_REQUESTS
+    )
+    maximum_assets: StrictInt = Field(default=2, ge=0, le=MAX_PUBLIC_GRAPHQL_ASSETS)
+    maximum_documents: StrictInt = Field(
+        default=MAX_PUBLIC_GRAPHQL_DOCUMENTS,
+        ge=1,
+        le=MAX_PUBLIC_GRAPHQL_DOCUMENTS,
+    )
+    maximum_page_bytes: StrictInt = Field(
+        default=MAX_PUBLIC_GRAPHQL_PAGE_BYTES,
+        ge=1,
+        le=MAX_PUBLIC_GRAPHQL_PAGE_BYTES,
+    )
+    maximum_asset_bytes: StrictInt = Field(
+        default=MAX_PUBLIC_GRAPHQL_ASSET_BYTES,
+        ge=1,
+        le=MAX_PUBLIC_GRAPHQL_ASSET_BYTES,
+    )
+    timeout_seconds: StrictFloat = Field(
+        default=5.0, gt=0.0, le=MAX_GRAPHQL_DISCOVERY_TIMEOUT_SECONDS
+    )
+
+
+class PublicGraphQLOperationAcquisitionResult(ResearchContract):
+    """Typed, execution-neutral exact documents observed in public material."""
+
+    sources: tuple[RegisteredGraphQLOperationSource, ...] = Field(
+        default=(), max_length=MAX_PUBLIC_GRAPHQL_DOCUMENTS
+    )
+    request_delta: RequestDelta = Field(default_factory=RequestDelta)
+    assets_examined: StrictInt = Field(default=0, ge=0, le=MAX_PUBLIC_GRAPHQL_ASSETS)
+    limitations: tuple[StrictStr, ...] = Field(default=(), max_length=100)
+
+    @model_validator(mode="after")
+    def public_safe(self) -> "PublicGraphQLOperationAcquisitionResult":
+        reject_secret_material(
+            self.model_dump(mode="json"),
+            location="public GraphQL operation acquisition result",
+        )
+        return self
 
 
 class GraphQLProbeDefinition(ResearchContract):
@@ -414,6 +475,470 @@ def _safe_url(value: Any, target_url: str | None) -> str | None:
     ):
         return None
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", "", ""))
+
+
+_PUBLIC_PAGE_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+_PUBLIC_CLIENT_CONTENT_TYPES = frozenset(
+    {
+        "application/javascript",
+        "application/typescript",
+        "application/x-javascript",
+        "text/javascript",
+        "text/plain",
+        "text/typescript",
+    }
+)
+_PUBLIC_MANIFEST_CONTENT_TYPES = frozenset(
+    {
+        "application/json",
+        "application/manifest+json",
+        "application/graphql",
+        "text/plain",
+    }
+)
+_GRAPHQL_DOCUMENT_PREFIX = re.compile(
+    r"^(?:(?:\s+|#[^\r\n]*(?:\r?\n|$))*)(?:query\b|mutation\b|"
+    r"subscription\b|fragment\b|\{)",
+    re.IGNORECASE,
+)
+_PERSONAL_LITERAL = re.compile(
+    r"(?:\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}\b|"
+    r"\bpersonal[-_ ]?data(?:[-_ ](?:value[-_ ]?)?sentinel)?\b|"
+    r"\b(?:api[-_ ]?key|credential|jwt|password|secret)"
+    r"[-_ ](?:value[-_ ]?)?sentinel\b)",
+    re.IGNORECASE,
+)
+
+
+def _content_type(response: Any) -> str:
+    value = str(getattr(response, "headers", {}).get("Content-Type", ""))
+    return value.partition(";")[0].strip().lower()
+
+
+def _within_public_target(url: str, target_url: str) -> bool:
+    candidate = urlparse(url)
+    target = urlparse(target_url)
+    if (
+        candidate.scheme not in {"http", "https"}
+        or candidate.scheme != target.scheme
+        or candidate.netloc != target.netloc
+        or candidate.username is not None
+        or candidate.password is not None
+        or candidate.fragment
+    ):
+        return False
+    target_path = target.path or "/"
+    if target_path in {"", "/"}:
+        return True
+    prefix = target_path.rstrip("/")
+    return candidate.path == prefix or candidate.path.startswith(prefix + "/")
+
+
+class _PublicApplicationHTMLParser(HTMLParser):
+    """Collect only explicit public script and manifest references."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.asset_references: list[tuple[str, str]] = []
+        self.inline_sources: list[tuple[str, str]] = []
+        self._inline_kind: str | None = None
+        self._inline_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {name.casefold(): value or "" for name, value in attrs}
+        normalized_tag = tag.casefold()
+        if normalized_tag == "script":
+            source = attributes.get("src")
+            media_type = attributes.get("type", "").partition(";")[0].casefold()
+            kind = (
+                "public_persisted_manifest"
+                if media_type
+                in {
+                    "application/json",
+                    "application/manifest+json",
+                }
+                else "public_client_asset"
+            )
+            if source:
+                self.asset_references.append((source, kind))
+            elif not media_type or media_type in (
+                _PUBLIC_CLIENT_CONTENT_TYPES | _PUBLIC_MANIFEST_CONTENT_TYPES
+            ):
+                self._inline_kind = kind
+                self._inline_parts = []
+        elif normalized_tag == "link" and attributes.get("href"):
+            relations = set(attributes.get("rel", "").casefold().split())
+            if relations.intersection(
+                {
+                    "graphql-manifest",
+                    "operation-manifest",
+                    "persisted-operations",
+                }
+            ):
+                self.asset_references.append(
+                    (attributes["href"], "public_persisted_manifest")
+                )
+
+    def handle_data(self, data: str) -> None:
+        if self._inline_kind is not None:
+            self._inline_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "script" and self._inline_kind is not None:
+            self.inline_sources.append(("".join(self._inline_parts), self._inline_kind))
+            self._inline_kind = None
+            self._inline_parts = []
+
+
+def _decode_javascript_literal(quote: str, body: str) -> str | None:
+    if quote == "`":
+        if "${" in body or "\\" in body:
+            return None
+        return body
+    try:
+        value = ast.literal_eval(quote + body + quote)
+    except (SyntaxError, ValueError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _javascript_string_literals(source: str) -> tuple[str, ...]:
+    """Read standalone string literals without evaluating or joining source."""
+
+    output: list[str] = []
+    index = 0
+    length = len(source)
+    while index < length and len(output) < 256:
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            close = source.find("*/", index + 2)
+            index = length if close < 0 else close + 2
+            continue
+        quote = source[index]
+        if quote not in {"'", '"', "`"}:
+            index += 1
+            continue
+        cursor = index + 1
+        escaped = False
+        while cursor < length:
+            character = source[cursor]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                break
+            cursor += 1
+        if cursor >= length:
+            break
+        decoded = _decode_javascript_literal(quote, source[index + 1 : cursor])
+        if decoded is not None:
+            output.append(decoded)
+        index = cursor + 1
+    return tuple(output)
+
+
+def _manifest_string_values(value: Any) -> tuple[str, ...]:
+    output: list[str] = []
+
+    def visit(candidate: Any, depth: int) -> None:
+        if depth > 8 or len(output) >= 256:
+            return
+        if isinstance(candidate, str):
+            output.append(candidate)
+        elif isinstance(candidate, Mapping):
+            for item in list(candidate.values())[:128]:
+                visit(item, depth + 1)
+        elif isinstance(candidate, Sequence) and not isinstance(
+            candidate, (str, bytes, bytearray)
+        ):
+            for item in list(candidate)[:128]:
+                visit(item, depth + 1)
+
+    visit(value, 0)
+    return tuple(output)
+
+
+def _exact_public_graphql_documents(
+    source: str,
+    *,
+    source_kind: str,
+    maximum_documents: int,
+) -> tuple[tuple[ParsedGraphQLDocument, ...], bool]:
+    """Extract whole explicit literals and validate them with the bounded parser."""
+
+    values: tuple[str, ...]
+    if source_kind == "public_persisted_manifest":
+        try:
+            manifest = json.loads(source)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            manifest = None
+        values = (
+            _manifest_string_values(manifest) if manifest is not None else (source,)
+        )
+    else:
+        values = (
+            (source, *_javascript_string_literals(source))
+            if _GRAPHQL_DOCUMENT_PREFIX.match(source)
+            else _javascript_string_literals(source)
+        )
+    documents: list[ParsedGraphQLDocument] = []
+    rejected = False
+    for value in values:
+        if len(documents) >= maximum_documents:
+            break
+        if _GRAPHQL_DOCUMENT_PREFIX.match(value) is None:
+            continue
+        try:
+            reject_secret_material(value, location="public GraphQL document")
+            if _PERSONAL_LITERAL.search(value):
+                raise SecretMaterialRejected(
+                    "public GraphQL document contains personal literal material"
+                )
+            parsed = parse_graphql_document(value)
+        except (GraphQLDocumentError, SecretMaterialRejected, ValueError):
+            rejected = True
+            continue
+        documents.append(parsed)
+    deduplicated = {document.document_digest: document for document in documents}
+    return tuple(deduplicated[key] for key in sorted(deduplicated)), rejected
+
+
+class PublicGraphQLOperationAcquirer:
+    """Acquire exact public application documents through the shared HTTP authority."""
+
+    def __init__(
+        self,
+        *,
+        client: ScopedHTTPClient,
+        policy: AssessmentPolicy,
+        config: PublicGraphQLOperationAcquisitionConfig | None = None,
+    ) -> None:
+        if client.policy is not policy or client.budget is None:
+            raise ValueError(
+                "public GraphQL acquisition must share policy and request budget"
+            )
+        self.client = client
+        self.policy = policy
+        self.config = config or PublicGraphQLOperationAcquisitionConfig()
+
+    def acquire(
+        self,
+        *,
+        target_url: str,
+        endpoint_url: str,
+        surface_reference: str,
+        method: Literal["GET", "POST"] = "POST",
+    ) -> PublicGraphQLOperationAcquisitionResult:
+        if not _within_public_target(endpoint_url, target_url):
+            raise ValueError("GraphQL surface is outside the canonical target boundary")
+        before = self.client.budget.snapshot()
+        request_allowance = min(
+            self.config.maximum_requests,
+            max(0, self.client.budget.remaining - 1),
+        )
+        limitations: set[str] = set()
+        sources: list[RegisteredGraphQLOperationSource] = []
+        assets_examined = 0
+
+        def fetch(url: str, byte_limit: int, accept: str) -> tuple[str, str] | None:
+            consumed = RequestDelta.from_snapshots(
+                before, self.client.budget.snapshot()
+            ).total
+            if consumed >= request_allowance:
+                limitations.add("public_graphql_source_request_ceiling_reached")
+                return None
+            try:
+                response, _ = self.client.request(
+                    "GET",
+                    url,
+                    headers={
+                        "Accept": accept,
+                        "User-Agent": "CyberCortexAI-Public-GraphQL-Discovery/1",
+                    },
+                    timeout=self.config.timeout_seconds,
+                    response_byte_limit=byte_limit,
+                    follow_redirects=False,
+                    max_redirects=0,
+                    purpose="discovery",
+                    allow_session_credentials=False,
+                    isolate_session_cookies=True,
+                )
+            except (
+                OSError,
+                PolicyViolationError,
+                RequestBudgetExceeded,
+                RequestException,
+                ResponseTooLargeError,
+                TimeoutError,
+            ):
+                limitations.add("public_graphql_source_retrieval_failed")
+                return None
+            if not 200 <= int(getattr(response, "status_code", 0) or 0) < 300:
+                limitations.add("public_graphql_source_response_rejected")
+                return None
+            raw = bytes(getattr(response, "content", b"") or b"")
+            try:
+                return raw.decode("utf-8-sig"), _content_type(response)
+            except UnicodeDecodeError:
+                limitations.add("public_graphql_source_encoding_rejected")
+                return None
+
+        if request_allowance == 0:
+            limitations.add("public_graphql_source_budget_unavailable")
+        else:
+            page = fetch(
+                target_url,
+                self.config.maximum_page_bytes,
+                "text/html, application/xhtml+xml",
+            )
+            if page is not None:
+                page_text, page_type = page
+                if page_type in _PUBLIC_PAGE_CONTENT_TYPES:
+                    parser = _PublicApplicationHTMLParser()
+                    try:
+                        parser.feed(page_text)
+                        parser.close()
+                    except (TypeError, ValueError):
+                        limitations.add("public_graphql_page_parse_failed")
+                    else:
+                        for index, (inline, kind) in enumerate(
+                            parser.inline_sources[: self.config.maximum_assets]
+                        ):
+                            if assets_examined >= self.config.maximum_assets:
+                                break
+                            assets_examined += 1
+                            documents, rejected = _exact_public_graphql_documents(
+                                inline,
+                                source_kind=kind,
+                                maximum_documents=(
+                                    self.config.maximum_documents - len(sources)
+                                ),
+                            )
+                            if rejected:
+                                limitations.add("public_graphql_document_rejected")
+                            for document in documents:
+                                sources.append(
+                                    self._source(
+                                        endpoint_url=endpoint_url,
+                                        source_kind=kind,
+                                        source_locator=f"inline:{index}",
+                                        surface_reference=surface_reference,
+                                        document=document,
+                                        method=method,
+                                    )
+                                )
+                        seen_assets: set[str] = set()
+                        for reference, kind in parser.asset_references:
+                            if (
+                                assets_examined >= self.config.maximum_assets
+                                or len(sources) >= self.config.maximum_documents
+                            ):
+                                break
+                            asset_url = urljoin(target_url, reference)
+                            if asset_url in seen_assets or not _within_public_target(
+                                asset_url, target_url
+                            ):
+                                continue
+                            try:
+                                reject_secret_material(
+                                    asset_url,
+                                    location="public GraphQL asset reference",
+                                )
+                            except SecretMaterialRejected:
+                                limitations.add(
+                                    "public_graphql_asset_reference_rejected"
+                                )
+                                continue
+                            seen_assets.add(asset_url)
+                            assets_examined += 1
+                            acquired = fetch(
+                                asset_url,
+                                self.config.maximum_asset_bytes,
+                                (
+                                    "application/json, application/manifest+json, "
+                                    "application/graphql, text/plain"
+                                    if kind == "public_persisted_manifest"
+                                    else "application/javascript, text/javascript, "
+                                    "text/typescript, text/plain"
+                                ),
+                            )
+                            if acquired is None:
+                                continue
+                            asset_text, asset_type = acquired
+                            allowed_types = (
+                                _PUBLIC_MANIFEST_CONTENT_TYPES
+                                if kind == "public_persisted_manifest"
+                                else _PUBLIC_CLIENT_CONTENT_TYPES
+                            )
+                            if asset_type not in allowed_types:
+                                limitations.add(
+                                    "public_graphql_asset_content_type_rejected"
+                                )
+                                continue
+                            documents, rejected = _exact_public_graphql_documents(
+                                asset_text,
+                                source_kind=kind,
+                                maximum_documents=(
+                                    self.config.maximum_documents - len(sources)
+                                ),
+                            )
+                            if rejected:
+                                limitations.add("public_graphql_document_rejected")
+                            for document in documents:
+                                sources.append(
+                                    self._source(
+                                        endpoint_url=endpoint_url,
+                                        source_kind=kind,
+                                        source_locator=asset_url,
+                                        surface_reference=surface_reference,
+                                        document=document,
+                                        method=method,
+                                    )
+                                )
+                else:
+                    limitations.add("public_graphql_page_content_type_rejected")
+
+        after = self.client.budget.snapshot()
+        return PublicGraphQLOperationAcquisitionResult(
+            sources=tuple(sources[: self.config.maximum_documents]),
+            request_delta=RequestDelta.from_snapshots(before, after),
+            assets_examined=assets_examined,
+            limitations=tuple(sorted(limitations)),
+        )
+
+    @staticmethod
+    def _source(
+        *,
+        endpoint_url: str,
+        source_kind: str,
+        source_locator: str,
+        surface_reference: str,
+        document: ParsedGraphQLDocument,
+        method: Literal["GET", "POST"],
+    ) -> RegisteredGraphQLOperationSource:
+        if source_kind not in {
+            "public_client_asset",
+            "public_persisted_manifest",
+        }:
+            raise ValueError("unsupported public GraphQL operation provenance")
+        reference = stable_research_identifier(
+            "public-graphql-operation-source",
+            source_kind,
+            source_locator,
+            surface_reference,
+            document.document_digest,
+        )
+        return RegisteredGraphQLOperationSource(
+            endpoint_url=endpoint_url,
+            method=method,
+            source_kind=source_kind,
+            source_reference=reference,
+            document=document,
+        )
 
 
 def _graphql_tool_outputs(evidence: Any) -> dict[str, Mapping[str, Any]]:
@@ -1900,6 +2425,11 @@ __all__ = [
     "GRAPHQL_PROBE_REGISTRY",
     "INTROSPECTION_PROBE_DOCUMENT",
     "MAX_GRAPHQL_DISCOVERY_OBSERVATIONS",
+    "MAX_PUBLIC_GRAPHQL_ASSET_BYTES",
+    "MAX_PUBLIC_GRAPHQL_ASSETS",
+    "MAX_PUBLIC_GRAPHQL_DOCUMENTS",
+    "MAX_PUBLIC_GRAPHQL_PAGE_BYTES",
+    "MAX_PUBLIC_GRAPHQL_SOURCE_REQUESTS",
     "PROTOCOL_CONFIRMATION_DOCUMENT",
     "TYPENAME_PROBE_DOCUMENT",
     "GraphQLDetectedDocument",
@@ -1920,4 +2450,8 @@ __all__ = [
     "GraphQLSurfaceDetector",
     "GraphQLSurfaceObservation",
     "GraphQLSemanticAcquirer",
+    "PublicGraphQLOperationAcquirer",
+    "PublicGraphQLOperationAcquisitionConfig",
+    "PublicGraphQLOperationAcquisitionResult",
+    "RegisteredGraphQLOperationSource",
 ]

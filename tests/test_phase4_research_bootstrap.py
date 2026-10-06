@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 import requests
@@ -72,6 +73,7 @@ from agent_core.research import (
     SecurityResearchOrchestrator,
     TargetClass,
     build_public_safe_graphql_summary,
+    candidate_ready_graphql_operation_templates,
 )
 from agent_core.research.outcomes import ExperimentOutcome
 from agent_core.research.evaluation import HypothesisProposalSource
@@ -499,6 +501,188 @@ def test_blind_bootstrap_passively_populates_graphql_semantics_and_graph(tmp_pat
         assert not state.hypotheses
         assert not state.findings
         assert store.verify_integrity(state.research_id).valid
+    finally:
+        vault.close()
+
+
+def test_bootstrap_prioritizes_bounded_public_graphql_operation_source(tmp_path):
+    store = ResearchStore(tmp_path / "public-graphql-bootstrap.sqlite3")
+    request_budget = RequestBudget(20, per_host_limit=20)
+    budgets = ResearchBudgetManager(
+        ResearchBudgetPolicy(wall_time_ceiling_seconds=3600.0),
+        request_budget=request_budget,
+        model_call_ceiling=1,
+    )
+    selected_policy = policy(allow_graphql=True).model_copy(
+        update={"request_budget": 20, "per_host_request_budget": 20}
+    )
+    initial = ResearchBootstrapper.register_target(
+        store,
+        research_id="research-public-graphql-bootstrap",
+        target_url=TARGET,
+        target_class=TargetClass.dedicated_lab,
+        scope_reference="scope-public-graphql-bootstrap",
+        policy=selected_policy,
+        budget_manager=budgets,
+        occurred_at=NOW,
+    )
+    vault = CredentialVault()
+    context = controlled(vault)
+    context.object_acquisition.extend(
+        OwnedObjectAcquisition(
+            owner_account_id=account.account_id,
+            collection_url=f"{TARGET}/owned-resources",
+            object_type="Resource",
+            identifier_field="id",
+            items_field="items",
+            max_items=1,
+        )
+        for account in context.accounts
+    )
+    acquisition_calls: list[dict[str, Any]] = []
+
+    def acquire_controlled_object(request):
+        acquisition_calls.append(request)
+        return {
+            "status_code": 200,
+            "body": {
+                "items": [{"id": f"synthetic-controlled-{len(acquisition_calls)}"}]
+            },
+        }
+
+    public_requests: list[tuple[str, str]] = []
+
+    def requester(method, url, **_kwargs):
+        public_requests.append((method, url))
+        response = requests.Response()
+        response.status_code = 200
+        response.url = url
+        response.headers["Content-Type"] = (
+            "text/html" if url == TARGET else "application/javascript"
+        )
+        response._content = (
+            b'<html><script src="/client.js"></script></html>'
+            if url == TARGET
+            else (
+                b"const viewerOperation = `query CurrentViewer "
+                b"{ viewer { id displayName } }`;"
+            )
+        )
+        response._content_consumed = True
+        return response
+
+    client = ScopedHTTPClient(
+        policy=selected_policy,
+        budget=request_budget,
+        requester=requester,
+    )
+
+    class PublicGraphQLRunner(FakeDiscoveryRunner):
+        def run(self, target, **kwargs):
+            result = super().run(target, **kwargs)
+            result["results"] = {
+                "graphql_endpoint_discovery": {
+                    "output": {
+                        "success": True,
+                        "observed_candidates": [
+                            {
+                                "url": f"{TARGET}/api/gql",
+                                "evidence_types": ["graphql_content_type"],
+                                "source": "public-api-metadata",
+                            }
+                        ],
+                        "confirmed_endpoints": [],
+                        "likely_endpoints": [],
+                    }
+                },
+                "graphql_schema_analyzer": {
+                    "output": {
+                        "success": True,
+                        "query_operations": [
+                            {
+                                "name": "viewer",
+                                "arguments": [],
+                                "return_type": "Viewer",
+                            }
+                        ],
+                        "mutation_operations": [],
+                        "subscription_operations": [],
+                        "planning_only": True,
+                    }
+                },
+            }
+            return result
+
+    runner = PublicGraphQLRunner(
+        request_budget,
+        surface=CanonicalAttackSurface(
+            target=TARGET,
+            routes=[
+                {
+                    "method": "GET",
+                    "path": "/owned-resources",
+                    "source": "synthetic-public-api-metadata",
+                    "confidence": "high",
+                    "evidence_refs": ["synthetic-owned-resources-route"],
+                    "content_types": ["application/json"],
+                }
+            ],
+            evidence_sources=[
+                SurfaceEvidence(
+                    source="synthetic-public-api-metadata",
+                    reference="synthetic-public-api-run",
+                )
+            ],
+        ),
+    )
+    runner.http_client = client
+    bootstrapper = ResearchBootstrapper(
+        store=store,
+        policy=selected_policy,
+        controlled_context=context,
+        request_budget=request_budget,
+        budget_manager=budgets,
+        target_id=initial.targets[0].target_id,
+        tool_runner=runner,
+        vault=vault,
+        object_acquisition_sender=acquire_controlled_object,
+        limits=ResearchBootstrapLimits(
+            maximum_discovery_target_requests=7,
+            maximum_graphql_discovery_requests=0,
+            maximum_public_graphql_source_requests=2,
+            maximum_public_graphql_assets=1,
+            maximum_bootstrap_model_calls=0,
+        ),
+        now=lambda: NOW,
+    )
+    try:
+        state = bootstrapper.prepare(initial)
+
+        assert public_requests == [("GET", TARGET), ("GET", f"{TARGET}/client.js")]
+        assert len(acquisition_calls) == 2
+        assert request_budget.total == 5
+        assert len(state.identities) == 2
+        assert len(state.objects) == 2
+        assert len({item.owner_identity_id for item in state.objects}) == 2
+        assert all(item.test_owned for item in state.objects)
+        assert all(
+            next(
+                surface
+                for surface in state.surfaces
+                if surface.surface_id == item.surface_id
+            ).surface_type.value
+            == "rest"
+            for item in state.objects
+        )
+        assert len(state.graphql_operations) == 1
+        assert len(candidate_ready_graphql_operation_templates(state)) == 1
+        assert (
+            candidate_ready_graphql_operation_templates(state)[0].variable_bindings
+            == ()
+        )
+        assert not state.experiment_history
+        assert not state.experiment_outcomes
+        assert not state.findings
     finally:
         vault.close()
 

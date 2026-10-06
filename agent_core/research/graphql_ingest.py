@@ -2026,18 +2026,60 @@ class GraphQLSemanticIngestor:
         )
         timestamp = occurred_at or datetime.now(timezone.utc).isoformat()
         capabilities = tuple(item.operation_type for item in parsed.operations)
+        source_kind = str(getattr(observation, "source_kind", ""))
+        static_public_document = source_kind in {
+            "public_client_asset",
+            "public_persisted_manifest",
+        }
+        authentication_requirement = (
+            GraphQLAuthenticationRequirement.unknown
+            if static_public_document and response is None
+            else _authentication_requirement(
+                getattr(observation, "identity_id", None), response
+            )
+        )
         surface, endpoint, semantic_surface, evidence, provenance = self._foundation(
             state,
             observation,
             occurred_at=timestamp,
-            evidence_kind=EvidenceKind.graphql_request_capture,
-            summary="A bounded GraphQL request document was structurally observed.",
-            schema_state=GraphQLSchemaState.capture_derived,
-            capabilities=capabilities,
-            authentication_requirement=_authentication_requirement(
-                getattr(observation, "identity_id", None), response
+            evidence_kind=(
+                EvidenceKind.graphql_document
+                if static_public_document
+                else EvidenceKind.graphql_request_capture
             ),
+            summary=(
+                "A bounded exact public GraphQL application document was statically "
+                "observed; execution and authorization behavior were not observed."
+                if static_public_document
+                else "A bounded GraphQL request document was structurally observed."
+            ),
+            schema_state=(
+                GraphQLSchemaState.document_derived
+                if static_public_document
+                else GraphQLSchemaState.capture_derived
+            ),
+            capabilities=capabilities,
+            authentication_requirement=authentication_requirement,
         )
+        if static_public_document:
+            source_metadata = PublicMetadata(
+                entries=(
+                    MetadataEntry(
+                        key="graphql.operation_source",
+                        value=source_kind,
+                    ),
+                    MetadataEntry(
+                        key="graphql.operation_executed",
+                        value=False,
+                    ),
+                    MetadataEntry(
+                        key="graphql.object_binding_observed",
+                        value=False,
+                    ),
+                )
+            )
+            evidence = evidence.model_copy(update={"metadata": source_metadata})
+            provenance = provenance.model_copy(update={"metadata": source_metadata})
         evidence_items = [evidence]
         if response is not None:
             evidence_items.append(
@@ -2080,9 +2122,7 @@ class GraphQLSemanticIngestor:
             evidence_references=evidence_refs,
             provenance_id=provenance.provenance_id,
         )
-        auth_requirement = _authentication_requirement(
-            getattr(observation, "identity_id", None), response
-        )
+        auth_requirement = authentication_requirement
         for parsed_operation in parsed.operations:
             role = GraphQLRootRole(parsed_operation.operation_type.value)
             root_name = role.value.title()
