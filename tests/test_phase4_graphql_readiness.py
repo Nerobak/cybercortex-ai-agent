@@ -13,6 +13,7 @@ from agent_core.policy import AssessmentPolicy, ScopeAsset
 from agent_core.research import (
     ControlledContextResearchAdapter,
     ControlledObjectDescriptor,
+    CrossSurfaceControlledObjectCorrelator,
     ExperimentCompiler,
     ExperimentCompilerContext,
     ExperimentRegistry,
@@ -158,6 +159,9 @@ def test_multi_surface_controlled_acquisition_reaches_graphql_candidate_readines
             method="GET",
             object_type="Resource",
             identifier_field="resourceRef",
+            identifier_parameter_reference=(
+                "parameter-resource-ref" if account_id == "account-a" else None
+            ),
         )
         for account_id in ("account-a", "account-b")
     )
@@ -173,6 +177,11 @@ def test_multi_surface_controlled_acquisition_reaches_graphql_candidate_readines
             object_id=f"synthetic-owned-{index}",
             owner_account_id=acquisition.owner_account_id,
             object_type=acquisition.object_type,
+            parameter_ids=(
+                (acquisition.identifier_parameter_reference,)
+                if acquisition.identifier_parameter_reference is not None
+                else ()
+            ),
             ownership_basis="owner_scoped_authenticated_collection",
             source_reference=owned_object_acquisition_reference(acquisition),
         )
@@ -196,24 +205,17 @@ def test_multi_surface_controlled_acquisition_reaches_graphql_candidate_readines
     }
 
     controlled = _with_registered_operation(controlled)
-    operation = controlled.graphql_operations[0]
-    variable = controlled.graphql_variables[0]
+    graph = build_graphql_graph_assertions(controlled, asserted_at=TS)
+    correlation = CrossSurfaceControlledObjectCorrelator().correlate(
+        controlled,
+        graph_assertions=graph,
+        templates=candidate_ready_graphql_operation_templates(controlled),
+    )
     ready, limitations = derive_candidate_ready_graphql_operations(
         controlled,
         descriptors,
         occurred_at=TS,
-        binding_evidence=(
-            RegisteredGraphQLObjectBindingEvidence(
-                operation_id=operation.operation_id,
-                variable_id=variable.variable_id,
-                argument_id=str(variable.linked_argument_id),
-                controlled_object_id=controlled.objects[0].object_id,
-                binding_basis=(
-                    GraphQLObjectBindingBasis.explicit_cross_surface_relationship
-                ),
-                evidence_references=controlled.objects[0].evidence_references,
-            ),
-        ),
+        binding_evidence=correlation.readiness_evidence,
     )
     templates = candidate_ready_graphql_operation_templates(ready)
     graph = build_graphql_graph_assertions(ready, asserted_at=TS)
@@ -245,6 +247,7 @@ def test_multi_surface_controlled_acquisition_reaches_graphql_candidate_readines
     assert len(records.objects) == 2
     assert all(item.surface_id == "surface-rest" for item in records.objects)
     assert len(records.evidence) == 2
+    assert len(correlation.bindings) == 1
     assert len(ready.graphql_operations) == 1
     assert len(templates) == 1
     assert generation.hypotheses

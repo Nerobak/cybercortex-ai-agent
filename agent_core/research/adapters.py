@@ -27,6 +27,7 @@ from agent_core.research.evaluation import (
 )
 from agent_core.research.provenance import reject_secret_material
 from agent_core.research.state import (
+    ControlledObjectReferenceEvidence,
     Endpoint,
     EvidenceArtifact,
     Fact,
@@ -875,6 +876,8 @@ class ControlledContextResearchAdapter:
         diagnostic_codes: set[str] = set()
         evidence: list[EvidenceArtifact] = []
         objects: list[ResearchObject] = []
+        parameters = {item.parameter_id: item for item in state.parameters}
+        endpoints = {item.endpoint_id: item for item in state.endpoints}
         controlled_objects = {
             (item.owner_account_id, item.object_id): item
             for item in (*context.objects, *acquired_objects)
@@ -946,11 +949,63 @@ class ControlledContextResearchAdapter:
                     provenance_id=provenance_id,
                 )
             )
+            ownership_evidence = evidence[-1]
+            valid_parameters = tuple(
+                sorted(
+                    parameter_id
+                    for parameter_id in controlled_object.parameter_ids
+                    if (
+                        (parameter := parameters.get(parameter_id)) is not None
+                        and (endpoint := endpoints.get(parameter.endpoint_id))
+                        is not None
+                        and endpoint.surface_id == surface_id
+                    )
+                )
+            )
+            if len(valid_parameters) != len(controlled_object.parameter_ids):
+                limitations.append("controlled_object_parameter_evidence_unavailable")
+                diagnostic_codes.add("controlled_object_parameter_evidence_unavailable")
+            reference_evidence = ()
+            if (
+                controlled_object.ownership_basis
+                == "owner_scoped_authenticated_collection"
+                and controlled_object.source_reference is not None
+            ):
+                value_fingerprint = digest_for(
+                    {"controlled_object_reference": controlled_object.object_id}
+                )
+                reference_evidence = tuple(
+                    ControlledObjectReferenceEvidence(
+                        reference_evidence_id=stable_research_identifier(
+                            "object-reference-evidence",
+                            state.research_id,
+                            ownership_evidence.evidence_id,
+                            parameter_id,
+                            value_fingerprint,
+                        ),
+                        source_surface_id=surface_id,
+                        source_request_reference=controlled_object.source_reference,
+                        parameter_id=parameter_id,
+                        ownership_evidence_reference=ownership_evidence.evidence_id,
+                        value_fingerprint=value_fingerprint,
+                        evidence_references=tuple(
+                            sorted(
+                                {
+                                    ownership_evidence.evidence_id,
+                                    *parameters[parameter_id].evidence_references,
+                                }
+                            )
+                        ),
+                        provenance_id=provenance_id,
+                    )
+                    for parameter_id in valid_parameters
+                )
             objects.append(
                 ResearchObject(
                     object_id=stable_research_identifier(
                         "object",
                         target_id,
+                        owner_identity,
                         controlled_object.object_type,
                         controlled_object.object_id,
                     ),
@@ -969,7 +1024,8 @@ class ControlledContextResearchAdapter:
                         else None
                     ),
                     test_owned=True,
-                    parameter_references=controlled_object.parameter_ids,
+                    parameter_references=valid_parameters,
+                    reference_evidence=reference_evidence,
                     evidence_references=(evidence_id,),
                     provenance_id=provenance_id,
                 )

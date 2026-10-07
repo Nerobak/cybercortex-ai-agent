@@ -651,11 +651,11 @@ class PublicSafeResearchPacketBuilder:
                     "object_id": item.object_id,
                     "surface_id": item.surface_id,
                     "object_type": item.object_type,
-                    "object_reference": item.object_reference,
                     "owner_identity_id": item.owner_identity_id,
                     "tenant_reference": item.tenant_reference,
                     "test_owned": item.test_owned,
                     "parameter_references": list(item.parameter_references),
+                    "has_object_reference_evidence": bool(item.reference_evidence),
                 }
                 for item in state.objects
                 if item.test_owned and item.target_id in target_ids

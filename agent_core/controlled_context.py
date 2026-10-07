@@ -92,6 +92,9 @@ class OwnedObjectAcquisition(StrictModel):
     method: str = "GET"
     object_type: str = Field(default="unknown", min_length=1, max_length=100)
     identifier_field: str = Field(min_length=1, max_length=200)
+    identifier_parameter_reference: str | None = Field(
+        default=None, min_length=1, max_length=255
+    )
     tenant_field: str | None = Field(default=None, min_length=1, max_length=200)
     items_field: str | None = Field(default=None, min_length=1, max_length=200)
     max_items: int = Field(default=20, ge=1, le=20)
@@ -630,6 +633,11 @@ class OwnedObjectAcquirer:
             tenant_id=tenant_id,
             object_type=config.object_type,
             test_owned=True,
+            parameter_ids=(
+                (config.identifier_parameter_reference,)
+                if config.identifier_parameter_reference is not None
+                else ()
+            ),
             ownership_basis="owner_scoped_authenticated_collection",
             source_reference=owned_object_acquisition_reference(config),
         )

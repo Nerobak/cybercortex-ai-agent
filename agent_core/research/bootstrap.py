@@ -57,6 +57,9 @@ from agent_core.research.authenticated_discovery import (
 from agent_core.research.budgets import ResearchBudgetManager
 from agent_core.research.candidates import ExperimentCandidateBuilder
 from agent_core.research.compiler import ExperimentCompilerContext
+from agent_core.research.cross_surface_correlation import (
+    CrossSurfaceControlledObjectCorrelator,
+)
 from agent_core.research.graphql import (
     GraphQLAuthenticationRequirement,
     GraphQLSchemaState,
@@ -274,6 +277,7 @@ class ResearchBootstrapper:
         self.packet_builder = packet_builder
         self.candidate_builder = candidate_builder
         self.candidate_compiler_context = candidate_compiler_context
+        self.cross_surface_correlator = CrossSurfaceControlledObjectCorrelator()
         self.allowed_hypothesis_categories = tuple(allowed_hypothesis_categories)
         self.confirmation_policy_reference = opaque_reference(
             confirmation_policy_reference
@@ -805,6 +809,17 @@ class ResearchBootstrapper:
         adapted, authenticated_graphql_limitations = (
             self._discover_authenticated_graphql(adapted, target)
         )
+        correlation = self.cross_surface_correlator.correlate(
+            adapted,
+            graph_assertions=build_graphql_graph_assertions(
+                adapted, asserted_at=self._now(adapted)
+            ),
+            templates=candidate_ready_graphql_operation_templates(adapted),
+        )
+        operation_bindings = (
+            *operation_bindings,
+            *correlation.readiness_evidence,
+        )
         adapted, readiness_limitations = derive_candidate_ready_graphql_operations(
             adapted,
             self._controlled_object_descriptors(adapted),
@@ -813,6 +828,10 @@ class ResearchBootstrapper:
         )
         diagnostic_codes = set(adapted.diagnostic_codes)
         diagnostic_codes.update(acquisition_diagnostics)
+        diagnostic_codes.update(
+            f"graphql_correlation_{item.reason.value}"
+            for item in correlation.rejections
+        )
         if adapted.graphql_surfaces and not adapted.graphql_operations:
             diagnostic_codes.add("no_graphql_operation")
         if adapted.graphql_surfaces and not adapted.objects:
@@ -1296,6 +1315,12 @@ class ResearchBootstrapper:
                 for item in current.graphql_surfaces
                 if item.graphql_surface_id == operation.graphql_surface_id
             )
+            if research_object.surface_id != semantic_surface.surface_id:
+                limitations.add(
+                    "A cross-surface controlled object requires a closed typed "
+                    "correlation before GraphQL binding."
+                )
+                continue
             bindings.append(
                 RegisteredGraphQLObjectBindingEvidence(
                     operation_id=operation.operation_id,
@@ -1303,9 +1328,7 @@ class ResearchBootstrapper:
                     argument_id=str(variable.linked_argument_id),
                     controlled_object_id=research_object.object_id,
                     binding_basis=(
-                        GraphQLObjectBindingBasis.explicit_cross_surface_relationship
-                        if research_object.surface_id != semantic_surface.surface_id
-                        else GraphQLObjectBindingBasis.registered_graphql_acquisition
+                        GraphQLObjectBindingBasis.registered_graphql_acquisition
                     ),
                     evidence_references=tuple(
                         sorted(

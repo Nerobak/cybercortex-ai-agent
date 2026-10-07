@@ -29,6 +29,7 @@ from agent_core.research.state import (
     AttackChain,
     AttackChainStep,
     BudgetState,
+    ControlledObjectReferenceEvidence,
     ControlledImpact,
     Endpoint,
     EvidenceArtifact,
@@ -224,6 +225,14 @@ from agent_core.research.graphql_readiness import (
     RegisteredGraphQLObjectBindingEvidence,
     candidate_ready_graphql_operation_templates,
     derive_candidate_ready_graphql_operations,
+)
+from agent_core.research.cross_surface_correlation import (
+    CROSS_SURFACE_CORRELATION_VERSION,
+    CorrelatedGraphQLVariableBinding,
+    CrossSurfaceControlledObjectCorrelationResult,
+    CrossSurfaceControlledObjectCorrelator,
+    CrossSurfaceCorrelationRejection,
+    CrossSurfaceCorrelationRejectionReason,
 )
 from agent_core.research.graphql_execution import (
     GRAPHQL_EXECUTION_VERSION,
@@ -960,6 +969,7 @@ __all__ = [
     "AttackChainStatus",
     "AttackChainStep",
     "BudgetState",
+    "ControlledObjectReferenceEvidence",
     "BudgetUpdatedPayload",
     "BoundedGraphQuery",
     "CleanupStatus",
@@ -1099,6 +1109,12 @@ __all__ = [
     "GraphQLVariableRecord",
     "GraphQLObjectBindingBasis",
     "RegisteredGraphQLObjectBindingEvidence",
+    "CROSS_SURFACE_CORRELATION_VERSION",
+    "CorrelatedGraphQLVariableBinding",
+    "CrossSurfaceControlledObjectCorrelationResult",
+    "CrossSurfaceControlledObjectCorrelator",
+    "CrossSurfaceCorrelationRejection",
+    "CrossSurfaceCorrelationRejectionReason",
     "GraphQLTraceEvent",
     "GRAPHQL_HYPOTHESIS_VERSION",
     "GRAPHQL_CANDIDATE_VERSION",

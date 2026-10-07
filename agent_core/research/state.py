@@ -359,6 +359,41 @@ class TokenRef(ResearchContract):
         return self
 
 
+class ControlledObjectReferenceEvidence(ResearchContract):
+    """Secret-safe proof that one acquired object is usable by a REST parameter.
+
+    The raw response value remains in controlled runtime context. Persistent
+    research state retains only its fingerprint and the typed semantic links
+    needed to prove where the reference came from.
+    """
+
+    reference_evidence_id: OpaqueIdentifier
+    source_surface_id: SurfaceId
+    source_request_reference: OpaqueIdentifier
+    parameter_id: ParameterId
+    ownership_evidence_reference: EvidenceArtifactId
+    value_fingerprint: Sha256Digest
+    evidence_references: tuple[EvidenceArtifactId, ...] = Field(
+        min_length=1, max_length=100
+    )
+    provenance_id: ProvenanceRecordId
+
+    @model_validator(mode="after")
+    def validate_reference_evidence(self) -> "ControlledObjectReferenceEvidence":
+        object.__setattr__(
+            self,
+            "evidence_references",
+            _canonical_references(
+                self.evidence_references, "controlled object reference evidence"
+            ),
+        )
+        if self.ownership_evidence_reference not in self.evidence_references:
+            raise ValueError(
+                "controlled object reference evidence must include ownership evidence"
+            )
+        return self
+
+
 class ResearchObject(ResearchContract):
     object_id: ResearchObjectId
     target_id: TargetAssetId
@@ -369,6 +404,9 @@ class ResearchObject(ResearchContract):
     tenant_reference: OpaqueIdentifier | None = None
     test_owned: StrictBool
     parameter_references: tuple[ParameterId, ...] = Field(default=(), max_length=100)
+    reference_evidence: tuple[ControlledObjectReferenceEvidence, ...] = Field(
+        default=(), max_length=100
+    )
     evidence_references: tuple[EvidenceArtifactId, ...] = Field(
         min_length=1, max_length=100
     )
@@ -390,6 +428,27 @@ class ResearchObject(ResearchContract):
                 self.parameter_references, "object parameter references"
             ),
         )
+        reference_ids = tuple(
+            item.reference_evidence_id for item in self.reference_evidence
+        )
+        _unique(reference_ids, "controlled object reference evidence IDs")
+        object.__setattr__(
+            self,
+            "reference_evidence",
+            tuple(
+                sorted(
+                    self.reference_evidence,
+                    key=lambda item: item.reference_evidence_id,
+                )
+            ),
+        )
+        if any(
+            item.parameter_id not in self.parameter_references
+            for item in self.reference_evidence
+        ):
+            raise ValueError(
+                "controlled object reference evidence requires an object parameter"
+            )
         return self
 
 
@@ -2062,6 +2121,63 @@ class ResearchState(ResearchContract):
                 item.parameter_references, parameter_ids, "object parameters"
             )
             _require_reference(item.provenance_id, provenance_ids, "object provenance")
+            for reference in item.reference_evidence:
+                _require_reference(
+                    reference.source_surface_id,
+                    surface_ids,
+                    "object reference source surface",
+                )
+                if reference.source_surface_id != item.surface_id:
+                    raise ValueError(
+                        "object reference evidence does not match the object surface"
+                    )
+                _require_reference(
+                    reference.parameter_id,
+                    parameter_ids,
+                    "object reference parameter",
+                )
+                parameter = next(
+                    value
+                    for value in self.parameters
+                    if value.parameter_id == reference.parameter_id
+                )
+                endpoint = next(
+                    value
+                    for value in self.endpoints
+                    if value.endpoint_id == parameter.endpoint_id
+                )
+                if endpoint.surface_id != reference.source_surface_id:
+                    raise ValueError(
+                        "object reference parameter does not match its source surface"
+                    )
+                _require_reference(
+                    reference.ownership_evidence_reference,
+                    evidence_ids,
+                    "object reference ownership evidence",
+                )
+                _require_references(
+                    reference.evidence_references,
+                    evidence_ids,
+                    "object reference evidence",
+                )
+                _require_reference(
+                    reference.provenance_id,
+                    provenance_ids,
+                    "object reference provenance",
+                )
+                ownership = next(
+                    value
+                    for value in self.evidence
+                    if value.evidence_id == reference.ownership_evidence_reference
+                )
+                if (
+                    reference.ownership_evidence_reference
+                    not in item.evidence_references
+                    or ownership.source_reference != reference.source_request_reference
+                ):
+                    raise ValueError(
+                        "object reference evidence lacks acquisition ownership closure"
+                    )
 
         graphql_surface_by_id = {
             item.graphql_surface_id: item for item in self.graphql_surfaces

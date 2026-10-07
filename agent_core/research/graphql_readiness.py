@@ -20,19 +20,25 @@ from agent_core.research.graphql import (
     GraphQLOperationRecord,
     GraphQLSemanticRole,
     GraphQLTypeKind,
+    build_graphql_graph_assertions,
 )
 from agent_core.research.graphql_candidates import (
     build_registered_graphql_operation_template,
 )
 from agent_core.research.state import ProvenanceRecord, ResearchState
 from agent_core.research.types import (
+    EntityKind,
     IdentityEligibility,
+    MetadataEntry,
+    PublicMetadata,
     ProvenanceProducerType,
     ResearchConfidence,
     ResearchContract,
+    ResearchPredicate,
+    Sha256Digest,
 )
 
-GRAPHQL_READINESS_VERSION = "phase4-graphql-readiness-v2"
+GRAPHQL_READINESS_VERSION = "phase4-graphql-readiness-v3"
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,13 @@ class RegisteredGraphQLObjectBindingEvidence(ResearchContract):
     controlled_object_id: str = Field(min_length=1, max_length=255)
     binding_basis: GraphQLObjectBindingBasis
     evidence_references: tuple[str, ...] = Field(min_length=1, max_length=100)
+    owner_identity_id: str | None = Field(default=None, min_length=1, max_length=255)
+    source_template_id: str | None = Field(default=None, min_length=1, max_length=255)
+    object_reference_evidence_id: str | None = Field(
+        default=None, min_length=1, max_length=255
+    )
+    relationship_assertion_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    binding_fingerprint: Sha256Digest | None = None
 
     @model_validator(mode="after")
     def canonicalize_evidence(self) -> "RegisteredGraphQLObjectBindingEvidence":
@@ -68,6 +81,26 @@ class RegisteredGraphQLObjectBindingEvidence(ResearchContract):
         if len(references) != len(self.evidence_references):
             raise ValueError("GraphQL binding evidence must not contain duplicates")
         object.__setattr__(self, "evidence_references", references)
+        assertion_ids = tuple(sorted(set(self.relationship_assertion_ids)))
+        if len(assertion_ids) != len(self.relationship_assertion_ids):
+            raise ValueError(
+                "GraphQL binding relationships must not contain duplicates"
+            )
+        object.__setattr__(self, "relationship_assertion_ids", assertion_ids)
+        if (
+            self.binding_basis
+            is GraphQLObjectBindingBasis.explicit_cross_surface_relationship
+        ):
+            if (
+                self.owner_identity_id is None
+                or self.source_template_id is None
+                or self.object_reference_evidence_id is None
+                or len(assertion_ids) < 2
+                or self.binding_fingerprint is None
+            ):
+                raise ValueError(
+                    "cross-surface GraphQL binding requires closed typed evidence"
+                )
         return self
 
 
@@ -144,6 +177,14 @@ def _apply_object_bindings(
     surfaces = {item.graphql_surface_id: item for item in state.graphql_surfaces}
     known_evidence = {item.evidence_id for item in state.evidence}
     provenance = {item.provenance_id: item for item in state.provenance}
+    template_by_id = {
+        item.template_id: item
+        for item in candidate_ready_graphql_operation_templates(state)
+    }
+    graph_assertions = {
+        item.assertion_id: item
+        for item in build_graphql_graph_assertions(state, asserted_at=occurred_at)
+    }
 
     for binding in sorted(
         bindings,
@@ -201,6 +242,57 @@ def _apply_object_bindings(
             GraphQLObjectBindingBasis.explicit_cross_surface_relationship
         ):
             continue
+        if cross_surface:
+            source_template = template_by_id.get(str(binding.source_template_id))
+            references = {
+                item.reference_evidence_id: item
+                for item in controlled_object.reference_evidence
+            }
+            reference = references.get(str(binding.object_reference_evidence_id))
+            selected_assertions = tuple(
+                graph_assertions.get(assertion_id)
+                for assertion_id in binding.relationship_assertion_ids
+            )
+            variable_linked = any(
+                item is not None
+                and item.source.entity_kind is EntityKind.graphql_variable
+                and item.source.entity_id == variable.variable_id
+                and item.relation is ResearchPredicate.graphql_variable_binds_argument
+                and item.target.entity_kind is EntityKind.graphql_argument
+                and item.target.entity_id == argument.argument_id
+                for item in selected_assertions
+            )
+            parameter_linked = any(
+                item is not None
+                and reference is not None
+                and item.source.entity_kind is EntityKind.graphql_argument
+                and item.source.entity_id == argument.argument_id
+                and item.relation is ResearchPredicate.crosses_surface
+                and item.target.entity_kind is EntityKind.parameter
+                and item.target.entity_id == reference.parameter_id
+                for item in selected_assertions
+            )
+            if (
+                binding.owner_identity_id != owner.identity_id
+                or source_template is None
+                or source_template.operation_id != operation.operation_id
+                or reference is None
+                or binding.binding_fingerprint is None
+                or any(item is None for item in selected_assertions)
+                or not variable_linked
+                or not parameter_linked
+                or not set(reference.evidence_references).issubset(
+                    binding.evidence_references
+                )
+                or any(
+                    not set(item.evidence_references).issubset(
+                        binding.evidence_references
+                    )
+                    for item in selected_assertions
+                    if item is not None
+                )
+            ):
+                continue
 
         evidence = tuple(
             sorted(
@@ -221,6 +313,7 @@ def _apply_object_bindings(
             argument.argument_id,
             controlled_object.object_id,
             binding.binding_basis.value,
+            binding.binding_fingerprint or "direct-binding",
         )
         provenance.setdefault(
             provenance_id,
@@ -229,12 +322,51 @@ def _apply_object_bindings(
                 producer_type=ProvenanceProducerType.deterministic,
                 producer_name="graphql-registered-operation-binding",
                 producer_version=GRAPHQL_READINESS_VERSION,
-                source_references=evidence,
+                source_references=tuple(
+                    sorted(
+                        {
+                            *evidence,
+                            *binding.relationship_assertion_ids,
+                            *(
+                                (binding.source_template_id,)
+                                if binding.source_template_id
+                                else ()
+                            ),
+                            *(
+                                (binding.object_reference_evidence_id,)
+                                if binding.object_reference_evidence_id
+                                else ()
+                            ),
+                            *(
+                                (binding.owner_identity_id,)
+                                if binding.owner_identity_id
+                                else ()
+                            ),
+                            *(
+                                (binding.binding_fingerprint,)
+                                if binding.binding_fingerprint
+                                else ()
+                            ),
+                        }
+                    )
+                ),
                 summary=(
                     "Bound an exact registered GraphQL variable and argument to "
                     "an existing owner-controlled object using typed evidence."
                 ),
                 occurred_at=occurred_at,
+                metadata=(
+                    PublicMetadata(
+                        entries=(
+                            MetadataEntry(
+                                key="graphql.binding_fingerprint",
+                                value=binding.binding_fingerprint,
+                            ),
+                        )
+                    )
+                    if binding.binding_fingerprint is not None
+                    else PublicMetadata()
+                ),
             ),
         )
         variables[variable.variable_id] = variable.model_copy(
