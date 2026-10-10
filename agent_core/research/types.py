@@ -365,6 +365,15 @@ class ResearchExperimentStatus(str, Enum):
     cleanup_failed = "cleanup_failed"
 
 
+class CandidateSelectionMethod(str, Enum):
+    """Durable provenance for routine experiment-candidate selection."""
+
+    model_selected = "model_selected"
+    singleton_deterministic = "singleton_deterministic"
+    deterministic_fallback = "deterministic_fallback"
+    model_selection_unavailable = "model_selection_unavailable"
+
+
 class CleanupStatus(str, Enum):
     not_required = "not_required"
     reserved = "reserved"

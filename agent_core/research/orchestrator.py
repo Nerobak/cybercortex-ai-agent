@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import Field, StrictInt
+from pydantic import Field, StrictBool, StrictInt, model_validator
 
 from agent_core.research.authorization import (
     DuplicateExperimentError,
@@ -45,6 +45,11 @@ from agent_core.research.evaluation import (
     ResearchConsequence,
     ResearchEvaluation,
 )
+from agent_core.research.events import (
+    CandidateSelectionRecordedPayload,
+    ResearchEvent,
+    ResearchEventType,
+)
 from agent_core.research.experiments import ExperimentProposal, SecurityExperiment
 from agent_core.research.outcomes import ExperimentOutcome
 from agent_core.research.primitives import (
@@ -64,6 +69,7 @@ from agent_core.research.reasoning import (
     PublicSafeResearchPacketBuilder,
     ResearchReasoningEngine,
     ResearchReasoningError,
+    ResearchModelFailure,
     ResearchSelectionAction,
     ResearchSelectionResult,
     ResearchStrategyAction,
@@ -72,10 +78,13 @@ from agent_core.research.reasoning import (
 from agent_core.research.selection import (
     ExperimentSelector,
     InformationGainEstimate,
+    InformationValue,
     ProposalRankingAdvice,
     material_experiment_fingerprint,
 )
 from agent_core.research.state import (
+    CandidateSelectionRankingEvidence,
+    CandidateSelectionRecord,
     FindingRecord,
     ResearchExperimentRecord,
     ResearchState,
@@ -83,6 +92,7 @@ from agent_core.research.state import (
 from agent_core.research.store import ResearchStore
 from agent_core.research.transitions import ResearchStateMachine
 from agent_core.research.types import (
+    CandidateSelectionMethod,
     HypothesisResearchStatus,
     FindingStatus,
     ReproductionPlanStatus,
@@ -97,6 +107,7 @@ class OrchestratorStopReason(str, Enum):
     no_research_hypotheses = "no_research_hypotheses"
     no_eligible_hypotheses = "no_eligible_hypotheses"
     no_eligible_experiments = "no_eligible_experiments"
+    model_selection_unavailable = "model_selection_unavailable"
     global_experiment_budget_exhausted = "global_experiment_budget_exhausted"
     request_budget_exhausted = "request_budget_exhausted"
     model_budget_exhausted = "model_budget_exhausted"
@@ -120,6 +131,30 @@ class ResearchLoopResult(ResearchContract):
     evaluations: tuple[ResearchEvaluation, ...] = Field(default=(), max_length=10_000)
     stop_reason: OrchestratorStopReason | None = None
     completed: bool = False
+
+
+class DeterministicSelectionFallbackPolicy(ResearchContract):
+    """Opt-in failover for classified routine candidate-selection failures."""
+
+    enabled: StrictBool = False
+    fallback_on: tuple[ResearchModelFailure, ...] = (
+        ResearchModelFailure.timeout,
+        ResearchModelFailure.provider_unavailable,
+        ResearchModelFailure.invalid_output,
+        ResearchModelFailure.rate_limited,
+        ResearchModelFailure.schema_rejected,
+    )
+
+    @model_validator(mode="after")
+    def validate_failure_categories(self) -> "DeterministicSelectionFallbackPolicy":
+        if len(self.fallback_on) != len(set(self.fallback_on)):
+            raise ValueError("selection fallback failure categories must be unique")
+        if ResearchModelFailure.model_budget_exhausted in self.fallback_on:
+            raise ValueError("model budget exhaustion is not a selection fallback")
+        return self
+
+    def permits(self, failure: ResearchModelFailure) -> bool:
+        return self.enabled and failure in self.fallback_on
 
 
 class ChainStrategyResult(ResearchContract):
@@ -221,6 +256,7 @@ class SecurityResearchOrchestrator:
         reproduction_planner: ReproductionPlanner | None = None,
         confirmation_evaluator: FindingConfirmationEvaluator | None = None,
         enable_finding_confirmation: bool = False,
+        selection_fallback_policy: (DeterministicSelectionFallbackPolicy | None) = None,
     ) -> None:
         self.store = store
         self.compiler = compiler
@@ -244,6 +280,9 @@ class SecurityResearchOrchestrator:
             confirmation_evaluator or FindingConfirmationEvaluator()
         )
         self.enable_finding_confirmation = bool(enable_finding_confirmation)
+        self.selection_fallback_policy = (
+            selection_fallback_policy or DeterministicSelectionFallbackPolicy()
+        )
         if self.compiler_context is None:
             raise TypeError("the research orchestrator requires compiler context")
         if self.runtime is None:
@@ -397,6 +436,9 @@ class SecurityResearchOrchestrator:
             model_proposals: tuple[ExperimentProposal, ...] = ()
             experiment_candidates: tuple[ExperimentCandidate, ...] = ()
             model_failure_code: str | None = None
+            model_failure_category: str | None = None
+            selection_method: CandidateSelectionMethod | None = None
+            candidate_by_proposal_id: dict[str, ExperimentCandidate] = {}
             lightweight_selection = bool(
                 self.candidate_builder is not None
                 and self.candidate_packet_builder is not None
@@ -421,8 +463,15 @@ class SecurityResearchOrchestrator:
                             # strategic information, so keep the ordinary freshness,
                             # compiler, selector, policy, and authorization path while
                             # avoiding an unnecessary model call.
-                            model_proposals = (
-                                materialize_candidate(experiment_candidates[0], state),
+                            proposal = materialize_candidate(
+                                experiment_candidates[0], state
+                            )
+                            model_proposals = (proposal,)
+                            candidate_by_proposal_id[proposal.proposal_id] = (
+                                experiment_candidates[0]
+                            )
+                            selection_method = (
+                                CandidateSelectionMethod.singleton_deterministic
                             )
                             state = self._with_diagnostic_codes(
                                 state, "singleton_deterministic_selection"
@@ -463,16 +512,47 @@ class SecurityResearchOrchestrator:
                                 for item in experiment_candidates
                                 if item.candidate_id == decision.selected_candidate_id
                             )
-                            model_proposals = (
-                                materialize_candidate(
-                                    selected_candidate,
-                                    state,
-                                    model_decision_id=decision.decision_id,
-                                ),
+                            proposal = materialize_candidate(
+                                selected_candidate,
+                                state,
+                                model_decision_id=decision.decision_id,
                             )
+                            model_proposals = (proposal,)
+                            candidate_by_proposal_id[proposal.proposal_id] = (
+                                selected_candidate
+                            )
+                            selection_method = CandidateSelectionMethod.model_selected
                             next_is_pivot = next_is_pivot or (
                                 decision.action is ResearchSelectionAction.pivot
                             )
+                        elif len(experiment_candidates) > 1:
+                            failure = ResearchModelFailure.provider_unavailable
+                            model_failure_category = failure.value
+                            model_failure_code = "model_provider_unavailable"
+                            invalid_model_outputs += 1
+                            if self.selection_fallback_policy.permits(failure):
+                                model_proposals = tuple(
+                                    materialize_candidate(item, state)
+                                    for item in experiment_candidates
+                                )
+                                candidate_by_proposal_id.update(
+                                    {
+                                        proposal.proposal_id: candidate
+                                        for proposal, candidate in zip(
+                                            model_proposals,
+                                            experiment_candidates,
+                                            strict=True,
+                                        )
+                                    }
+                                )
+                                selection_method = (
+                                    CandidateSelectionMethod.deterministic_fallback
+                                )
+                                state = self._with_diagnostic_codes(
+                                    state,
+                                    model_failure_code,
+                                    "deterministic_selection_fallback",
+                                )
                     else:
                         packet = self.packet_builder.build(  # type: ignore[union-attr]
                             state, policy_limitations=self.policy_limitations
@@ -500,6 +580,7 @@ class SecurityResearchOrchestrator:
                     if not lightweight_selection:
                         model_proposals = decision.proposals
                 except ResearchReasoningError as exc:
+                    model_failure_category = exc.reason.value
                     model_failure_code = {
                         "invalid_output": "model_invalid_structured_response",
                         "provider_unavailable": "model_provider_unavailable",
@@ -528,9 +609,38 @@ class SecurityResearchOrchestrator:
                             stop_reason=OrchestratorStopReason.model_budget_exhausted,
                             completed=True,
                         )
-                    if (
+                    fallback_applied = bool(
+                        lightweight_selection
+                        and experiment_candidates
+                        and self.selection_fallback_policy.permits(exc.reason)
+                    )
+                    if fallback_applied:
+                        model_proposals = tuple(
+                            materialize_candidate(item, state)
+                            for item in experiment_candidates
+                        )
+                        candidate_by_proposal_id.update(
+                            {
+                                proposal.proposal_id: candidate
+                                for proposal, candidate in zip(
+                                    model_proposals,
+                                    experiment_candidates,
+                                    strict=True,
+                                )
+                            }
+                        )
+                        selection_method = (
+                            CandidateSelectionMethod.deterministic_fallback
+                        )
+                        state = self._with_diagnostic_codes(
+                            state,
+                            model_failure_code,
+                            "deterministic_selection_fallback",
+                        )
+                    elif (
                         invalid_model_outputs
                         >= self.budget_manager.policy.invalid_model_output_limit
+                        and not (lightweight_selection and experiment_candidates)
                         and not static_proposals
                         and self.proposal_source is None
                     ):
@@ -568,6 +678,7 @@ class SecurityResearchOrchestrator:
                 cleanup_barrier=bool(getattr(barrier, "active", False)),
                 policy_reference=self.compiler_context.policy_reference,
                 policy_fingerprint=self._policy_fingerprint(),
+                require_model_capacity=selection_method is None,
             )
             if next_is_pivot and previous_experiment is not None:
                 plan = self.pivot_planner.plan(
@@ -588,7 +699,11 @@ class SecurityResearchOrchestrator:
                 if model_failure_code is not None:
                     diagnostic_codes.append(model_failure_code)
                 if not candidates:
-                    diagnostic_codes.append("no_proposal")
+                    diagnostic_codes.append(
+                        "model_selection_unavailable"
+                        if experiment_candidates and model_failure_category is not None
+                        else "no_proposal"
+                    )
                 elif any(
                     reason.value == "invalid_proposal"
                     for assessment in selection.assessments
@@ -616,7 +731,17 @@ class SecurityResearchOrchestrator:
                     diagnostic_codes.append("missing_authentication_mechanism")
                 state = self._with_diagnostic_codes(state, *diagnostic_codes)
                 reason = self._selection_stop_reason(selection)
-                state = self._stop(state, reason)
+                selection_record = None
+                if experiment_candidates and model_failure_category is not None:
+                    if reason is OrchestratorStopReason.no_eligible_experiments:
+                        reason = OrchestratorStopReason.model_selection_unavailable
+                    selection_record = self._candidate_selection_record(
+                        state,
+                        method=CandidateSelectionMethod.model_selection_unavailable,
+                        eligible_candidate_count=len(experiment_candidates),
+                        model_failure_category=model_failure_category,
+                    )
+                state = self._stop(state, reason, selection_record=selection_record)
                 return ResearchLoopResult(
                     research_id=research_id,
                     state=state,
@@ -631,11 +756,40 @@ class SecurityResearchOrchestrator:
                 for item in candidates
                 if item.proposal_id == selection.selected.proposal_id
             )
+            selection_record = None
+            if selection_method is not None:
+                selected_candidate = candidate_by_proposal_id.get(
+                    selected_proposal.proposal_id
+                )
+                if selected_candidate is None:
+                    raise ValueError(
+                        "candidate selection lost its immutable candidate binding"
+                    )
+                selection_record = self._candidate_selection_record(
+                    state,
+                    method=selection_method,
+                    eligible_candidate_count=len(experiment_candidates),
+                    selected_candidate=selected_candidate,
+                    selected_proposal=selected_proposal,
+                    information_value=selection.selected.information_value,
+                    model_decision_id=(
+                        decision.decision_id
+                        if selection_method is CandidateSelectionMethod.model_selected
+                        else None
+                    ),
+                    model_failure_category=(
+                        model_failure_category
+                        if selection_method
+                        is CandidateSelectionMethod.deterministic_fallback
+                        else None
+                    ),
+                )
             state = self._transition(
                 state,
                 ResearchRunStatus.awaiting_authorization,
                 "experiment-selected",
                 replacement=self._with_synchronized_budget(state),
+                selection_record=selection_record,
             )
             executable_proposal = self._rebase_proposals((selected_proposal,), state)[0]
             experiment = self.compiler.compile(
@@ -1100,6 +1254,7 @@ class SecurityResearchOrchestrator:
         reason: str,
         *,
         replacement: ResearchState | None = None,
+        selection_record: CandidateSelectionRecord | None = None,
     ) -> ResearchState:
         occurred_at = self._now(state.updated_at)
         machine = ResearchStateMachine(state)
@@ -1121,15 +1276,59 @@ class SecurityResearchOrchestrator:
                 updated_at=next_state.updated_at,
             )
             next_state = ResearchState.model_validate(payload)
+        events = [event]
+        if selection_record is not None:
+            if (
+                selection_record.source_state_revision != state.revision
+                or selection_record.recorded_state_revision != next_state.revision
+            ):
+                raise ValueError("candidate selection revision is stale")
+            payload = next_state.model_dump(mode="python")
+            payload["candidate_selections"] = (
+                *next_state.candidate_selections,
+                selection_record,
+            )
+            next_state = ResearchState.model_validate(payload)
+            events.append(
+                ResearchEvent(
+                    event_id=_identifier(
+                        "event",
+                        state.research_id,
+                        selection_record.selection_id,
+                        "candidate-selection-recorded",
+                    ),
+                    research_id=state.research_id,
+                    event_type=ResearchEventType.candidate_selection_recorded,
+                    state_revision=next_state.revision,
+                    provenance_id=self._provenance_id(state),
+                    occurred_at=occurred_at,
+                    summary=(
+                        "Candidate selection provenance recorded using "
+                        f"{selection_record.method.value}."
+                    ),
+                    payload=CandidateSelectionRecordedPayload(
+                        selection_id=selection_record.selection_id,
+                        selection_method=selection_record.method,
+                        candidate_id=selection_record.selected_candidate_id,
+                        model_failure_category=(
+                            selection_record.model_failure_category
+                        ),
+                    ),
+                )
+            )
         return self.store.commit_revision(
             state.research_id,
             expected_revision=state.revision,
             state=next_state,
-            events=(event,),
+            events=tuple(events),
         )
 
     def _stop(
-        self, state: ResearchState, reason: OrchestratorStopReason
+        self,
+        state: ResearchState,
+        reason: OrchestratorStopReason,
+        *,
+        selection_record: CandidateSelectionRecord | None = None,
     ) -> ResearchState:
         persisted = self.store.load_research(state.research_id)
         if persisted.revision != state.revision or persisted.status is not state.status:
@@ -1141,6 +1340,7 @@ class SecurityResearchOrchestrator:
                 ResearchRunStatus.stopped,
                 reason.value,
                 replacement=synchronized,
+                selection_record=selection_record,
             )
         if ResearchRunStatus.stopped in self._allowed_next(state):
             return self._transition(
@@ -1148,12 +1348,14 @@ class SecurityResearchOrchestrator:
                 ResearchRunStatus.stopped,
                 reason.value,
                 replacement=synchronized,
+                selection_record=selection_record,
             )
         return self._transition(
             persisted,
             ResearchRunStatus.failed,
             reason.value,
             replacement=synchronized,
+            selection_record=selection_record,
         )
 
     def _with_synchronized_budget(self, state: ResearchState) -> ResearchState:
@@ -1174,6 +1376,67 @@ class SecurityResearchOrchestrator:
                 **state.model_dump(mode="python"),
                 "diagnostic_codes": tuple(sorted({*state.diagnostic_codes, *codes})),
             }
+        )
+
+    def _candidate_selection_record(
+        self,
+        state: ResearchState,
+        *,
+        method: CandidateSelectionMethod,
+        eligible_candidate_count: int,
+        selected_candidate: ExperimentCandidate | None = None,
+        selected_proposal: ExperimentProposal | None = None,
+        information_value: InformationValue | None = None,
+        model_decision_id: str | None = None,
+        model_failure_category: str | None = None,
+    ) -> CandidateSelectionRecord:
+        selected_values = (
+            selected_candidate,
+            selected_proposal,
+            information_value,
+        )
+        if any(item is not None for item in selected_values) and not all(
+            item is not None for item in selected_values
+        ):
+            raise ValueError("candidate selection provenance is incomplete")
+        candidate_id = (
+            selected_candidate.candidate_id if selected_candidate is not None else None
+        )
+        occurred_at = self._now(state.updated_at)
+        selection_id = _identifier(
+            "selection",
+            state.research_id,
+            state.revision,
+            method.value,
+            candidate_id or "unavailable",
+            model_decision_id or model_failure_category or "deterministic",
+        )
+        ranking = (
+            CandidateSelectionRankingEvidence.model_validate(
+                information_value.model_dump(mode="python")
+            )
+            if information_value is not None
+            else None
+        )
+        return CandidateSelectionRecord(
+            selection_id=selection_id,
+            source_state_revision=state.revision,
+            recorded_state_revision=state.revision + 1,
+            method=method,
+            eligible_candidate_count=eligible_candidate_count,
+            selected_candidate_id=candidate_id,
+            selected_hypothesis_id=(
+                selected_candidate.hypothesis_id
+                if selected_candidate is not None
+                else None
+            ),
+            selected_proposal_id=(
+                selected_proposal.proposal_id if selected_proposal is not None else None
+            ),
+            model_decision_id=model_decision_id,
+            model_failure_category=model_failure_category,
+            ranking_evidence=ranking,
+            occurred_at=occurred_at,
         )
 
     def _report_and_stop(
@@ -1302,6 +1565,8 @@ class SecurityResearchOrchestrator:
             return OrchestratorStopReason.request_budget_exhausted
         if "global_budget_exhausted" in reasons:
             return OrchestratorStopReason.global_experiment_budget_exhausted
+        if "wall_time_exhausted" in reasons:
+            return OrchestratorStopReason.wall_time_exhausted
         if "policy_context_changed" in reasons:
             return OrchestratorStopReason.policy_context_changed
         return OrchestratorStopReason.no_eligible_experiments
@@ -1360,6 +1625,7 @@ def _identifier(prefix: str, *parts: object) -> str:
 __all__ = [
     "AttackChainResearchCoordinator",
     "ChainStrategyResult",
+    "DeterministicSelectionFallbackPolicy",
     "OrchestratorStopReason",
     "ResearchLoopResult",
     "SecurityResearchOrchestrator",

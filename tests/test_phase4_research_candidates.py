@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -21,8 +22,10 @@ from agent_core.policy import AssessmentPolicy, ScopeAsset
 from agent_core.request_budget import RequestBudget
 from agent_core.research import (
     AuthorizationBlockedError,
+    CandidateSelectionMethod,
     CleanupStatus,
     DerivationType,
+    DeterministicSelectionFallbackPolicy,
     Endpoint,
     EntityKind,
     EntityReference,
@@ -366,6 +369,85 @@ def routing_policy():
     )
 
 
+class RecordingGate(FakeGate):
+    def __init__(self):
+        super().__init__()
+        self.authorized = []
+
+    def authorize(self, experiment):
+        self.authorized.append(experiment)
+        return super().authorize(experiment)
+
+
+def candidate_orchestrator(
+    tmp_path,
+    router,
+    *,
+    fallback_enabled: bool,
+    budget_policy: ResearchBudgetPolicy | None = None,
+    request_budget: RequestBudget | None = None,
+    candidate_builder_override=None,
+    initial_state: ResearchState | None = None,
+    runtime_classifications: tuple[ExperimentResultClassification, ...] = (
+        ExperimentResultClassification.inconclusive,
+    ),
+    model_call_ceiling: int = 10,
+):
+    requests = request_budget or RequestBudget(100)
+    budgets = ResearchBudgetManager(
+        budget_policy,
+        request_budget=requests,
+        model_ledger=router.ledger,
+        model_call_ceiling=model_call_ceiling,
+    )
+    state, budgets, compiler, context, builder = candidate_system(
+        initial_state, budgets=budgets
+    )
+    candidates = builder.build(
+        state,
+        compiler_context=context,
+        expected_state_revision=state.revision,
+        policy_reference=context.policy_reference,
+    )
+    store = ResearchStore(tmp_path / "candidate-selection.sqlite3")
+    store.create_research(state)
+    gate = RecordingGate()
+    runtime = FakeResearchRuntime(runtime_classifications)
+    selector = ExperimentSelector(compiler, budgets)
+    runner = SecurityResearchOrchestrator(
+        store=store,
+        compiler=compiler,
+        compiler_context=context,
+        gate=gate,
+        runtime=runtime,
+        selector=selector,
+        evaluator=ExperimentEvaluator(),
+        pivot_planner=PivotPlanner(selector),
+        budget_manager=budgets,
+        reasoning_engine=ResearchReasoningEngine(router, max_output_tokens=4096),
+        routing_policy=routing_policy(),
+        packet_builder=PublicSafeResearchPacketBuilder(compiler.registry, budgets),
+        candidate_builder=candidate_builder_override or builder,
+        candidate_packet_builder=PublicSafeCandidatePacketBuilder(budgets),
+        selection_fallback_policy=DeterministicSelectionFallbackPolicy(
+            enabled=fallback_enabled
+        ),
+    )
+    return (
+        state,
+        candidates,
+        requests,
+        budgets,
+        compiler,
+        context,
+        builder,
+        store,
+        gate,
+        runtime,
+        runner,
+    )
+
+
 def test_generic_authorization_and_authentication_candidates_compile():
     state, _budgets, compiler, context, _builder, candidates = build_candidates()
 
@@ -501,6 +583,33 @@ def test_orchestrator_authorizes_only_the_model_selected_candidate(tmp_path):
     assert (
         result.state.experiment_history[0].proposal_id == selected_proposal.proposal_id
     )
+    assert len(result.state.candidate_selections) == 1
+    selection_record = result.state.candidate_selections[0]
+    assert selection_record.method is CandidateSelectionMethod.model_selected
+    assert selection_record.selected_candidate_id == selected_candidate.candidate_id
+    assert selection_record.model_decision_id is not None
+
+
+def test_valid_model_selection_executes_after_consuming_last_model_call(tmp_path):
+    router = FakeSelectionRouter(choose_index=1)
+    fixture = candidate_orchestrator(
+        tmp_path,
+        router,
+        fallback_enabled=True,
+        model_call_ceiling=1,
+    )
+    state, candidates = fixture[:2]
+    store, gate, runtime, runner = fixture[7:]
+
+    runner.run(state.research_id, max_iterations=1)
+    persisted = store.load_research(state.research_id)
+    record = persisted.candidate_selections[0]
+
+    assert len(router.requests) == 1
+    assert len(gate.authorized) == len(runtime.calls) == 1
+    assert record.method is CandidateSelectionMethod.model_selected
+    assert record.selected_candidate_id == candidates[1].candidate_id
+    assert persisted.budgets[0].model_budget.remaining_calls == 0
 
 
 def test_orchestrator_deterministically_materializes_single_candidate_without_model(
@@ -556,6 +665,11 @@ def test_orchestrator_deterministically_materializes_single_candidate_without_mo
     assert len(result.state.experiment_history) == 1
     assert "singleton_deterministic_selection" in result.state.diagnostic_codes
     assert result.state.budgets[0].model_budget.usage.attempted_calls == 0
+    assert len(result.state.candidate_selections) == 1
+    assert (
+        result.state.candidate_selections[0].method
+        is CandidateSelectionMethod.singleton_deterministic
+    )
 
 
 def test_orchestrator_with_zero_candidates_stops_without_model_call(tmp_path):
@@ -597,7 +711,7 @@ def test_orchestrator_with_zero_candidates_stops_without_model_call(tmp_path):
     assert result.state.budgets[0].model_budget.usage.attempted_calls == 0
 
 
-def test_model_failure_never_falls_back_to_first_candidate(tmp_path):
+def test_model_failure_without_policy_records_selection_unavailable(tmp_path):
     state, budgets, compiler, context, builder, _candidates = build_candidates()
     store = ResearchStore(tmp_path / "candidate-failure.sqlite3")
     store.create_research(state)
@@ -634,8 +748,370 @@ def test_model_failure_never_falls_back_to_first_candidate(tmp_path):
     result = runner.run(state.research_id)
 
     assert not gate.authorized
-    assert result.stop_reason.value == "no_eligible_experiments"
+    assert result.stop_reason.value == "model_selection_unavailable"
     assert "model_invalid_structured_response" in result.state.diagnostic_codes
+    assert "model_selection_unavailable" in result.state.diagnostic_codes
+    assert len(result.state.candidate_selections) == 1
+    record = result.state.candidate_selections[0]
+    assert record.method is CandidateSelectionMethod.model_selection_unavailable
+    assert record.eligible_candidate_count == len(_candidates)
+    assert record.model_failure_category == "invalid_output"
+    assert record.selected_candidate_id is None
+    assert store.verify_integrity(state.research_id).valid
+
+
+def test_selection_unavailable_reason_survives_legacy_invalid_output_limit(tmp_path):
+    router = FakeSelectionRouter("{")
+    fixture = candidate_orchestrator(
+        tmp_path,
+        router,
+        fallback_enabled=False,
+        budget_policy=ResearchBudgetPolicy(invalid_model_output_limit=1),
+    )
+    state = fixture[0]
+    store, gate, runtime, runner = fixture[7:]
+
+    result = runner.run(state.research_id)
+
+    assert result.stop_reason.value == "model_selection_unavailable"
+    assert not gate.authorized
+    assert not runtime.calls
+    assert len(router.requests) == 1
+    assert (
+        store.load_research(state.research_id).candidate_selections[0].method
+        is CandidateSelectionMethod.model_selection_unavailable
+    )
+
+
+def test_after_start_timeout_uses_explicit_fallback_once_and_preserves_accounting(
+    tmp_path,
+):
+    class TimeoutClient:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, **kwargs):
+            del url, kwargs
+            self.calls += 1
+            raise httpx.ReadTimeout("synthetic local timeout")
+
+    client = TimeoutClient()
+    configuration = ModelConfiguration(
+        default_provider="ollama",
+        ollama=ProviderConfiguration(
+            model_name="fake-local-model",
+            base_url="http://127.0.0.1:11434",
+            timeout_seconds=1,
+            max_output_tokens=4096,
+        ),
+    )
+
+    class RecordingRegistry(ProviderRegistry):
+        def __init__(self):
+            super().__init__(configuration)
+            self.created = []
+
+        def create(self, provider=None, *, model_name=None, client_override=None):
+            del client_override
+            self.created.append(provider)
+            return super().create(provider, model_name=model_name, client=client)
+
+    registry = RecordingRegistry()
+    router = ModelRouter(registry)
+    (
+        state,
+        candidates,
+        requests,
+        _budgets,
+        _compiler,
+        _context,
+        _builder,
+        store,
+        gate,
+        runtime,
+        runner,
+    ) = candidate_orchestrator(
+        tmp_path,
+        router,
+        fallback_enabled=True,
+        initial_state=synthetic_state(endpoint_count=2, hypotheses=("bola",)),
+        runtime_classifications=(ExperimentResultClassification.secure_signal,),
+    )
+    before_candidates = tuple(item.model_dump(mode="json") for item in candidates)
+    before_requests = requests.snapshot()
+
+    result = runner.run(state.research_id)
+    usage = router.ledger.usage_for_run(state.research_id)
+    persisted = store.load_research(state.research_id)
+
+    assert result.stop_reason.value == "all_hypotheses_resolved"
+    assert client.calls == 1
+    assert registry.created == ["ollama"]
+    assert usage.attempted_calls == usage.failed_calls == 1
+    assert usage.successful_calls == 0
+    assert usage.unknown_usage_calls == 1
+    assert usage.input_tokens == usage.output_tokens == usage.total_tokens == 0
+    assert usage.budget_input_tokens > 0
+    assert usage.budget_output_tokens == 4096
+    assert usage.budget_total_tokens == (
+        usage.budget_input_tokens + usage.budget_output_tokens
+    )
+    assert requests.snapshot() == before_requests
+    assert len(gate.authorized) == len(runtime.calls) == 1
+    assert len(persisted.candidate_selections) == 1
+    record = persisted.candidate_selections[0]
+    assert record.method is CandidateSelectionMethod.deterministic_fallback
+    assert record.model_failure_category == "timeout"
+    assert record.selected_candidate_id in {item.candidate_id for item in candidates}
+    assert record.ranking_evidence is not None
+    assert gate.authorized[0].provenance.source_proposal_id == (
+        record.selected_proposal_id
+    )
+    assert tuple(item.model_dump(mode="json") for item in candidates) == (
+        before_candidates
+    )
+    assert "model_timeout" in persisted.diagnostic_codes
+    assert "deterministic_selection_fallback" in persisted.diagnostic_codes
+    assert store.verify_integrity(state.research_id).valid
+
+    terminal_revision = persisted.revision
+    restarted = runner.run(state.research_id)
+    assert restarted.completed
+    assert client.calls == 1
+    assert store.load_research(state.research_id).revision == terminal_revision
+    assert len(store.load_research(state.research_id).candidate_selections) == 1
+
+
+@pytest.mark.parametrize("failure_kind", ("invalid_json", "unknown_id", "mismatch"))
+def test_invalid_selection_responses_use_explicit_fallback(tmp_path, failure_kind):
+    class InvalidSelectionRouter(FakeSelectionRouter):
+        def route(self, request, policy):
+            if failure_kind == "invalid_json":
+                self.content = "{"
+            else:
+                selected = request.evidence["candidates"][0]
+                hypothesis_id = selected["hypothesis_id"]
+                if failure_kind == "mismatch":
+                    hypothesis_id = next(
+                        item["hypothesis_id"]
+                        for item in request.evidence["candidates"]
+                        if item["hypothesis_id"] != hypothesis_id
+                    )
+                self.content = json.dumps(
+                    {
+                        "decision_id": "decision-invalid-selection",
+                        "research_id": request.evidence["research_id"],
+                        "state_revision": request.evidence["state_revision"],
+                        "action": "select_candidate",
+                        "selected_candidate_id": (
+                            "candidate-unknown"
+                            if failure_kind == "unknown_id"
+                            else selected["candidate_id"]
+                        ),
+                        "selected_hypothesis_id": hypothesis_id,
+                        "priority": 80,
+                        "confidence": "medium",
+                        "expected_information_gain": "medium",
+                        "reasoning_summary": "Synthetic invalid selection response.",
+                        "evidence_references": [],
+                        "missing_evidence": [],
+                        "pivot_dimension": None,
+                        "stop_reason": None,
+                    }
+                )
+            return super().route(request, policy)
+
+    router = InvalidSelectionRouter()
+    fixture = candidate_orchestrator(tmp_path, router, fallback_enabled=True)
+    state, candidates, requests = fixture[:3]
+    store, gate, runtime, runner = fixture[7:]
+    before_requests = requests.snapshot()
+
+    runner.run(state.research_id, max_iterations=1)
+    persisted = store.load_research(state.research_id)
+    record = persisted.candidate_selections[0]
+
+    assert len(router.requests) == 1
+    assert len(gate.authorized) == len(runtime.calls) == 1
+    assert requests.snapshot() == before_requests
+    assert record.method is CandidateSelectionMethod.deterministic_fallback
+    assert record.model_failure_category == "invalid_output"
+    assert record.selected_candidate_id in {item.candidate_id for item in candidates}
+
+
+def test_provider_unavailable_before_invocation_uses_zero_call_fallback(tmp_path):
+    configuration = ModelConfiguration(
+        default_provider="ollama",
+        ollama=ProviderConfiguration(
+            model_name="fake-local-model",
+            base_url=None,
+            timeout_seconds=1,
+            max_output_tokens=4096,
+        ),
+    )
+    router = ModelRouter(ProviderRegistry(configuration))
+    fixture = candidate_orchestrator(tmp_path, router, fallback_enabled=True)
+    state = fixture[0]
+    store, gate, runtime, runner = fixture[7:]
+
+    runner.run(state.research_id, max_iterations=1)
+    usage = router.ledger.usage_for_run(state.research_id)
+    record = store.load_research(state.research_id).candidate_selections[0]
+
+    assert usage.attempted_calls == usage.failed_calls == 1
+    assert usage.unknown_usage_calls == 0
+    assert usage.budget_total_tokens == 0
+    assert len(gate.authorized) == len(runtime.calls) == 1
+    assert record.method is CandidateSelectionMethod.deterministic_fallback
+    assert record.model_failure_category == "provider_unavailable"
+
+
+def test_fallback_reuses_selector_ranking_independent_of_candidate_order(tmp_path):
+    class ReversedBuilder:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def build(self, *args, **kwargs):
+            return tuple(reversed(self.delegate.build(*args, **kwargs)))
+
+    first_router = FakeSelectionRouter("{")
+    first = candidate_orchestrator(
+        tmp_path / "first", first_router, fallback_enabled=True
+    )
+    first[10].run(first[0].research_id, max_iterations=1)
+    first_record = first[7].load_research(first[0].research_id).candidate_selections[0]
+
+    second_router = FakeSelectionRouter("{")
+    second = candidate_orchestrator(
+        tmp_path / "reversed",
+        second_router,
+        fallback_enabled=True,
+    )
+    second[10].candidate_builder = ReversedBuilder(second[6])
+    second[10].run(second[0].research_id, max_iterations=1)
+    second_record = (
+        second[7].load_research(second[0].research_id).candidate_selections[0]
+    )
+
+    assert first_record.selected_candidate_id == second_record.selected_candidate_id
+    assert first_record.ranking_evidence == second_record.ranking_evidence
+    assert first_record.ranking_evidence.stable_tie_breaker == ("proposal_id_ascending")
+
+
+def test_selector_uses_stable_proposal_id_tie_breaking_for_fallback_inputs():
+    state, budgets, compiler, context, _builder, candidates = build_candidates()
+    base = candidates[0]
+    tied_candidates = (
+        base.model_copy(update={"candidate_id": "candidate-tie-z"}),
+        base.model_copy(update={"candidate_id": "candidate-tie-a"}),
+    )
+    proposals = tuple(materialize_candidate(item, state) for item in tied_candidates)
+    selector = ExperimentSelector(compiler, budgets)
+
+    first = selector.select(proposals, state, compiler_context=context)
+    second = selector.select(
+        tuple(reversed(proposals)), state, compiler_context=context
+    )
+
+    scores = {item.information_value.score for item in first.assessments}
+    assert len(scores) == 1
+    assert first.selected is not None
+    assert second.selected is not None
+    assert first.selected.proposal_id == second.selected.proposal_id
+    assert first.selected.proposal_id == min(item.proposal_id for item in proposals)
+
+
+@pytest.mark.parametrize(
+    ("exhausted_resource", "expected_stop"),
+    (
+        ("request", "request_budget_exhausted"),
+        ("wall_time", "wall_time_exhausted"),
+    ),
+)
+def test_fallback_rechecks_execution_budgets_before_authorization(
+    tmp_path, exhausted_resource, expected_stop
+):
+    class HookRouter(FakeSelectionRouter):
+        hook = None
+
+        def route(self, request, policy):
+            if self.hook is not None:
+                self.hook()
+            return super().route(request, policy)
+
+    router = HookRouter("{")
+    request_budget = RequestBudget(4)
+    fixture = candidate_orchestrator(
+        tmp_path,
+        router,
+        fallback_enabled=True,
+        budget_policy=ResearchBudgetPolicy(wall_time_ceiling_seconds=1.0),
+        request_budget=request_budget,
+    )
+    state = fixture[0]
+    budgets = fixture[3]
+    store, gate, runtime, runner = fixture[7:]
+    if exhausted_resource == "request":
+        router.hook = lambda: request_budget.consume("verification", 4)
+    else:
+        router.hook = lambda: setattr(budgets, "_started", budgets._started - 2.0)
+
+    result = runner.run(state.research_id)
+    persisted = store.load_research(state.research_id)
+
+    assert result.stop_reason.value == expected_stop
+    assert not gate.authorized
+    assert not runtime.calls
+    assert len(router.requests) == 1
+    assert len(persisted.candidate_selections) == 1
+    assert (
+        persisted.candidate_selections[0].method
+        is CandidateSelectionMethod.model_selection_unavailable
+    )
+    assert store.verify_integrity(state.research_id).valid
+
+
+def test_fallback_cannot_bypass_authorization_gate(tmp_path):
+    router = FakeSelectionRouter("{")
+    fixture = candidate_orchestrator(tmp_path, router, fallback_enabled=True)
+    state, _candidates, _requests, _budgets, _compiler, _context, builder = fixture[:7]
+    store, _gate, runtime, runner = fixture[7:]
+
+    class SingleUseBuilder:
+        def __init__(self):
+            self.used = False
+
+        def build(self, *args, **kwargs):
+            if self.used:
+                return ()
+            self.used = True
+            return builder.build(*args, **kwargs)
+
+    class RejectingGate(FakeGate):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def authorize(self, _experiment):
+            self.attempts += 1
+            raise AuthorizationBlockedError(
+                ResearchAuthorizationErrorCode.authorization_blocked
+            )
+
+    rejecting_gate = RejectingGate()
+    runner.candidate_builder = SingleUseBuilder()
+    runner.gate = rejecting_gate
+    result = runner.run(state.research_id)
+
+    assert result.stop_reason.value == "no_eligible_experiments"
+    assert rejecting_gate.attempts == 1
+    assert not runtime.calls
+    assert len(router.requests) == 1
+    assert len(result.state.candidate_selections) == 1
+    assert result.state.experiment_history[0].status is (
+        ResearchExperimentStatus.policy_blocked
+    )
+    assert store.verify_integrity(state.research_id).valid
 
 
 def test_authorization_failure_persists_singleton_selection_without_model_call(

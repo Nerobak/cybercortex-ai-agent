@@ -448,6 +448,9 @@ class ResearchStore:
             *(item.budget_reference for item in state.budgets),
             *(item.budget_reference for item in state.chain_budgets),
         }
+        candidate_selection_ids = {
+            item.selection_id for item in state.candidate_selections
+        }
         chain_candidate_ids = {item.candidate_id for item in state.chain_candidates}
         chain_hypothesis_ids = {item.hypothesis_id for item in state.chain_hypotheses}
         chain_step_ids = {
@@ -588,6 +591,14 @@ class ResearchStore:
             elif event.event_type is ResearchEventType.budget_updated:
                 referenced_ids = (
                     (event_payload.budget_reference, budget_ids, "budget"),
+                )
+            elif event.event_type is ResearchEventType.candidate_selection_recorded:
+                referenced_ids = (
+                    (
+                        event_payload.selection_id,
+                        candidate_selection_ids,
+                        "candidate selection",
+                    ),
                 )
             elif event.event_type.value.startswith("chain_"):
                 optional_references = (

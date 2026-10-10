@@ -8,6 +8,7 @@ from typing import Annotated, Literal, TypeAlias
 from pydantic import Field, StrictInt, model_validator
 
 from agent_core.research.types import (
+    CandidateSelectionMethod,
     EndpointId,
     ExperimentOutcomeId,
     FactId,
@@ -48,6 +49,7 @@ class ResearchEventType(str, Enum):
     reproduction_outcome_recorded = "reproduction_outcome_recorded"
     finding_confirmation_decided = "finding_confirmation_decided"
     budget_updated = "budget_updated"
+    candidate_selection_recorded = "candidate_selection_recorded"
     chain_candidate = "chain_candidate"
     chain_select = "chain_select"
     chain_hypothesis = "chain_hypothesis"
@@ -168,6 +170,14 @@ class BudgetUpdatedPayload(ResearchContract):
     budget_reference: OpaqueIdentifier
 
 
+class CandidateSelectionRecordedPayload(ResearchContract):
+    event_type: Literal["candidate_selection_recorded"] = "candidate_selection_recorded"
+    selection_id: OpaqueIdentifier
+    selection_method: CandidateSelectionMethod
+    candidate_id: OpaqueIdentifier | None = None
+    model_failure_category: OpaqueIdentifier | None = None
+
+
 class ChainEventPayload(ResearchContract):
     """Safe reference-only trace for the P4-0G lifecycle."""
 
@@ -273,6 +283,7 @@ ResearchEventPayload: TypeAlias = Annotated[
     | ReproductionOutcomeRecordedPayload
     | FindingConfirmationDecidedPayload
     | BudgetUpdatedPayload
+    | CandidateSelectionRecordedPayload
     | ChainEventPayload
     | ResearchStateTransitionedPayload
     | ResearchStoppedPayload

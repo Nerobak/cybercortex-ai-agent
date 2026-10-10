@@ -36,6 +36,7 @@ class ProposalEligibilityReason(str, Enum):
     hypothesis_budget_exhausted = "hypothesis_budget_exhausted"
     surface_budget_exhausted = "surface_budget_exhausted"
     global_budget_exhausted = "global_budget_exhausted"
+    wall_time_exhausted = "wall_time_exhausted"
     request_reserve_unavailable = "request_reserve_unavailable"
     cleanup_barrier = "cleanup_barrier"
     stale_state_revision = "stale_state_revision"
@@ -157,6 +158,7 @@ class ExperimentSelector:
         cleanup_barrier: bool = False,
         policy_reference: str | None = None,
         policy_fingerprint: str | None = None,
+        require_model_capacity: bool = True,
     ) -> ExperimentSelection:
         advice = {item.proposal_id: item for item in advisory}
         if len(advice) != len(advisory):
@@ -171,6 +173,7 @@ class ExperimentSelector:
                 cleanup_barrier=cleanup_barrier,
                 policy_reference=policy_reference,
                 policy_fingerprint=policy_fingerprint,
+                require_model_capacity=require_model_capacity,
             )
             for proposal in proposals
         )
@@ -268,6 +271,7 @@ class ExperimentSelector:
         cleanup_barrier: bool,
         policy_reference: str | None,
         policy_fingerprint: str | None,
+        require_model_capacity: bool,
     ) -> ProposalAssessment:
         reasons: list[ProposalEligibilityReason] = []
         hypothesis = next(
@@ -348,11 +352,14 @@ class ExperimentSelector:
             estimated_requests=experiment.request_estimate.total_reservation,
             pivot=pivot,
             state_changing=experiment.state_changing,
+            require_model_capacity=require_model_capacity,
         )
         if not budget.allowed:
             reason = str(budget.reason.value if budget.reason else "")
             if "global_experiment" in reason:
                 reasons.append(ProposalEligibilityReason.global_budget_exhausted)
+            elif "wall_time" in reason:
+                reasons.append(ProposalEligibilityReason.wall_time_exhausted)
             elif "hypothesis" in reason:
                 reasons.append(ProposalEligibilityReason.hypothesis_budget_exhausted)
             elif "request" in reason:

@@ -388,7 +388,9 @@ class ResearchBudgetManager:
             raise ValueError("research budget reference is ambiguous")
         if matches:
             return self._synchronize(matches[0], research.research_id)
-        return self._new_state(research.research_id)
+        return self._synchronize(
+            self._new_state(research.research_id), research.research_id
+        )
 
     def check(
         self,
@@ -399,6 +401,7 @@ class ResearchBudgetManager:
         estimated_requests: int = 0,
         pivot: bool = False,
         state_changing: bool = False,
+        require_model_capacity: bool = True,
     ) -> ResearchBudgetDecision:
         if estimated_requests < 0:
             raise ValueError("estimated request cost cannot be negative")
@@ -464,7 +467,7 @@ class ResearchBudgetManager:
             estimated_requests + self.policy.cleanup_request_reserve
         ):
             reason = ResearchBudgetStopReason.request_budget_exhausted
-        elif budget.model_budget.remaining_calls <= 0:
+        elif require_model_capacity and budget.model_budget.remaining_calls <= 0:
             reason = ResearchBudgetStopReason.model_budget_exhausted
         elif (
             budget.consecutive_service_instability

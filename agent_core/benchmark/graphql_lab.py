@@ -76,7 +76,10 @@ from agent_core.research.graphql_discovery import (
 from agent_core.research.graphql_readiness import (
     candidate_ready_graphql_operation_templates,
 )
-from agent_core.research.orchestrator import SecurityResearchOrchestrator
+from agent_core.research.orchestrator import (
+    DeterministicSelectionFallbackPolicy,
+    SecurityResearchOrchestrator,
+)
 from agent_core.research.pivot import PivotPlanner
 from agent_core.research.reasoning import (
     PublicSafeResearchPacketBuilder,
@@ -1122,6 +1125,9 @@ def graphql_benchmark_execution_factory(
             runtime=gate.runtime,
             bootstrapper=bootstrapper,
             enable_finding_confirmation=True,
+            selection_fallback_policy=DeterministicSelectionFallbackPolicy(
+                enabled=True
+            ),
         )
 
     public_routing = BenchmarkModelRouting(

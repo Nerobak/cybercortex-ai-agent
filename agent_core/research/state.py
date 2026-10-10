@@ -60,6 +60,7 @@ from agent_core.research.chains import (
 from agent_core.research.types import (
     AttackChainId,
     AttackChainStatus,
+    CandidateSelectionMethod,
     CleanupStatus,
     DerivationType,
     EndpointId,
@@ -1870,6 +1871,74 @@ class BudgetState(ResearchContract):
         return self
 
 
+class CandidateSelectionRankingEvidence(ResearchContract):
+    """Public-safe factors emitted by the existing deterministic selector."""
+
+    expected_information_gain: StrictFloat = Field(ge=0.0, le=1.0)
+    hypothesis_priority: StrictFloat = Field(ge=0.0, le=1.0)
+    novelty: StrictFloat = Field(ge=0.0, le=1.0)
+    request_efficiency: StrictFloat = Field(ge=0.0, le=1.0)
+    safety: StrictFloat = Field(ge=0.0, le=1.0)
+    baseline_strength: StrictFloat = Field(ge=0.0, le=1.0)
+    surface_headroom: StrictFloat = Field(ge=0.0, le=1.0)
+    score: StrictFloat = Field(ge=0.0, le=1.0)
+    stable_tie_breaker: Literal["proposal_id_ascending"] = "proposal_id_ascending"
+
+
+class CandidateSelectionRecord(ResearchContract):
+    """Reference-only selection provenance; executable bindings remain elsewhere."""
+
+    selection_id: OpaqueIdentifier
+    source_state_revision: StrictInt = Field(ge=0, le=1_000_000_000)
+    recorded_state_revision: StrictInt = Field(ge=1, le=1_000_000_000)
+    method: CandidateSelectionMethod
+    eligible_candidate_count: StrictInt = Field(ge=1, le=500)
+    selected_candidate_id: OpaqueIdentifier | None = None
+    selected_hypothesis_id: HypothesisRecordId | None = None
+    selected_proposal_id: OpaqueIdentifier | None = None
+    model_decision_id: OpaqueIdentifier | None = None
+    model_failure_category: OpaqueIdentifier | None = None
+    ranking_evidence: CandidateSelectionRankingEvidence | None = None
+    occurred_at: Timestamp
+
+    @model_validator(mode="after")
+    def validate_selection_record(self) -> "CandidateSelectionRecord":
+        if self.recorded_state_revision != self.source_state_revision + 1:
+            raise ValueError("selection record must belong to the next state revision")
+        selected = (
+            self.method is not CandidateSelectionMethod.model_selection_unavailable
+        )
+        selection_fields = (
+            self.selected_candidate_id,
+            self.selected_hypothesis_id,
+            self.selected_proposal_id,
+            self.ranking_evidence,
+        )
+        if selected != all(item is not None for item in selection_fields):
+            raise ValueError("selected methods require complete selection references")
+        if not selected and any(item is not None for item in selection_fields):
+            raise ValueError("unavailable selection cannot retain selected references")
+        if self.method is CandidateSelectionMethod.model_selected:
+            if (
+                self.model_decision_id is None
+                or self.model_failure_category is not None
+            ):
+                raise ValueError(
+                    "model selection requires only model-decision provenance"
+                )
+        elif self.model_decision_id is not None:
+            raise ValueError("deterministic selection cannot claim a model decision")
+        if self.method in {
+            CandidateSelectionMethod.deterministic_fallback,
+            CandidateSelectionMethod.model_selection_unavailable,
+        }:
+            if self.model_failure_category is None:
+                raise ValueError("model failure provenance is required")
+        elif self.model_failure_category is not None:
+            raise ValueError("non-fallback selection cannot retain a model failure")
+        return self
+
+
 class ResearchState(ResearchContract):
     """One versioned, canonical, secret-free research-state snapshot."""
 
@@ -1924,6 +1993,9 @@ class ResearchState(ResearchContract):
         default=(), max_length=10_000
     )
     experiment_history: tuple[ResearchExperimentRecord, ...] = Field(
+        default=(), max_length=10_000
+    )
+    candidate_selections: tuple[CandidateSelectionRecord, ...] = Field(
         default=(), max_length=10_000
     )
     reproduction_plans: tuple[ReproductionPlan, ...] = Field(
@@ -1994,6 +2066,7 @@ class ResearchState(ResearchContract):
             ("hypotheses", "hypothesis_id"),
             ("experiment_outcomes", "outcome_id"),
             ("experiment_history", "experiment_id"),
+            ("candidate_selections", "selection_id"),
             ("reproduction_plans", "reproduction_id"),
             ("reproduction_outcomes", "reproduction_id"),
             ("confirmation_decisions", "decision_id"),
@@ -2059,6 +2132,15 @@ class ResearchState(ResearchContract):
         }
         observation_ids = {item.observation_id for item in self.observations}
         provenance_ids = {item.provenance_id for item in self.provenance}
+
+        for item in self.candidate_selections:
+            if item.recorded_state_revision > self.revision:
+                raise ValueError("candidate selection references a future revision")
+            _require_optional_reference(
+                item.selected_hypothesis_id,
+                hypothesis_ids,
+                "candidate selection hypothesis",
+            )
         graphql_surface_ids = {
             item.graphql_surface_id for item in self.graphql_surfaces
         }

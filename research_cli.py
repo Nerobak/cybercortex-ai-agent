@@ -58,6 +58,7 @@ from agent_core.research import (
     ResearchState,
     ResearchStore,
     SecurityResearchOrchestrator,
+    DeterministicSelectionFallbackPolicy,
     TargetClass,
 )
 from agent_core.tool_runner import DEFAULT_TOOL_TIMEOUT, ToolRunner
@@ -710,6 +711,7 @@ def _build_orchestrator(
         policy_limitations=policy_limitations,
         bootstrapper=wiring.bootstrapper,
         enable_finding_confirmation=True,
+        selection_fallback_policy=DeterministicSelectionFallbackPolicy(enabled=True),
     )
 
 

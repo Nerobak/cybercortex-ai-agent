@@ -7,7 +7,10 @@ import pytest
 from pydantic import ValidationError
 
 from agent_core.research import (
+    CandidateSelectionMethod,
     CleanupDefinition,
+    DeterministicSelectionFallbackPolicy,
+    ExperimentCandidateBuilder,
     ExperimentCompiler,
     ExperimentCompilerContext,
     ExperimentEvaluator,
@@ -39,6 +42,7 @@ from agent_core.research import (
     PivotPlanner,
     PublicSafeCandidatePacketBuilder,
     PublicSafeResearchPacketBuilder,
+    RegisteredRequestTemplate,
     RegisteredGraphQLSafeMutation,
     ResearchBudgetManager,
     ResearchConfidence,
@@ -56,6 +60,7 @@ from agent_core.research import (
     EntityReference,
     DerivationType,
     build_registered_graphql_operation_template,
+    materialize_candidate,
     materialize_selected_graphql_candidate,
 )
 
@@ -65,7 +70,11 @@ from test_phase4_graphql_hypotheses import (
     _two_identity_state,
 )
 from test_phase4_graphql_semantics import TS, semantic_state
-from test_phase4_research_candidates import FakeSelectionRouter, routing_policy
+from test_phase4_research_candidates import (
+    FakeSelectionRouter,
+    routing_policy,
+    synthetic_state,
+)
 from test_phase4_research_orchestrator import FakeGate, FakeResearchRuntime
 from agent_core.research.evaluation import ExperimentResultClassification
 
@@ -244,6 +253,175 @@ def test_single_graphql_candidate_reaches_normal_lifecycle_without_model_call(
     assert len(result.state.experiment_history) == 1
     assert result.state.experiment_history[0].status.value == "completed"
     assert "singleton_deterministic_selection" in result.state.diagnostic_codes
+
+
+def test_six_candidate_structural_fixture_falls_back_without_mutating_graphql(
+    tmp_path,
+):
+    graphql_state, graphql_context, _builder = _candidate_fixture(authenticated=True)
+    generic_state = synthetic_state()
+    generic_objects = tuple(
+        item.model_copy(
+            update={
+                "object_id": f"generic-{item.object_id}",
+                "object_reference": f"generic-{item.object_reference}",
+            }
+        )
+        for item in generic_state.objects
+    )
+    state = ResearchState.model_validate(
+        {
+            **graphql_state.model_dump(mode="python"),
+            "status": ResearchRunStatus.selecting_experiment,
+            "targets": (*graphql_state.targets, *generic_state.targets),
+            "surfaces": (*graphql_state.surfaces, *generic_state.surfaces),
+            "endpoints": (*graphql_state.endpoints, *generic_state.endpoints),
+            "parameters": (*graphql_state.parameters, *generic_state.parameters),
+            "request_templates": generic_state.request_templates,
+            "identities": (*graphql_state.identities, *generic_state.identities),
+            "objects": (*graphql_state.objects, *generic_objects),
+            "evidence": (*graphql_state.evidence, *generic_state.evidence),
+            "facts": generic_state.facts,
+            "hypotheses": (*graphql_state.hypotheses, *generic_state.hypotheses),
+            "provenance": (*graphql_state.provenance, *generic_state.provenance),
+        }
+    )
+    registry = ExperimentRegistry()
+    router = FakeSelectionRouter("{")
+    budgets = ResearchBudgetManager(model_ledger=router.ledger, model_call_ceiling=1)
+    context = ExperimentCompilerContext(
+        current_time=graphql_context.current_time,
+        execution_ready=True,
+        graphql_execution_enabled=True,
+        request_templates=tuple(
+            RegisteredRequestTemplate(
+                template_id=item.template_id,
+                target_id=item.target_id,
+                surface_id=item.surface_id,
+                endpoint_id=item.endpoint_id,
+                parameter_ids=item.parameter_ids,
+                authentication_mechanisms=item.identity_requirement.mechanisms,
+            )
+            for item in state.request_templates
+        ),
+        graphql_operation_templates=graphql_context.graphql_operation_templates,
+        policy_reference="policy-combined",
+        context_reference="context-combined",
+    )
+    compiler = ExperimentCompiler(registry, context)
+    generic = ExperimentCandidateBuilder(
+        registry, budgets, compiler, maximum_candidates=4
+    )
+    graphql = GraphQLExperimentCandidateBuilder(
+        registry,
+        budgets,
+        compiler,
+        limits=GraphQLCandidateLimits(max_total_candidates=2),
+        policy=GraphQLCandidatePolicy(
+            allow_read_only_candidates=True,
+            allow_state_change_candidates=False,
+            allow_cross_surface_candidates=False,
+        ),
+    )
+
+    class CombinedBuilder:
+        def build(self, current, **kwargs):
+            generic_candidates = generic.build(current, **kwargs)
+            graphql_candidates = graphql.build(
+                current,
+                compiler_context=kwargs["compiler_context"].model_copy(
+                    update={"execution_ready": False}
+                ),
+                expected_state_revision=kwargs.get("expected_state_revision"),
+                policy_reference=kwargs.get("policy_reference"),
+            )
+            by_id = {
+                item.candidate_id: item
+                for item in (*generic_candidates, *graphql_candidates)
+            }
+            return tuple(by_id[key] for key in sorted(by_id))
+
+    combined = CombinedBuilder()
+    candidates = combined.build(
+        state,
+        compiler_context=context,
+        expected_state_revision=state.revision,
+        policy_reference=context.policy_reference,
+    )
+    graphql_candidates = tuple(
+        item for item in candidates if item.graphql_candidate_kind is not None
+    )
+    generic_candidates = tuple(
+        item for item in candidates if item.graphql_candidate_kind is None
+    )
+    before_candidates = tuple(item.model_dump(mode="json") for item in candidates)
+    before_graphql = (
+        state.graphql_operations,
+        state.graphql_variables,
+        state.graphql_variable_bindings,
+        state.objects,
+    )
+    selector = ExperimentSelector(compiler, budgets)
+    expected = selector.select(
+        tuple(materialize_candidate(item, state) for item in candidates),
+        state,
+        compiler_context=context,
+        policy_reference=context.policy_reference,
+    )
+    assert expected.selected is not None
+
+    class RecordingGate(FakeGate):
+        def __init__(self):
+            super().__init__()
+            self.authorized = []
+
+        def authorize(self, experiment):
+            self.authorized.append(experiment)
+            return super().authorize(experiment)
+
+    store = ResearchStore(tmp_path / "combined-candidates.sqlite3")
+    store.create_research(state)
+    gate = RecordingGate()
+    runtime = FakeResearchRuntime((ExperimentResultClassification.inconclusive,))
+    runner = SecurityResearchOrchestrator(
+        store=store,
+        compiler=compiler,
+        compiler_context=context,
+        gate=gate,
+        runtime=runtime,
+        selector=selector,
+        evaluator=ExperimentEvaluator(),
+        pivot_planner=PivotPlanner(selector),
+        budget_manager=budgets,
+        reasoning_engine=ResearchReasoningEngine(router),
+        routing_policy=routing_policy(),
+        packet_builder=PublicSafeResearchPacketBuilder(registry, budgets),
+        candidate_builder=combined,
+        candidate_packet_builder=PublicSafeCandidatePacketBuilder(budgets),
+        selection_fallback_policy=DeterministicSelectionFallbackPolicy(enabled=True),
+    )
+
+    result = runner.run(state.research_id, max_iterations=1)
+    persisted = store.load_research(state.research_id)
+    record = persisted.candidate_selections[0]
+
+    assert len(candidates) == 6
+    assert len(graphql_candidates) == 2
+    assert len(generic_candidates) == 4
+    assert record.method is CandidateSelectionMethod.deterministic_fallback
+    assert record.selected_proposal_id == expected.selected.proposal_id
+    assert len(router.requests) == len(gate.authorized) == len(runtime.calls) == 1
+    assert result.state.budgets[0].model_budget.usage.attempted_calls == 1
+    assert tuple(item.model_dump(mode="json") for item in candidates) == (
+        before_candidates
+    )
+    assert (
+        persisted.graphql_operations,
+        persisted.graphql_variables,
+        persisted.graphql_variable_bindings,
+        persisted.objects,
+    ) == before_graphql
+    assert store.verify_integrity(state.research_id).valid
 
 
 def test_tenant_candidate_requires_two_controlled_tenants():
