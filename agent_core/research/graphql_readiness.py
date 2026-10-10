@@ -7,6 +7,7 @@ controlled-object bindings require an exact typed evidence record.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -15,11 +16,14 @@ from pydantic import Field, model_validator
 
 from agent_core.research.adapters import stable_research_identifier
 from agent_core.research.graphql import (
+    GraphQLControlledObjectBindingRecord,
     GraphQLObjectReferenceKind,
     GraphQLObjectReferenceSemantics,
     GraphQLOperationRecord,
     GraphQLSemanticRole,
     GraphQLTypeKind,
+    GraphQLVariableBinding,
+    GraphQLVariableValueSource,
     build_graphql_graph_assertions,
 )
 from agent_core.research.graphql_candidates import (
@@ -177,6 +181,9 @@ def _apply_object_bindings(
     surfaces = {item.graphql_surface_id: item for item in state.graphql_surfaces}
     known_evidence = {item.evidence_id for item in state.evidence}
     provenance = {item.provenance_id: item for item in state.provenance}
+    binding_records = {
+        item.binding_id: item for item in state.graphql_variable_bindings
+    }
     template_by_id = {
         item.template_id: item
         for item in candidate_ready_graphql_operation_templates(state)
@@ -369,26 +376,129 @@ def _apply_object_bindings(
                 ),
             ),
         )
-        variables[variable.variable_id] = variable.model_copy(
-            update={
-                "semantic_role": GraphQLSemanticRole.object_reference,
-                "semantic_role_evidence_references": evidence,
-                "controlled_value_reference": controlled_object.object_id,
-                "evidence_references": evidence,
-                "provenance_id": provenance_id,
-            }
+        record = GraphQLControlledObjectBindingRecord(
+            binding_id=stable_research_identifier(
+                "graphql-controlled-binding",
+                state.research_id,
+                binding.binding_fingerprint or "direct-binding",
+            ),
+            operation_id=operation.operation_id,
+            binding=GraphQLVariableBinding(
+                variable_id=variable.variable_id,
+                argument_id=argument.argument_id,
+                value_source=GraphQLVariableValueSource.controlled_object,
+                value_reference=controlled_object.object_id,
+            ),
+            owner_identity_id=owner.identity_id,
+            object_reference_evidence_id=binding.object_reference_evidence_id,
+            relationship_assertion_ids=(
+                binding.relationship_assertion_ids
+                or (
+                    "direct-variable-argument-binding",
+                    "direct-argument-object-binding",
+                )
+            ),
+            evidence_references=evidence,
+            binding_fingerprint=(
+                binding.binding_fingerprint
+                or "sha256:"
+                + hashlib.sha256(
+                    "\x1f".join(
+                        (
+                            operation.operation_id,
+                            variable.variable_id,
+                            argument.argument_id,
+                            controlled_object.object_id,
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+            ),
+            provenance_id=provenance_id,
         )
-        arguments[argument.argument_id] = argument.model_copy(
+        binding_records.setdefault(record.binding_id, record)
+
+    records_by_pair: dict[
+        tuple[str, str], list[GraphQLControlledObjectBindingRecord]
+    ] = {}
+    for record in binding_records.values():
+        records_by_pair.setdefault(
+            (record.binding.variable_id, record.binding.argument_id), []
+        ).append(record)
+    for (variable_id, argument_id), records in sorted(records_by_pair.items()):
+        variable = variables.get(variable_id)
+        argument = arguments.get(argument_id)
+        if variable is None or argument is None:
+            continue
+        records = sorted(records, key=lambda item: item.binding_id)
+        object_ids = tuple(sorted({item.binding.value_reference for item in records}))
+        evidence = tuple(
+            sorted(
+                {
+                    *variable.evidence_references,
+                    *argument.evidence_references,
+                    *(
+                        reference
+                        for item in records
+                        for reference in item.evidence_references
+                    ),
+                }
+            )
+        )
+        aggregate_provenance_id = stable_research_identifier(
+            "provenance",
+            state.research_id,
+            variable_id,
+            argument_id,
+            *(item.binding_fingerprint for item in records),
+        )
+        provenance.setdefault(
+            aggregate_provenance_id,
+            ProvenanceRecord(
+                provenance_id=aggregate_provenance_id,
+                producer_type=ProvenanceProducerType.deterministic,
+                producer_name="graphql-registered-operation-binding",
+                producer_version=GRAPHQL_READINESS_VERSION,
+                source_references=tuple(
+                    sorted(
+                        {
+                            *(item.binding_id for item in records),
+                            *(item.binding_fingerprint for item in records),
+                        }
+                    )
+                ),
+                summary=(
+                    "Preserved all exact controlled-object alternatives for one "
+                    "registered GraphQL variable and argument."
+                ),
+                occurred_at=occurred_at,
+            ),
+        )
+        variables[variable_id] = variable.model_copy(
             update={
                 "semantic_role": GraphQLSemanticRole.object_reference,
                 "semantic_role_evidence_references": evidence,
-                "object_reference_semantics": GraphQLObjectReferenceSemantics(
-                    kind=GraphQLObjectReferenceKind.research_object,
-                    research_object_id=controlled_object.object_id,
-                    confidence=ResearchConfidence.high,
+                "controlled_value_reference": (
+                    object_ids[0] if len(object_ids) == 1 else None
                 ),
                 "evidence_references": evidence,
-                "provenance_id": provenance_id,
+                "provenance_id": aggregate_provenance_id,
+            }
+        )
+        arguments[argument_id] = argument.model_copy(
+            update={
+                "semantic_role": GraphQLSemanticRole.object_reference,
+                "semantic_role_evidence_references": evidence,
+                "object_reference_semantics": (
+                    GraphQLObjectReferenceSemantics(
+                        kind=GraphQLObjectReferenceKind.research_object,
+                        research_object_id=object_ids[0],
+                        confidence=ResearchConfidence.high,
+                    )
+                    if len(object_ids) == 1
+                    else GraphQLObjectReferenceSemantics()
+                ),
+                "evidence_references": evidence,
+                "provenance_id": aggregate_provenance_id,
             }
         )
 
@@ -396,6 +506,9 @@ def _apply_object_bindings(
     payload.update(
         graphql_arguments=tuple(arguments[key] for key in sorted(arguments)),
         graphql_variables=tuple(variables[key] for key in sorted(variables)),
+        graphql_variable_bindings=tuple(
+            binding_records[key] for key in sorted(binding_records)
+        ),
         provenance=tuple(provenance[key] for key in sorted(provenance)),
     )
     return ResearchState.model_validate(payload)
@@ -448,11 +561,27 @@ def candidate_ready_graphql_operation_templates(state: ResearchState):
             if not scalar_children:
                 paths.append((root_id,))
         if paths:
-            templates.append(
-                build_registered_graphql_operation_template(
-                    state, operation.operation_id, selection_paths=paths
-                )
+            alternatives = tuple(
+                item
+                for item in state.graphql_variable_bindings
+                if item.operation_id == operation.operation_id
             )
+            if alternatives:
+                templates.extend(
+                    build_registered_graphql_operation_template(
+                        state,
+                        operation.operation_id,
+                        selection_paths=paths,
+                        variable_bindings=(item.binding,),
+                    )
+                    for item in alternatives
+                )
+            else:
+                templates.append(
+                    build_registered_graphql_operation_template(
+                        state, operation.operation_id, selection_paths=paths
+                    )
+                )
     return tuple(sorted(templates, key=lambda item: item.template_id))
 
 

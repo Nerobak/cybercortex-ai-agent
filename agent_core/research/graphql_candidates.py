@@ -1157,6 +1157,31 @@ def _object_binding(
     object_id: str,
     required_argument_ids: set[str],
 ) -> GraphQLVariableBinding | None:
+    durable = {
+        (
+            item.binding.variable_id,
+            item.binding.argument_id,
+            item.binding.value_reference,
+        )
+        for item in state.graphql_variable_bindings
+        if item.operation_id == template.operation_id
+    }
+    for binding in template.variable_bindings:
+        if (
+            binding.value_source is GraphQLVariableValueSource.controlled_object
+            and binding.value_reference == object_id
+            and (
+                not required_argument_ids
+                or binding.argument_id in required_argument_ids
+            )
+            and (
+                binding.variable_id,
+                binding.argument_id,
+                binding.value_reference,
+            )
+            in durable
+        ):
+            return binding
     arguments: dict[str, GraphQLArgumentRecord] = {
         item.argument_id: item for item in state.graphql_arguments
     }

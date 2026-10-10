@@ -17,6 +17,7 @@ from agent_core.attack_surface import CanonicalAttackSurface
 from agent_core.controlled_context import (
     ControlledContext,
     ControlledObject,
+    OwnedObjectAcquisition,
     owned_object_acquisition_reference,
 )
 from agent_core.credential_vault import CredentialVault
@@ -44,6 +45,7 @@ from agent_core.research.state import (
     TokenRef,
     Workflow,
     WorkflowStep,
+    WorkflowValueFlow,
 )
 from agent_core.research.types import (
     DerivationType,
@@ -206,6 +208,15 @@ def _controlled_object_surface_id(
                 )
                 if endpoint_reference == acquisition_reference:
                     candidates.add(candidate_endpoint.surface_id)
+            correspondence = acquisition.identifier_parameter_correspondence
+            if correspondence is not None:
+                for candidate_endpoint in endpoints.values():
+                    if (
+                        candidate_endpoint.method.value == correspondence.method
+                        and candidate_endpoint.route_template
+                        == correspondence.route_template
+                    ):
+                        candidates.add(candidate_endpoint.surface_id)
 
     if len(candidates) == 1:
         return next(iter(candidates))
@@ -214,6 +225,171 @@ def _controlled_object_surface_id(
     if len(surfaces) == 1:
         return next(iter(surfaces))
     return None
+
+
+def _source_acquisition(
+    controlled_object: ControlledObject,
+    context: ControlledContext,
+) -> OwnedObjectAcquisition | None:
+    source_reference = controlled_object.source_reference
+    if source_reference is None:
+        return None
+    return next(
+        (
+            item
+            for item in context.object_acquisition
+            if owned_object_acquisition_reference(item) == source_reference
+        ),
+        None,
+    )
+
+
+def _controlled_object_reference_parameter(
+    controlled_object: ControlledObject,
+    context: ControlledContext,
+    state: ResearchState,
+    *,
+    target_id: str,
+    surface_id: str,
+) -> tuple[str | None, tuple[str, ...], str | None]:
+    """Resolve one exact acquisition-to-REST-parameter correspondence."""
+
+    if (
+        controlled_object.ownership_basis != "owner_scoped_authenticated_collection"
+        or controlled_object.source_reference is None
+    ):
+        return None, (), None
+    acquisition = _source_acquisition(controlled_object, context)
+    if acquisition is None:
+        return None, (), "controlled_object_reference_provenance_unavailable"
+
+    surfaces = {item.surface_id: item for item in state.surfaces}
+    source_surface = surfaces.get(surface_id)
+    if source_surface is None or source_surface.surface_type is not SurfaceType.rest:
+        return None, (), "controlled_object_reference_provenance_unavailable"
+    endpoints = {
+        item.endpoint_id: item
+        for item in state.endpoints
+        if item.target_id == target_id and item.surface_id == surface_id
+    }
+    parameters = {item.parameter_id: item for item in state.parameters}
+    declared_parameters: set[str] = set()
+    supporting_evidence: dict[str, set[str]] = {}
+
+    direct_reference = acquisition.identifier_parameter_reference
+    if direct_reference is not None:
+        parameter = parameters.get(direct_reference)
+        endpoint = (
+            endpoints.get(parameter.endpoint_id) if parameter is not None else None
+        )
+        if (
+            parameter is None
+            or endpoint is None
+            or not parameter.evidence_references
+            or parameter.location is ParameterLocation.graphql_variable
+        ):
+            return None, (), "controlled_object_reference_provenance_unavailable"
+        declared_parameters.add(parameter.parameter_id)
+        supporting_evidence.setdefault(parameter.parameter_id, set()).update(
+            parameter.evidence_references
+        )
+
+    correspondence = acquisition.identifier_parameter_correspondence
+    if correspondence is not None:
+        expected_name = opaque_reference(
+            correspondence.parameter_name, "parameter-name"
+        )
+        matches = tuple(
+            sorted(
+                parameter.parameter_id
+                for parameter in state.parameters
+                if (
+                    (endpoint := endpoints.get(parameter.endpoint_id)) is not None
+                    and endpoint.method.value == correspondence.method
+                    and endpoint.route_template == correspondence.route_template
+                    and parameter.location.value == correspondence.parameter_location
+                    and parameter.name == expected_name
+                    and bool(parameter.evidence_references)
+                )
+            )
+        )
+        if not matches:
+            return None, (), "controlled_object_reference_provenance_unavailable"
+        if len(matches) != 1:
+            return None, (), "controlled_object_reference_provenance_ambiguous"
+        declared_parameters.add(matches[0])
+        supporting_evidence.setdefault(matches[0], set()).update(
+            parameters[matches[0]].evidence_references
+        )
+
+    workflow_parameters: set[str] = set()
+    if controlled_object.identifier_response_pointer is not None:
+        target = next(item for item in state.targets if item.target_id == target_id)
+        acquisition_reference = _normalized_http_reference(
+            target.canonical_reference, acquisition.collection_url
+        )
+        for workflow in state.workflows:
+            workflow_steps = {item.step_id: item for item in workflow.steps}
+            for flow in workflow.value_flows:
+                if (
+                    flow.source_location != "response_body"
+                    or flow.source_reference
+                    != controlled_object.identifier_response_pointer
+                    or flow.target_location == "graphql_variable"
+                    or flow.target_parameter_id is None
+                ):
+                    continue
+                source_step = workflow_steps[flow.source_step_id]
+                target_step = workflow_steps[flow.target_step_id]
+                source_endpoint = endpoints.get(str(source_step.endpoint_id))
+                target_parameter = parameters.get(flow.target_parameter_id)
+                target_endpoint = (
+                    endpoints.get(target_parameter.endpoint_id)
+                    if target_parameter is not None
+                    else None
+                )
+                if (
+                    source_endpoint is None
+                    or target_endpoint is None
+                    or target_step.endpoint_id != target_endpoint.endpoint_id
+                    or target_parameter.location.value != flow.target_location
+                    or target_parameter.name
+                    != opaque_reference(flow.target_reference, "parameter-name")
+                    or not target_parameter.evidence_references
+                ):
+                    continue
+                source_reference = _normalized_http_reference(
+                    target.canonical_reference, source_endpoint.route_template
+                )
+                if (
+                    source_endpoint.method.value != acquisition.method
+                    or source_reference != acquisition_reference
+                ):
+                    continue
+                workflow_parameters.add(target_parameter.parameter_id)
+                supporting_evidence.setdefault(
+                    target_parameter.parameter_id, set()
+                ).update(
+                    {
+                        *workflow.evidence_references,
+                        *target_parameter.evidence_references,
+                    }
+                )
+
+    if len(workflow_parameters) > 1 and not declared_parameters:
+        return None, (), "controlled_object_reference_provenance_ambiguous"
+    declared_parameters.update(workflow_parameters)
+
+    if not declared_parameters:
+        return None, (), "controlled_object_reference_provenance_unavailable"
+    if len(declared_parameters) != 1:
+        return None, (), "controlled_object_reference_provenance_conflicting"
+    parameter_id = next(iter(declared_parameters))
+    if controlled_object.parameter_ids and set(controlled_object.parameter_ids) != {
+        parameter_id
+    }:
+        return None, (), "controlled_object_reference_provenance_conflicting"
+    return parameter_id, tuple(sorted(supporting_evidence[parameter_id])), None
 
 
 def _timestamp(value: str | None = None) -> str:
@@ -503,6 +679,7 @@ class AttackSurfaceResearchAdapter:
             surface.workflows,
             surface_id=surface_id,
             endpoint_by_key=endpoint_by_key,
+            parameters=tuple(parameters),
             route_evidence=route_evidence,
             provenance_id=provenance_id,
         )
@@ -704,6 +881,7 @@ class AttackSurfaceResearchAdapter:
         *,
         surface_id: str,
         endpoint_by_key: dict[tuple[str, str], Endpoint],
+        parameters: tuple[Parameter, ...],
         route_evidence: dict[tuple[str, str], str],
         provenance_id: str,
     ) -> tuple[Workflow, ...]:
@@ -711,6 +889,7 @@ class AttackSurfaceResearchAdapter:
         for index, item in enumerate(values[:2_000], start=1):
             raw_steps = item.get("steps") or [item]
             steps: list[WorkflowStep] = []
+            steps_by_sequence: dict[int, WorkflowStep] = {}
             evidence_ids: list[str] = []
             for sequence, raw in enumerate(raw_steps, start=1):
                 if not isinstance(raw, dict):
@@ -722,38 +901,160 @@ class AttackSurfaceResearchAdapter:
                 endpoint = endpoint_by_key.get(key)
                 if endpoint is None:
                     continue
-                steps.append(
-                    WorkflowStep(
-                        step_id=stable_research_identifier(
-                            "workflow-step",
-                            surface_id,
-                            index,
-                            sequence,
-                            endpoint.endpoint_id,
-                        ),
-                        sequence=sequence,
-                        endpoint_id=endpoint.endpoint_id,
-                        method=endpoint.method,
-                        state_before_reference=(
-                            opaque_reference(raw.get("state_before"), "state")
-                            if raw.get("state_before")
-                            else None
-                        ),
-                        state_after_reference=(
-                            opaque_reference(raw.get("state_after"), "state")
-                            if raw.get("state_after")
-                            else None
-                        ),
-                        state_changing=bool(
-                            raw.get("state_changing")
-                            or endpoint.method
-                            not in {HttpMethod.get, HttpMethod.head, HttpMethod.options}
-                        ),
-                    )
+                step = WorkflowStep(
+                    step_id=stable_research_identifier(
+                        "workflow-step",
+                        surface_id,
+                        index,
+                        sequence,
+                        endpoint.endpoint_id,
+                    ),
+                    sequence=sequence,
+                    endpoint_id=endpoint.endpoint_id,
+                    method=endpoint.method,
+                    state_before_reference=(
+                        opaque_reference(raw.get("state_before"), "state")
+                        if raw.get("state_before")
+                        else None
+                    ),
+                    state_after_reference=(
+                        opaque_reference(raw.get("state_after"), "state")
+                        if raw.get("state_after")
+                        else None
+                    ),
+                    state_changing=bool(
+                        raw.get("state_changing")
+                        or endpoint.method
+                        not in {HttpMethod.get, HttpMethod.head, HttpMethod.options}
+                    ),
                 )
+                steps.append(step)
+                steps_by_sequence[sequence] = step
                 evidence_ids.append(route_evidence[key])
             if not steps:
                 continue
+            value_flows: list[WorkflowValueFlow] = []
+            for raw_flow in (item.get("value_flows") or [])[:200]:
+                if not isinstance(raw_flow, dict):
+                    continue
+                source_sequence = raw_flow.get("source_step_sequence")
+                target_sequence = raw_flow.get("target_step_sequence")
+                if (
+                    isinstance(source_sequence, bool)
+                    or not isinstance(source_sequence, int)
+                    or isinstance(target_sequence, bool)
+                    or not isinstance(target_sequence, int)
+                ):
+                    continue
+                source_step = steps_by_sequence.get(source_sequence)
+                target_step = steps_by_sequence.get(target_sequence)
+                source_location = str(raw_flow.get("source_location") or "")
+                target_location = str(raw_flow.get("target_location") or "")
+                source_reference = str(raw_flow.get("source_reference") or "").strip()
+                target_reference = str(raw_flow.get("target_reference") or "").strip()
+                if (
+                    source_step is None
+                    or target_step is None
+                    or not source_reference
+                    or not target_reference
+                    or source_location
+                    not in {
+                        "response_body",
+                        "path",
+                        "query",
+                        "header",
+                        "cookie",
+                        "json",
+                        "form",
+                    }
+                    or target_location
+                    not in {
+                        "path",
+                        "query",
+                        "header",
+                        "cookie",
+                        "json",
+                        "form",
+                        "graphql_variable",
+                    }
+                ):
+                    continue
+
+                def resolve_parameter(
+                    step: WorkflowStep, location: str, reference: str
+                ) -> str | None:
+                    resolved_location = _parameter_location(location)
+                    matches = tuple(
+                        parameter.parameter_id
+                        for parameter in parameters
+                        if parameter.endpoint_id == step.endpoint_id
+                        and parameter.location is resolved_location
+                        and parameter.name
+                        == opaque_reference(reference, "parameter-name")
+                    )
+                    return matches[0] if len(matches) == 1 else None
+
+                source_parameter_id = (
+                    None
+                    if source_location == "response_body"
+                    else resolve_parameter(
+                        source_step, source_location, source_reference
+                    )
+                )
+                target_parameter_id = (
+                    None
+                    if target_location == "graphql_variable"
+                    else resolve_parameter(
+                        target_step, target_location, target_reference
+                    )
+                )
+                if (
+                    source_location != "response_body" and source_parameter_id is None
+                ) or (
+                    target_location != "graphql_variable"
+                    and target_parameter_id is None
+                ):
+                    continue
+                target_operation_name = str(
+                    raw_flow.get("target_operation_name") or ""
+                ).strip()
+                if target_location == "graphql_variable" and not target_operation_name:
+                    continue
+                value_flows.append(
+                    WorkflowValueFlow(
+                        flow_id=stable_research_identifier(
+                            "workflow-flow",
+                            surface_id,
+                            item.get("workflow_id") or index,
+                            source_step.step_id,
+                            source_location,
+                            source_reference,
+                            source_parameter_id,
+                            target_step.step_id,
+                            target_location,
+                            target_reference,
+                            target_parameter_id,
+                            target_operation_name,
+                        ),
+                        source_step_id=source_step.step_id,
+                        source_location=source_location,
+                        source_reference=public_text(
+                            source_reference, "Observed source reference."
+                        ),
+                        source_parameter_id=source_parameter_id,
+                        target_step_id=target_step.step_id,
+                        target_location=target_location,
+                        target_reference=public_text(
+                            target_reference, "Observed target reference."
+                        ),
+                        target_parameter_id=target_parameter_id,
+                        target_operation_name=(
+                            opaque_reference(target_operation_name, "graphql-operation")
+                            if target_operation_name
+                            else None
+                        ),
+                    )
+                )
             name = str(
                 item.get("name") or item.get("workflow_type") or f"workflow-{index}"
             )
@@ -765,6 +1066,7 @@ class AttackSurfaceResearchAdapter:
                     surface_id=surface_id,
                     name=public_text(name, "Observed workflow."),
                     steps=tuple(steps),
+                    value_flows=tuple(value_flows),
                     evidence_references=tuple(sorted(set(evidence_ids))),
                     provenance_id=provenance_id,
                 )
@@ -965,40 +1267,60 @@ class ControlledContextResearchAdapter:
             if len(valid_parameters) != len(controlled_object.parameter_ids):
                 limitations.append("controlled_object_parameter_evidence_unavailable")
                 diagnostic_codes.add("controlled_object_parameter_evidence_unavailable")
+            (
+                reference_parameter_id,
+                reference_supporting_evidence,
+                reference_limitation,
+            ) = _controlled_object_reference_parameter(
+                controlled_object,
+                context,
+                state,
+                target_id=target_id,
+                surface_id=surface_id,
+            )
+            if _source_acquisition(controlled_object, context) is not None:
+                # A configured acquisition promotes its parameter relation only
+                # as the same atomic unit as exact reference evidence.
+                valid_parameters = ()
+            if reference_limitation is not None:
+                limitations.append(reference_limitation)
+                diagnostic_codes.add(reference_limitation)
+            if reference_parameter_id is not None:
+                valid_parameters = tuple(
+                    sorted({*valid_parameters, reference_parameter_id})
+                )
             reference_evidence = ()
-            if (
-                controlled_object.ownership_basis
-                == "owner_scoped_authenticated_collection"
-                and controlled_object.source_reference is not None
-            ):
+            if reference_parameter_id is not None:
                 value_fingerprint = digest_for(
                     {"controlled_object_reference": controlled_object.object_id}
                 )
-                reference_evidence = tuple(
+                reference_evidence = (
                     ControlledObjectReferenceEvidence(
                         reference_evidence_id=stable_research_identifier(
                             "object-reference-evidence",
                             state.research_id,
                             ownership_evidence.evidence_id,
-                            parameter_id,
+                            reference_parameter_id,
                             value_fingerprint,
                         ),
                         source_surface_id=surface_id,
                         source_request_reference=controlled_object.source_reference,
-                        parameter_id=parameter_id,
+                        parameter_id=reference_parameter_id,
                         ownership_evidence_reference=ownership_evidence.evidence_id,
                         value_fingerprint=value_fingerprint,
                         evidence_references=tuple(
                             sorted(
                                 {
                                     ownership_evidence.evidence_id,
-                                    *parameters[parameter_id].evidence_references,
+                                    *parameters[
+                                        reference_parameter_id
+                                    ].evidence_references,
+                                    *reference_supporting_evidence,
                                 }
                             )
                         ),
                         provenance_id=provenance_id,
-                    )
-                    for parameter_id in valid_parameters
+                    ),
                 )
             objects.append(
                 ResearchObject(

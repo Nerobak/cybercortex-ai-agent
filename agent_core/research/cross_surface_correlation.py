@@ -260,7 +260,6 @@ class CrossSurfaceControlledObjectCorrelator:
                     and item.source.entity_id == argument.argument_id
                     and item.relation is ResearchPredicate.crosses_surface
                     and item.target.entity_kind is EntityKind.parameter
-                    and item.target.entity_id == argument.parameter_id
                 )
                 if not cross_links:
                     reject(
@@ -354,7 +353,13 @@ class CrossSurfaceControlledObjectCorrelator:
                         argument_id=argument.argument_id,
                     )
                     continue
-                if len(fingerprints_by_object) > 1:
+                objects_by_fingerprint: dict[str, set[str]] = {}
+                for object_id, fingerprints in fingerprints_by_object.items():
+                    for fingerprint in fingerprints:
+                        objects_by_fingerprint.setdefault(fingerprint, set()).add(
+                            object_id
+                        )
+                if any(len(values) > 1 for values in objects_by_fingerprint.values()):
                     reject(
                         template,
                         CrossSurfaceCorrelationRejectionReason.ambiguous_object_reference,
@@ -363,96 +368,103 @@ class CrossSurfaceControlledObjectCorrelator:
                     )
                     continue
 
-                controlled_object, reference, cross_link = sorted(
+                matches_by_object: dict[
+                    str, tuple[ResearchObject, object, GraphAssertion]
+                ] = {}
+                for match in sorted(
                     matches,
                     key=lambda item: (
                         item[0].object_id,
                         item[1].reference_evidence_id,
                         item[2].assertion_id,
                     ),
-                )[0]
-                owner_identity_id = str(controlled_object.owner_identity_id)
+                ):
+                    matches_by_object.setdefault(match[0].object_id, match)
                 variable_link = sorted(
                     variable_links, key=lambda item: item.assertion_id
                 )[0]
-                assertion_ids = tuple(
-                    sorted((variable_link.assertion_id, cross_link.assertion_id))
-                )
-                evidence = tuple(
-                    sorted(
+                for controlled_object, reference, cross_link in (
+                    matches_by_object[key] for key in sorted(matches_by_object)
+                ):
+                    owner_identity_id = str(controlled_object.owner_identity_id)
+                    assertion_ids = tuple(
+                        sorted((variable_link.assertion_id, cross_link.assertion_id))
+                    )
+                    evidence = tuple(
+                        sorted(
+                            {
+                                *template.evidence_references,
+                                *operation.evidence_references,
+                                *controlled_object.evidence_references,
+                                *reference.evidence_references,
+                                *variable_link.evidence_references,
+                                *cross_link.evidence_references,
+                            }
+                        )
+                    )
+                    if not set(evidence).issubset(known_evidence):
+                        reject(
+                            template,
+                            CrossSurfaceCorrelationRejectionReason.missing_object_reference_evidence,
+                            variable_id=variable.variable_id,
+                            argument_id=argument.argument_id,
+                        )
+                        continue
+                    binding_fingerprint = _fingerprint(
                         {
-                            *template.evidence_references,
-                            *operation.evidence_references,
-                            *variable.evidence_references,
-                            *argument.evidence_references,
-                            *controlled_object.evidence_references,
-                            *reference.evidence_references,
-                            *variable_link.evidence_references,
-                            *cross_link.evidence_references,
+                            "version": CROSS_SURFACE_CORRELATION_VERSION,
+                            "operation_id": operation.operation_id,
+                            "variable_id": variable.variable_id,
+                            "argument_id": argument.argument_id,
+                            "controlled_object_id": controlled_object.object_id,
+                            "owner_identity_id": owner_identity_id,
+                            "object_reference_evidence_id": (
+                                reference.reference_evidence_id
+                            ),
+                            "value_fingerprint": reference.value_fingerprint,
+                            "relationship_assertion_ids": assertion_ids,
+                            "evidence_references": evidence,
                         }
                     )
-                )
-                if not set(evidence).issubset(known_evidence):
-                    reject(
-                        template,
-                        CrossSurfaceCorrelationRejectionReason.missing_object_reference_evidence,
+                    binding = GraphQLVariableBinding(
                         variable_id=variable.variable_id,
                         argument_id=argument.argument_id,
+                        value_source=GraphQLVariableValueSource.controlled_object,
+                        value_reference=controlled_object.object_id,
                     )
-                    continue
-                binding_fingerprint = _fingerprint(
-                    {
-                        "version": CROSS_SURFACE_CORRELATION_VERSION,
-                        "operation_id": operation.operation_id,
-                        "variable_id": variable.variable_id,
-                        "argument_id": argument.argument_id,
-                        "controlled_object_id": controlled_object.object_id,
-                        "owner_identity_id": owner_identity_id,
-                        "object_reference_evidence_id": (
-                            reference.reference_evidence_id
-                        ),
-                        "value_fingerprint": reference.value_fingerprint,
-                        "relationship_assertion_ids": assertion_ids,
-                        "evidence_references": evidence,
-                    }
-                )
-                binding = GraphQLVariableBinding(
-                    variable_id=variable.variable_id,
-                    argument_id=argument.argument_id,
-                    value_source=GraphQLVariableValueSource.controlled_object,
-                    value_reference=controlled_object.object_id,
-                )
-                readiness_evidence = RegisteredGraphQLObjectBindingEvidence(
-                    operation_id=operation.operation_id,
-                    variable_id=variable.variable_id,
-                    argument_id=argument.argument_id,
-                    controlled_object_id=controlled_object.object_id,
-                    binding_basis=(
-                        GraphQLObjectBindingBasis.explicit_cross_surface_relationship
-                    ),
-                    evidence_references=evidence,
-                    owner_identity_id=owner_identity_id,
-                    source_template_id=template.template_id,
-                    object_reference_evidence_id=reference.reference_evidence_id,
-                    relationship_assertion_ids=assertion_ids,
-                    binding_fingerprint=binding_fingerprint,
-                )
-                correlations.append(
-                    CorrelatedGraphQLVariableBinding(
+                    readiness_evidence = RegisteredGraphQLObjectBindingEvidence(
                         operation_id=operation.operation_id,
-                        source_template_id=template.template_id,
                         variable_id=variable.variable_id,
                         argument_id=argument.argument_id,
                         controlled_object_id=controlled_object.object_id,
+                        binding_basis=(
+                            GraphQLObjectBindingBasis.explicit_cross_surface_relationship
+                        ),
+                        evidence_references=evidence,
                         owner_identity_id=owner_identity_id,
+                        source_template_id=template.template_id,
                         object_reference_evidence_id=(reference.reference_evidence_id),
                         relationship_assertion_ids=assertion_ids,
-                        evidence_references=evidence,
                         binding_fingerprint=binding_fingerprint,
-                        binding=binding,
-                        readiness_evidence=readiness_evidence,
                     )
-                )
+                    correlations.append(
+                        CorrelatedGraphQLVariableBinding(
+                            operation_id=operation.operation_id,
+                            source_template_id=template.template_id,
+                            variable_id=variable.variable_id,
+                            argument_id=argument.argument_id,
+                            controlled_object_id=controlled_object.object_id,
+                            owner_identity_id=owner_identity_id,
+                            object_reference_evidence_id=(
+                                reference.reference_evidence_id
+                            ),
+                            relationship_assertion_ids=assertion_ids,
+                            evidence_references=evidence,
+                            binding_fingerprint=binding_fingerprint,
+                            binding=binding,
+                            readiness_evidence=readiness_evidence,
+                        )
+                    )
 
         unique = {item.binding_fingerprint: item for item in correlations}
 

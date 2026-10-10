@@ -320,6 +320,44 @@ class GraphQLVariableBinding(ResearchContract):
         return value
 
 
+class GraphQLControlledObjectBindingRecord(ResearchContract):
+    """Durable evidence-backed alternative for one registered variable."""
+
+    binding_id: OpaqueIdentifier
+    operation_id: GraphQLOperationId
+    binding: GraphQLVariableBinding
+    owner_identity_id: IdentityId
+    object_reference_evidence_id: OpaqueIdentifier | None = None
+    relationship_assertion_ids: tuple[OpaqueIdentifier, ...] = Field(
+        min_length=2, max_length=20
+    )
+    evidence_references: tuple[EvidenceArtifactId, ...] = Field(
+        min_length=1, max_length=100
+    )
+    binding_fingerprint: Sha256Digest
+    provenance_id: ProvenanceRecordId
+
+    @model_validator(mode="after")
+    def canonicalize(self) -> "GraphQLControlledObjectBindingRecord":
+        if (
+            self.binding.value_source
+            is not GraphQLVariableValueSource.controlled_object
+        ):
+            raise ValueError("controlled object binding requires a controlled object")
+        assertions = tuple(sorted(set(self.relationship_assertion_ids)))
+        if len(assertions) != len(self.relationship_assertion_ids):
+            raise ValueError("binding relationship assertions must be unique")
+        object.__setattr__(self, "relationship_assertion_ids", assertions)
+        object.__setattr__(
+            self,
+            "evidence_references",
+            _canonical_references(
+                self.evidence_references, "controlled object binding evidence"
+            ),
+        )
+        return self
+
+
 class GraphQLSelectionPath(ResearchContract):
     """One registered, non-recursive path through known GraphQL fields."""
 
@@ -1682,6 +1720,9 @@ def build_graphql_graph_assertions(
     semantic_surfaces = {
         item.graphql_surface_id: item for item in state.graphql_surfaces
     }
+    parameters = {item.parameter_id: item for item in state.parameters}
+    endpoints = {item.endpoint_id: item for item in state.endpoints}
+    surfaces = {item.surface_id: item for item in state.surfaces}
     registered_binding_provenance = {
         item.provenance_id
         for item in state.provenance
@@ -1826,13 +1867,28 @@ def build_graphql_graph_assertions(
                         item.evidence_references,
                         item.provenance_id,
                     )
-        if item.parameter_id is not None:
+        parameter = (
+            parameters.get(str(item.parameter_id)) if item.parameter_id else None
+        )
+        parameter_endpoint = (
+            endpoints.get(parameter.endpoint_id) if parameter is not None else None
+        )
+        parameter_surface = (
+            surfaces.get(parameter_endpoint.surface_id)
+            if parameter_endpoint is not None
+            else None
+        )
+        if (
+            parameter is not None
+            and parameter_surface is not None
+            and parameter_surface.surface_type.value == "rest"
+        ):
             add(
                 EntityKind.graphql_argument,
                 item.argument_id,
                 ResearchPredicate.crosses_surface,
                 EntityKind.parameter,
-                item.parameter_id,
+                parameter.parameter_id,
                 item.evidence_references,
                 item.provenance_id,
             )
@@ -1914,9 +1970,110 @@ def build_graphql_graph_assertions(
                     ResearchPredicate.graphql_variable_binds_argument,
                     EntityKind.graphql_argument,
                     variable.linked_argument_id,
-                    variable.evidence_references,
-                    variable.provenance_id,
+                    item.evidence_references,
+                    item.provenance_id,
                 )
+
+    # A standard OpenAPI Link Object may explicitly carry a REST request
+    # parameter into one named GraphQL operation variable. This is application
+    # dataflow evidence, not a parameter-name heuristic.
+    for workflow in state.workflows:
+        workflow_steps = {item.step_id: item for item in workflow.steps}
+        for flow in workflow.value_flows:
+            if (
+                flow.target_location != "graphql_variable"
+                or flow.source_parameter_id is None
+                or flow.target_operation_name is None
+            ):
+                continue
+            source_parameter = parameters.get(flow.source_parameter_id)
+            source_step = workflow_steps[flow.source_step_id]
+            target_step = workflow_steps[flow.target_step_id]
+            target_workflow_endpoint = endpoints.get(str(target_step.endpoint_id))
+            source_endpoint = (
+                endpoints.get(source_parameter.endpoint_id)
+                if source_parameter is not None
+                else None
+            )
+            source_surface = (
+                surfaces.get(source_endpoint.surface_id)
+                if source_endpoint is not None
+                else None
+            )
+            if (
+                source_parameter is None
+                or source_endpoint is None
+                or source_step.endpoint_id != source_endpoint.endpoint_id
+                or source_surface is None
+                or source_surface.surface_type.value != "rest"
+                or source_parameter.name != flow.source_reference
+                or source_parameter.location.value != flow.source_location
+                or target_workflow_endpoint is None
+            ):
+                continue
+            matching_surfaces = tuple(
+                item
+                for item in semantic_surfaces.values()
+                if (
+                    (semantic_endpoint := endpoints.get(item.endpoint_id)) is not None
+                    and semantic_endpoint.target_id
+                    == target_workflow_endpoint.target_id
+                    and semantic_endpoint.method == target_workflow_endpoint.method
+                    and semantic_endpoint.route_template
+                    == target_workflow_endpoint.route_template
+                )
+                and item.surface_id != source_surface.surface_id
+            )
+            if len(matching_surfaces) != 1:
+                continue
+            semantic_surface = matching_surfaces[0]
+            matching_operations = tuple(
+                operation
+                for operation in state.graphql_operations
+                if isinstance(operation, GraphQLOperationRecord)
+                and operation.graphql_surface_id == semantic_surface.graphql_surface_id
+                and operation.operation_name == flow.target_operation_name
+            )
+            if len(matching_operations) != 1:
+                continue
+            operation = matching_operations[0]
+            matching_variables = tuple(
+                variables[variable_id]
+                for variable_id in operation.variable_ids
+                if variables[variable_id].name == flow.target_reference
+                and variables[variable_id].linked_argument_id is not None
+            )
+            if len(matching_variables) != 1:
+                continue
+            variable = matching_variables[0]
+            add(
+                EntityKind.graphql_argument,
+                str(variable.linked_argument_id),
+                ResearchPredicate.crosses_surface,
+                EntityKind.parameter,
+                source_parameter.parameter_id,
+                workflow.evidence_references,
+                workflow.provenance_id,
+            )
+
+    # Persisted correlation output may contain multiple independently owned
+    # alternatives for the same variable. Preserve every proven mapping; no
+    # object is selected merely because its identifier sorts first.
+    for record in state.graphql_variable_bindings:
+        for relation in (
+            ResearchPredicate.graphql_references_object,
+            ResearchPredicate.references_same_object,
+            ResearchPredicate.crosses_surface,
+        ):
+            add(
+                EntityKind.graphql_argument,
+                record.binding.argument_id,
+                relation,
+                EntityKind.object,
+                record.binding.value_reference,
+                record.evidence_references,
+                record.provenance_id,
+            )
 
     return tuple(assertions[key] for key in sorted(assertions))
 

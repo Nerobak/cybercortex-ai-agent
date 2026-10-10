@@ -18,6 +18,7 @@ from agent_core.controlled_context import (
     ControlledContext,
     ControlledObject,
     OwnedObjectAcquisition,
+    OwnedObjectReferenceCorrespondence,
 )
 from agent_core.credential_vault import CredentialVault
 from agent_core.models import (
@@ -1554,6 +1555,53 @@ def test_bootstrap_is_idempotent_and_does_not_reset_accounting(tmp_path):
         assert len(second.request_templates) == 1
         assert second.budgets[0].request_budget.consumed.total == first_budget
         assert second.bootstrap_progress[0].request_delta.discovery == 1
+    finally:
+        vault.close()
+
+
+def test_bootstrap_persists_exact_controlled_object_reference_before_readiness(
+    tmp_path,
+):
+    store, _budgets, vault, _runner, bootstrapper = bootstrap_fixture(tmp_path)
+    config = OwnedObjectAcquisition(
+        owner_account_id="account-a",
+        collection_url=f"{TARGET}/owned-users",
+        object_type="user",
+        identifier_field="user_id",
+        identifier_parameter_correspondence=OwnedObjectReferenceCorrespondence(
+            method="GET",
+            route_template="/admin/users/{user_id}",
+            parameter_location="path",
+            parameter_name="user_id",
+        ),
+    )
+    bootstrapper.controlled_context.object_acquisition.append(config)
+    bootstrapper.object_acquisition_sender = lambda _request: {
+        "status_code": 200,
+        "body": [{"user_id": "synthetic-owned-user"}],
+    }
+
+    try:
+        state = bootstrapper.prepare(store.load_research("research-blind"))
+        restored = store.load_research("research-blind")
+
+        controlled_object = next(
+            item for item in state.objects if item.object_type == "user"
+        )
+        assert len(controlled_object.reference_evidence) == 1
+        assert controlled_object.parameter_references == (
+            controlled_object.reference_evidence[0].parameter_id,
+        )
+        ownership_evidence = next(
+            item
+            for item in state.evidence
+            if item.evidence_id == controlled_object.evidence_references[0]
+        )
+        assert controlled_object.reference_evidence[0].source_request_reference == (
+            ownership_evidence.source_reference
+        )
+        assert restored == state
+        assert store.verify_integrity(state.research_id).valid is True
     finally:
         vault.close()
 

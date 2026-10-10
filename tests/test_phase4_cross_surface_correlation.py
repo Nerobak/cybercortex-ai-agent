@@ -8,6 +8,7 @@ from agent_core.controlled_context import (
     ControlledObject,
     OwnedObjectAcquirer,
     OwnedObjectAcquisition,
+    OwnedObjectReferenceCorrespondence,
     owned_object_acquisition_reference,
 )
 from agent_core.credential_vault import CredentialVault
@@ -27,6 +28,7 @@ from agent_core.research import (
     ResearchPredicate,
     ResearchState,
     ResearchStore,
+    ParameterLocation,
     build_graphql_graph_assertions,
     candidate_ready_graphql_operation_templates,
     derive_candidate_ready_graphql_operations,
@@ -68,8 +70,15 @@ def _state(
             collection_url=f"{TARGET}/resources/{{resourceRef}}",
             object_type="Resource",
             identifier_field="resourceRef",
-            identifier_parameter_reference=(
-                "parameter-resource-ref" if account_id in evidenced_accounts else None
+            identifier_parameter_correspondence=(
+                OwnedObjectReferenceCorrespondence(
+                    method="GET",
+                    route_template="/resources/{resourceRef}",
+                    parameter_location="path",
+                    parameter_name="resourceRef",
+                )
+                if account_id in evidenced_accounts
+                else None
             ),
         )
         for account_id in accounts
@@ -83,11 +92,6 @@ def _state(
             object_id=f"controlled-reference-{index}",
             owner_account_id=config.owner_account_id,
             object_type=config.object_type,
-            parameter_ids=(
-                (config.identifier_parameter_reference,)
-                if config.identifier_parameter_reference is not None
-                else ()
-            ),
             ownership_basis="owner_scoped_authenticated_collection",
             source_reference=owned_object_acquisition_reference(config),
         )
@@ -133,9 +137,12 @@ def test_closed_cross_surface_evidence_creates_stable_binding_without_calls():
     }
     assert first.correlations[0].binding_fingerprint.startswith("sha256:")
     assert first.target_requests == first.model_calls == 0
+    assert len(state.objects) == 2
+    assert len({item.owner_identity_id for item in state.objects}) == 2
+    assert sorted(len(item.reference_evidence) for item in state.objects) == [0, 1]
 
 
-def test_benchmark7_shape_blocks_without_object_reference_then_closes_with_it():
+def test_benchmark8_shape_blocks_without_object_reference_then_closes_with_it():
     blocked = _correlate(_state(evidenced_accounts=()))
     closed = _correlate(_state(evidenced_accounts=("account-a",)))
 
@@ -157,8 +164,38 @@ def test_name_only_match_cannot_replace_typed_cross_surface_relation():
     assert GraphQLHypothesisGenerator().generate_result(state, ()).hypotheses == ()
 
 
-def test_two_fully_evidenced_objects_fail_closed_as_ambiguous():
+def test_two_independently_owned_objects_preserve_distinct_binding_alternatives():
     result = _correlate(_state(evidenced_accounts=("account-a", "account-b")))
+
+    assert len(result.bindings) == 2
+    assert len({item.value_reference for item in result.bindings}) == 2
+    assert len({item.owner_identity_id for item in result.correlations}) == 2
+    assert result.rejections == ()
+
+
+def test_same_reference_fingerprint_across_owners_is_rejected_as_ambiguous():
+    state = _state(evidenced_accounts=("account-a", "account-b"))
+    first, second = state.objects
+    shared = first.reference_evidence[0].value_fingerprint
+    ambiguous = ResearchState.model_validate(
+        {
+            **state.model_dump(mode="python"),
+            "objects": (
+                first,
+                second.model_copy(
+                    update={
+                        "reference_evidence": (
+                            second.reference_evidence[0].model_copy(
+                                update={"value_fingerprint": shared}
+                            ),
+                        )
+                    }
+                ),
+            ),
+        }
+    )
+
+    result = _correlate(ambiguous)
 
     assert result.bindings == ()
     assert {item.reason for item in result.rejections} == {
@@ -421,6 +458,244 @@ def test_owned_rest_acquisition_preserves_explicit_parameter_provenance():
     assert acquired.source_reference == owned_object_acquisition_reference(config)
 
 
+def test_owned_rest_acquisition_resolves_exact_parameter_correspondence():
+    schema = _schema_without_controlled_objects()
+    vault = CredentialVault()
+    budget = RequestBudget(2, per_host_limit=2)
+    token_reference = vault.put("synthetic-wire-token", label="controlled-token")
+    account = ControlledAccount(
+        account_id="account-a", session_reference=token_reference
+    )
+    config = OwnedObjectAcquisition(
+        owner_account_id="account-a",
+        collection_url=f"{TARGET}/resources",
+        object_type="Resource",
+        identifier_field="resourceRef",
+        identifier_parameter_correspondence=OwnedObjectReferenceCorrespondence(
+            method="GET",
+            route_template="/resources/{resourceRef}",
+            parameter_location="path",
+            parameter_name="resourceRef",
+        ),
+    )
+
+    try:
+        acquired = OwnedObjectAcquirer(vault, budget).acquire(
+            account,
+            config,
+            lambda _request: {
+                "status_code": 200,
+                "body": [{"resourceRef": "synthetic-controlled-reference"}],
+            },
+        )
+        context = ControlledContext(accounts=[account], object_acquisition=[config])
+        records = ControlledContextResearchAdapter().adapt_acquired_objects(
+            (acquired,),
+            context,
+            schema,
+            policy=_policy("account-a"),
+            target_id="target-1",
+            vault=vault,
+            occurred_at=TS,
+        )
+    finally:
+        vault.close()
+
+    assert acquired.parameter_ids == ()
+    assert records.limitations == ()
+    assert records.objects[0].parameter_references == ("parameter-resource-ref",)
+    reference = records.objects[0].reference_evidence[0]
+    assert reference.parameter_id == "parameter-resource-ref"
+    assert reference.source_request_reference == acquired.source_reference
+    assert records.evidence[0].evidence_id in reference.evidence_references
+    assert len(reference.evidence_references) >= 2
+
+
+def test_response_identifier_without_correspondence_proof_is_not_promoted():
+    schema = _schema_without_controlled_objects()
+    config = OwnedObjectAcquisition(
+        owner_account_id="account-a",
+        collection_url=f"{TARGET}/resources/{{resourceRef}}",
+        object_type="Resource",
+        identifier_field="resourceRef",
+    )
+    acquired = ControlledObject(
+        object_id="response-only-reference",
+        owner_account_id="account-a",
+        object_type="Resource",
+        ownership_basis="owner_scoped_authenticated_collection",
+        source_reference=owned_object_acquisition_reference(config),
+    )
+    records = ControlledContextResearchAdapter().adapt_acquired_objects(
+        (acquired,),
+        ControlledContext(
+            accounts=[ControlledAccount(account_id="account-a")],
+            object_acquisition=[config],
+        ),
+        schema,
+        policy=_policy("account-a"),
+        target_id="target-1",
+        occurred_at=TS,
+    )
+
+    assert records.objects[0].parameter_references == ()
+    assert records.objects[0].reference_evidence == ()
+    assert records.limitations == (
+        "controlled_object_reference_provenance_unavailable",
+    )
+
+
+def test_declared_correspondence_without_parameter_evidence_is_not_promoted():
+    schema = _schema_without_controlled_objects()
+    config = OwnedObjectAcquisition(
+        owner_account_id="account-a",
+        collection_url=f"{TARGET}/resources/{{resourceRef}}",
+        object_type="Resource",
+        identifier_field="resourceRef",
+        identifier_parameter_correspondence=OwnedObjectReferenceCorrespondence(
+            route_template="/resources/{resourceRef}",
+            parameter_location="query",
+            parameter_name="unobservedReference",
+        ),
+    )
+    acquired = ControlledObject(
+        object_id="missing-parameter-evidence-reference",
+        owner_account_id="account-a",
+        object_type="Resource",
+        ownership_basis="owner_scoped_authenticated_collection",
+        source_reference=owned_object_acquisition_reference(config),
+    )
+    records = ControlledContextResearchAdapter().adapt_acquired_objects(
+        (acquired,),
+        ControlledContext(
+            accounts=[ControlledAccount(account_id="account-a")],
+            object_acquisition=[config],
+        ),
+        schema,
+        policy=_policy("account-a"),
+        target_id="target-1",
+        occurred_at=TS,
+    )
+
+    assert records.objects[0].parameter_references == ()
+    assert records.objects[0].reference_evidence == ()
+    assert records.limitations == (
+        "controlled_object_reference_provenance_unavailable",
+    )
+
+
+def test_ambiguous_exact_parameter_correspondence_is_rejected():
+    schema = _schema_without_controlled_objects()
+    parameter = next(
+        item
+        for item in schema.parameters
+        if item.parameter_id == "parameter-resource-ref"
+    )
+    ambiguous_schema = ResearchState.model_validate(
+        {
+            **schema.model_dump(mode="python"),
+            "parameters": (
+                *schema.parameters,
+                parameter.model_copy(update={"parameter_id": "parameter-duplicate"}),
+            ),
+        }
+    )
+    config = OwnedObjectAcquisition(
+        owner_account_id="account-a",
+        collection_url=f"{TARGET}/resources",
+        object_type="Resource",
+        identifier_field="resourceRef",
+        identifier_parameter_correspondence=OwnedObjectReferenceCorrespondence(
+            route_template="/resources/{resourceRef}",
+            parameter_location="path",
+            parameter_name="resourceRef",
+        ),
+    )
+    acquired = ControlledObject(
+        object_id="ambiguous-reference",
+        owner_account_id="account-a",
+        object_type="Resource",
+        ownership_basis="owner_scoped_authenticated_collection",
+        source_reference=owned_object_acquisition_reference(config),
+    )
+    records = ControlledContextResearchAdapter().adapt_acquired_objects(
+        (acquired,),
+        ControlledContext(
+            accounts=[ControlledAccount(account_id="account-a")],
+            object_acquisition=[config],
+        ),
+        ambiguous_schema,
+        policy=_policy("account-a"),
+        target_id="target-1",
+        occurred_at=TS,
+    )
+
+    assert records.objects[0].parameter_references == ()
+    assert records.objects[0].reference_evidence == ()
+    assert records.limitations == ("controlled_object_reference_provenance_ambiguous",)
+
+
+def test_conflicting_parameter_correspondence_is_atomically_rejected():
+    schema = _schema_without_controlled_objects()
+    parameter = next(
+        item
+        for item in schema.parameters
+        if item.parameter_id == "parameter-resource-ref"
+    )
+    conflicting_schema = ResearchState.model_validate(
+        {
+            **schema.model_dump(mode="python"),
+            "parameters": (
+                *schema.parameters,
+                parameter.model_copy(
+                    update={
+                        "parameter_id": "parameter-alternate-ref",
+                        "name": "alternateRef",
+                        "location": ParameterLocation.query,
+                    }
+                ),
+            ),
+        }
+    )
+    config = OwnedObjectAcquisition(
+        owner_account_id="account-a",
+        collection_url=f"{TARGET}/resources",
+        object_type="Resource",
+        identifier_field="resourceRef",
+        identifier_parameter_reference="parameter-resource-ref",
+        identifier_parameter_correspondence=OwnedObjectReferenceCorrespondence(
+            route_template="/resources/{resourceRef}",
+            parameter_location="query",
+            parameter_name="alternateRef",
+        ),
+    )
+    acquired = ControlledObject(
+        object_id="conflicting-reference",
+        owner_account_id="account-a",
+        object_type="Resource",
+        parameter_ids=("parameter-resource-ref",),
+        ownership_basis="owner_scoped_authenticated_collection",
+        source_reference=owned_object_acquisition_reference(config),
+    )
+    records = ControlledContextResearchAdapter().adapt_acquired_objects(
+        (acquired,),
+        ControlledContext(
+            accounts=[ControlledAccount(account_id="account-a")],
+            object_acquisition=[config],
+        ),
+        conflicting_schema,
+        policy=_policy("account-a"),
+        target_id="target-1",
+        occurred_at=TS,
+    )
+
+    assert records.objects[0].parameter_references == ()
+    assert records.objects[0].reference_evidence == ()
+    assert records.limitations == (
+        "controlled_object_reference_provenance_conflicting",
+    )
+
+
 def test_secret_and_personal_values_never_enter_state_packets_or_graph():
     sentinels = (
         "sensitive-object-secret-sentinel",
@@ -437,7 +712,11 @@ def test_secret_and_personal_values_never_enter_state_packets_or_graph():
             collection_url=f"{TARGET}/resources/{{resourceRef}}",
             object_type="Resource",
             identifier_field="resourceRef",
-            identifier_parameter_reference="parameter-resource-ref",
+            identifier_parameter_correspondence=OwnedObjectReferenceCorrespondence(
+                route_template="/resources/{resourceRef}",
+                parameter_location="path",
+                parameter_name="resourceRef",
+            ),
         )
         for account in accounts
     )
@@ -450,7 +729,6 @@ def test_secret_and_personal_values_never_enter_state_packets_or_graph():
             object_id=sentinel,
             owner_account_id=config.owner_account_id,
             object_type=config.object_type,
-            parameter_ids=("parameter-resource-ref",),
             ownership_basis="owner_scoped_authenticated_collection",
             source_reference=owned_object_acquisition_reference(config),
         )

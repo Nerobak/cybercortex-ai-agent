@@ -109,6 +109,7 @@ def build_canonical_attack_surface(
         parameters.extend(attack.get("parameters") or observed.get("parameters") or [])
         objects.extend(attack.get("objects") or observed.get("objects") or [])
         boundaries.extend(attack.get("authentication_boundaries") or [])
+        workflows.extend(attack.get("workflows") or [])
         graphql = redact(observed.get("graphql") or {})
         jwt = redact(observed.get("jwt") or {})
         uploads = redact(observed.get("upload") or {})

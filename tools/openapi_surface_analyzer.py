@@ -717,6 +717,179 @@ def _extract_operation_metadata(
         )
 
 
+def _link_request_body_values(
+    value: Any,
+    *,
+    prefix: tuple[str, ...] = (),
+    depth: int = 0,
+) -> list[tuple[tuple[str, ...], str]]:
+    """Return bounded OpenAPI Link request-body runtime expressions."""
+
+    if depth > 8 or not isinstance(value, dict):
+        return []
+    output: list[tuple[tuple[str, ...], str]] = []
+    for key in sorted(value)[:100]:
+        item = value[key]
+        path = (*prefix, str(key))
+        if isinstance(item, dict):
+            output.extend(_link_request_body_values(item, prefix=path, depth=depth + 1))
+        elif isinstance(item, str) and item.startswith("$request."):
+            output.append((path, item))
+    return output
+
+
+def _openapi_link_workflows(
+    routes: list[dict[str, Any]],
+    operations_by_route: dict[tuple[str, str], dict[str, Any]],
+    root: dict[str, Any],
+    *,
+    max_ref_depth: int,
+    max_items: int,
+) -> list[dict[str, Any]]:
+    """Extract exact operation dataflow from standard OpenAPI Link Objects.
+
+    Only explicit runtime expressions and uniquely resolved operation/parameter
+    targets are retained. Names alone never create a workflow.
+    """
+
+    routes_by_operation: dict[str, list[dict[str, Any]]] = {}
+    for route in routes:
+        operation_id = str(route.get("operation_id") or "").strip()
+        if operation_id:
+            routes_by_operation.setdefault(operation_id, []).append(route)
+
+    workflows: list[dict[str, Any]] = []
+    request_expression = re.compile(
+        r"^\$request\.(path|query|header|cookie)\.([A-Za-z0-9._-]{1,255})$"
+    )
+    for source_route in routes:
+        source_key = (str(source_route["method"]), str(source_route["path"]))
+        operation = operations_by_route.get(source_key)
+        if not isinstance(operation, dict):
+            continue
+        responses = operation.get("responses")
+        if not isinstance(responses, dict):
+            continue
+        for status_code in sorted(responses)[:50]:
+            response = _resolve(
+                responses[status_code], root, depth=0, max_depth=max_ref_depth
+            )
+            links = response.get("links") if isinstance(response, dict) else None
+            if not isinstance(links, dict):
+                continue
+            for link_name in sorted(links)[:100]:
+                link = _resolve(
+                    links[link_name], root, depth=0, max_depth=max_ref_depth
+                )
+                if not isinstance(link, dict):
+                    continue
+                target_operation_id = str(link.get("operationId") or "").strip()
+                target_routes = routes_by_operation.get(target_operation_id, [])
+                if len(target_routes) != 1:
+                    continue
+                target_route = target_routes[0]
+                flows: list[dict[str, Any]] = []
+
+                link_parameters = link.get("parameters")
+                if isinstance(link_parameters, dict):
+                    for target_name in sorted(link_parameters)[:100]:
+                        expression = link_parameters[target_name]
+                        if not isinstance(expression, str) or not expression.startswith(
+                            "$response.body#/"
+                        ):
+                            continue
+                        target_matches = [
+                            item
+                            for item in target_route.get("parameters", [])
+                            if isinstance(item, dict)
+                            and str(item.get("name") or "") == str(target_name)
+                            and str(item.get("in") or "")
+                            in {"path", "query", "header", "cookie"}
+                        ]
+                        if len(target_matches) != 1:
+                            continue
+                        target_parameter = target_matches[0]
+                        flows.append(
+                            {
+                                "source_step_sequence": 1,
+                                "source_location": "response_body",
+                                "source_reference": expression.removeprefix(
+                                    "$response.body#"
+                                ),
+                                "target_step_sequence": 2,
+                                "target_location": str(target_parameter["in"]),
+                                "target_reference": str(target_parameter["name"]),
+                            }
+                        )
+
+                request_body = link.get("requestBody")
+                if isinstance(request_body, dict):
+                    operation_name = str(
+                        request_body.get("operationName") or ""
+                    ).strip()
+                    for target_path, expression in _link_request_body_values(
+                        request_body
+                    ):
+                        match = request_expression.fullmatch(expression)
+                        if match is None or len(target_path) != 2:
+                            continue
+                        source_location, source_name = match.groups()
+                        source_matches = [
+                            item
+                            for item in source_route.get("parameters", [])
+                            if isinstance(item, dict)
+                            and str(item.get("name") or "") == source_name
+                            and str(item.get("in") or "") == source_location
+                        ]
+                        if len(source_matches) != 1:
+                            continue
+                        if target_path[0] != "variables" or not operation_name:
+                            continue
+                        flows.append(
+                            {
+                                "source_step_sequence": 1,
+                                "source_location": source_location,
+                                "source_reference": source_name,
+                                "target_step_sequence": 2,
+                                "target_location": "graphql_variable",
+                                "target_reference": target_path[1],
+                                "target_operation_name": operation_name,
+                            }
+                        )
+
+                if not flows:
+                    continue
+                workflows.append(
+                    {
+                        "workflow_id": (
+                            f"openapi-link:{source_route.get('operation_id')}:{link_name}:"
+                            f"{target_operation_id}"
+                        ),
+                        "workflow_type": "openapi_operation_link",
+                        "name": "Observed OpenAPI operation dataflow.",
+                        "source": "openapi_link",
+                        "steps": [
+                            {
+                                "sequence": 1,
+                                "method": source_route["method"],
+                                "path": source_route["path"],
+                                "operation_id": source_route.get("operation_id"),
+                            },
+                            {
+                                "sequence": 2,
+                                "method": target_route["method"],
+                                "path": target_route["path"],
+                                "operation_id": target_route.get("operation_id"),
+                            },
+                        ],
+                        "value_flows": flows,
+                    }
+                )
+                if len(workflows) >= max_items:
+                    return workflows
+    return workflows
+
+
 def openapi_surface_analyzer(
     document: Any,
     *,
@@ -749,6 +922,7 @@ def openapi_surface_analyzer(
         parameter_map: dict[tuple[Any, ...], dict[str, Any]] = {}
         object_map: dict[tuple[Any, ...], dict[str, Any]] = {}
         boundary_map: dict[tuple[str, str], dict[str, Any]] = {}
+        workflow_map: dict[str, dict[str, Any]] = {}
         schema_map: dict[str, dict[str, Any]] = {}
         security_scheme_map: dict[str, dict[str, Any]] = {}
         for analysis in analyses:
@@ -774,6 +948,8 @@ def openapi_surface_analyzer(
                 ] = candidate
             for boundary in analysis["authentication_boundaries"]:
                 boundary_map[(boundary["path"], boundary["method"])] = boundary
+            for workflow in analysis.get("workflows", []):
+                workflow_map[str(workflow.get("workflow_id") or "")] = workflow
             for schema in analysis["schemas"]:
                 schema_map[schema["name"]] = schema
             for scheme in analysis["security_schemes"]:
@@ -792,6 +968,7 @@ def openapi_surface_analyzer(
             "parameters": parameters,
             "objects": objects,
             "authentication_boundaries": boundaries,
+            "workflows": [workflow_map[key] for key in sorted(workflow_map) if key],
             "schemas": [schema_map[key] for key in sorted(schema_map)],
             "security_schemes": [
                 security_scheme_map[key] for key in sorted(security_scheme_map)
@@ -801,6 +978,7 @@ def openapi_surface_analyzer(
             "parameter_count": len(parameters),
             "object_reference_count": len(objects),
             "authentication_protected_operation_count": len(boundaries),
+            "workflow_count": len(workflow_map),
             "network_tested": False,
             "limits": {"max_ref_depth": max_ref_depth, "max_items": max_items},
             "vulnerability_status": "not_assessed",
@@ -824,6 +1002,7 @@ def openapi_surface_analyzer(
     all_parameters: list[dict[str, Any]] = []
     objects: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     auth_boundaries: list[dict[str, Any]] = []
+    operations_by_route: dict[tuple[str, str], dict[str, Any]] = {}
     base_path = (
         str(root.get("basePath") or "").rstrip("/") if version.startswith("2") else ""
     )
@@ -879,6 +1058,7 @@ def openapi_surface_analyzer(
                 continue
             route_identities.add(identity)
             routes.append(route)
+            operations_by_route[(route["method"], route["path"])] = operation
             try:
                 _extract_operation_metadata(
                     route,
@@ -923,6 +1103,13 @@ def openapi_surface_analyzer(
         ): item
         for item in all_parameters
     }
+    workflows = _openapi_link_workflows(
+        routes,
+        operations_by_route,
+        root,
+        max_ref_depth=max_ref_depth,
+        max_items=max_items,
+    )
     return {
         "success": True,
         "openapi_version": version,
@@ -933,6 +1120,7 @@ def openapi_surface_analyzer(
         ],
         "objects": [objects[key] for key in sorted(objects)],
         "authentication_boundaries": auth_boundaries,
+        "workflows": workflows,
         "schemas": [{"name": name, "source": "openapi"} for name in schema_names],
         "security_schemes": [
             {
@@ -950,6 +1138,7 @@ def openapi_surface_analyzer(
         "parameter_count": len(deduplicated_parameters),
         "object_reference_count": len(objects),
         "authentication_protected_operation_count": len(auth_boundaries),
+        "workflow_count": len(workflows),
         "network_tested": False,
         "limits": {"max_ref_depth": max_ref_depth, "max_items": max_items},
         "vulnerability_status": "not_assessed",

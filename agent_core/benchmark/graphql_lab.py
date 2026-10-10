@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
 from fastapi import FastAPI, Header
@@ -125,6 +125,27 @@ class _GraphQLRequest(BaseModel):
     query: str = Field(min_length=1, max_length=32_768)
     variables: dict[str, Any] = Field(default_factory=dict)
     operationName: str | None = Field(default=None, max_length=255)
+
+
+class _ResourceSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=255)
+    kind: Literal["resource"] = "resource"
+
+
+class _OwnedResourcesResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[_ResourceSummary] = Field(max_length=20)
+
+
+class _ResourceDetailResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=255)
+    kind: Literal["resource"] = "resource"
+    label: str = Field(min_length=1, max_length=255)
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,13 +406,45 @@ query ResourceByReference($ref: ID!) {
 }`;
 const viewerOperation = `query CurrentViewer { viewer { id displayName } }`;
 const endpoint = "/query";
+async function loadOwnedResource(accessToken) {
+  const headers = {Authorization: `Bearer ${accessToken}`};
+  const collection = await fetch("/owned-resources", {headers}).then(r => r.json());
+  const owned = collection.items[0];
+  const detail = await fetch(`/resources/${encodeURIComponent(owned.id)}`, {headers})
+    .then(r => r.json());
+  const graphql = await fetch(endpoint, {
+    method: "POST",
+    headers: {...headers, "Content-Type": "application/json"},
+    body: JSON.stringify({
+      operationName: "ResourceByReference",
+      query: operation,
+      variables: {ref: owned.id}
+    })
+  }).then(r => r.json());
+  return {detail, graphql};
+}
 """
 
         @self.app.get("/healthz", include_in_schema=False)
         def health() -> dict[str, str]:
             return {"status": "ok" if self.health() else "unavailable"}
 
-        @self.app.get("/owned-resources")
+        @self.app.get(
+            "/owned-resources",
+            operation_id="listOwnedResources",
+            response_model=_OwnedResourcesResponse,
+            responses={
+                200: {
+                    "description": "The authenticated identity's controlled resources.",
+                    "links": {
+                        "resourceDetail": {
+                            "operationId": "getResourceDetail",
+                            "parameters": {"resource_id": "$response.body#/items/0/id"},
+                        }
+                    },
+                }
+            },
+        )
         def owned_resources(
             authorization: str | None = Header(default=None),
         ) -> JSONResponse:
@@ -411,7 +464,52 @@ const endpoint = "/query";
                 ]
             return JSONResponse(status_code=200, content={"items": items})
 
-        @self.app.post("/query")
+        @self.app.get(
+            "/resources/{resource_id}",
+            operation_id="getResourceDetail",
+            response_model=_ResourceDetailResponse,
+            responses={
+                200: {
+                    "description": "One resource owned by the authenticated identity.",
+                    "links": {
+                        "resourceGraphQL": {
+                            "operationId": "executeGraphQL",
+                            "requestBody": {
+                                "operationName": "ResourceByReference",
+                                "variables": {"ref": "$request.path.resource_id"},
+                            },
+                        }
+                    },
+                }
+            },
+        )
+        def resource_detail(
+            resource_id: str,
+            authorization: str | None = Header(default=None),
+        ) -> JSONResponse:
+            identity = self._authenticate(authorization)
+            if identity is None:
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "authentication_required"},
+                )
+            with self._lock:
+                resource = self._resources.get(resource_id)
+            if resource is None or resource.owner_identity_id != identity.identity_id:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "resource_not_found"},
+                )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "id": resource.resource_id,
+                    "kind": "resource",
+                    "label": resource.label,
+                },
+            )
+
+        @self.app.post("/query", operation_id="executeGraphQL")
         def graphql(
             payload: _GraphQLRequest,
             authorization: str | None = Header(default=None),

@@ -1338,7 +1338,14 @@ class ExperimentCompiler:
         if source is GraphQLVariableValueSource.controlled_object:
             owned = cls._owned_object(indexes, reference, proposal.target_id, None)
             semantics = argument.object_reference_semantics
-            if semantics.research_object_id != owned.object_id:
+            durable_binding = any(
+                item.operation_id == template.operation_id
+                and item.binding.variable_id == binding.variable_id
+                and item.binding.argument_id == binding.argument_id
+                and item.binding.value_reference == owned.object_id
+                for item in indexes.state.graphql_variable_bindings
+            )
+            if semantics.research_object_id != owned.object_id and not durable_binding:
                 _fail(CompilerErrorCode.object_binding_mismatch)
             objects.append(owned)
         elif source is GraphQLVariableValueSource.controlled_identity:

@@ -30,6 +30,7 @@ from agent_core.research.graphql import (
     MAX_GRAPHQL_TYPES,
     MAX_GRAPHQL_VARIABLES_PER_OPERATION,
     MAX_GRAPHQL_VARIABLES,
+    GraphQLControlledObjectBindingRecord,
     GraphQLArgumentRecord,
     GraphQLCandidateKind,
     GraphQLFieldRecord,
@@ -521,11 +522,37 @@ class WorkflowStep(ResearchContract):
     state_changing: StrictBool
 
 
+class WorkflowValueFlow(ResearchContract):
+    """Value-free, exact dataflow between two observed workflow steps."""
+
+    flow_id: OpaqueIdentifier
+    source_step_id: OpaqueIdentifier
+    source_location: Literal[
+        "response_body", "path", "query", "header", "cookie", "json", "form"
+    ]
+    source_reference: PublicText
+    source_parameter_id: ParameterId | None = None
+    target_step_id: OpaqueIdentifier
+    target_location: Literal[
+        "path",
+        "query",
+        "header",
+        "cookie",
+        "json",
+        "form",
+        "graphql_variable",
+    ]
+    target_reference: PublicText
+    target_parameter_id: ParameterId | None = None
+    target_operation_name: OpaqueIdentifier | None = None
+
+
 class Workflow(ResearchContract):
     workflow_id: WorkflowId
     surface_id: SurfaceId
     name: ShortPublicText
     steps: tuple[WorkflowStep, ...] = Field(min_length=1, max_length=100)
+    value_flows: tuple[WorkflowValueFlow, ...] = Field(default=(), max_length=200)
     evidence_references: tuple[EvidenceArtifactId, ...] = Field(
         min_length=1, max_length=200
     )
@@ -538,6 +565,15 @@ class Workflow(ResearchContract):
         _unique(step_ids, "workflow step IDs")
         if len(sequences) != len(set(sequences)):
             raise ValueError("workflow step sequences must be unique")
+        flow_ids = tuple(item.flow_id for item in self.value_flows)
+        _unique(flow_ids, "workflow value-flow IDs")
+        for item in self.value_flows:
+            if (
+                item.source_step_id not in step_ids
+                or item.target_step_id not in step_ids
+                or item.source_step_id == item.target_step_id
+            ):
+                raise ValueError("workflow value flow must reference distinct steps")
         object.__setattr__(
             self,
             "evidence_references",
@@ -545,6 +581,11 @@ class Workflow(ResearchContract):
         )
         object.__setattr__(
             self, "steps", tuple(sorted(self.steps, key=lambda x: x.sequence))
+        )
+        object.__setattr__(
+            self,
+            "value_flows",
+            tuple(sorted(self.value_flows, key=lambda x: x.flow_id)),
         )
         return self
 
@@ -1869,6 +1910,9 @@ class ResearchState(ResearchContract):
     graphql_variables: tuple[GraphQLVariableRecord, ...] = Field(
         default=(), max_length=MAX_GRAPHQL_VARIABLES
     )
+    graphql_variable_bindings: tuple[GraphQLControlledObjectBindingRecord, ...] = Field(
+        default=(), max_length=MAX_GRAPHQL_VARIABLES
+    )
     uploads: tuple[UploadArtifact, ...] = Field(default=(), max_length=2_000)
     workflows: tuple[Workflow, ...] = Field(default=(), max_length=2_000)
     observations: tuple[Observation, ...] = Field(default=(), max_length=20_000)
@@ -1940,6 +1984,7 @@ class ResearchState(ResearchContract):
             ("graphql_arguments", "argument_id"),
             ("graphql_operations", "operation_id"),
             ("graphql_variables", "variable_id"),
+            ("graphql_variable_bindings", "binding_id"),
             ("uploads", "upload_id"),
             ("workflows", "workflow_id"),
             ("observations", "observation_id"),
@@ -2520,6 +2565,63 @@ class ResearchState(ResearchContract):
                 item.provenance_id, provenance_ids, "GraphQL variable provenance"
             )
 
+        for item in self.graphql_variable_bindings:
+            _require_reference(
+                item.operation_id,
+                graphql_semantic_operation_ids,
+                "GraphQL controlled binding operation",
+            )
+            _require_reference(
+                item.binding.variable_id,
+                graphql_variable_ids,
+                "GraphQL controlled binding variable",
+            )
+            _require_reference(
+                item.binding.argument_id,
+                graphql_argument_ids,
+                "GraphQL controlled binding argument",
+            )
+            _require_reference(
+                item.binding.value_reference,
+                {value.object_id for value in self.objects},
+                "GraphQL controlled binding object",
+            )
+            _require_reference(
+                item.owner_identity_id,
+                identity_ids,
+                "GraphQL controlled binding owner",
+            )
+            _require_references(
+                item.evidence_references,
+                evidence_ids,
+                "GraphQL controlled binding evidence",
+            )
+            _require_reference(
+                item.provenance_id,
+                provenance_ids,
+                "GraphQL controlled binding provenance",
+            )
+            variable = variables_by_id[item.binding.variable_id]
+            controlled_object = next(
+                value
+                for value in self.objects
+                if value.object_id == item.binding.value_reference
+            )
+            if (
+                variable.operation_id != item.operation_id
+                or variable.linked_argument_id != item.binding.argument_id
+                or controlled_object.owner_identity_id != item.owner_identity_id
+                or (
+                    item.object_reference_evidence_id is not None
+                    and item.object_reference_evidence_id
+                    not in {
+                        value.reference_evidence_id
+                        for value in controlled_object.reference_evidence
+                    }
+                )
+            ):
+                raise ValueError("GraphQL controlled binding closure is inconsistent")
+
         evidence_by_id = {item.evidence_id: item for item in self.evidence}
         provenance_by_id = {item.provenance_id: item for item in self.provenance}
 
@@ -2580,6 +2682,40 @@ class ResearchState(ResearchContract):
                 _require_optional_reference(
                     step.endpoint_id, endpoint_ids, "workflow endpoint"
                 )
+            workflow_steps = {step.step_id: step for step in item.steps}
+            for flow in item.value_flows:
+                _require_optional_reference(
+                    flow.source_parameter_id,
+                    parameter_ids,
+                    "workflow source parameter",
+                )
+                _require_optional_reference(
+                    flow.target_parameter_id,
+                    parameter_ids,
+                    "workflow target parameter",
+                )
+                for parameter_id, step_id, description in (
+                    (
+                        flow.source_parameter_id,
+                        flow.source_step_id,
+                        "workflow source parameter endpoint",
+                    ),
+                    (
+                        flow.target_parameter_id,
+                        flow.target_step_id,
+                        "workflow target parameter endpoint",
+                    ),
+                ):
+                    if parameter_id is None:
+                        continue
+                    parameter = next(
+                        value
+                        for value in self.parameters
+                        if value.parameter_id == parameter_id
+                    )
+                    step = workflow_steps[step_id]
+                    if step.endpoint_id != parameter.endpoint_id:
+                        raise ValueError(f"{description} does not match workflow step")
         for item in self.evidence:
             _require_reference(
                 item.provenance_id, provenance_ids, "evidence provenance"

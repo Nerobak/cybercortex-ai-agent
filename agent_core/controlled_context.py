@@ -82,6 +82,31 @@ class ControlledObject(StrictModel):
         "owner_scoped_authenticated_collection",
     ] = "configured_controlled_context"
     source_reference: str | None = None
+    identifier_response_pointer: str | None = Field(
+        default=None, min_length=1, max_length=1_024, pattern=r"^/"
+    )
+
+
+class OwnedObjectReferenceCorrespondence(StrictModel):
+    """Explicit response-identifier correspondence to one REST parameter.
+
+    The declaration is acquisition provenance, not a name-matching hint: the
+    configured ``identifier_field`` is asserted to supply the value used by
+    exactly this parameter semantic.
+    """
+
+    method: str = "GET"
+    route_template: str = Field(min_length=1, max_length=2048)
+    parameter_location: Literal["path", "query", "header", "cookie", "json", "form"]
+    parameter_name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("method")
+    @classmethod
+    def normalize_method(cls, value: str) -> str:
+        method = value.strip().upper()
+        if not method or len(method) > 16 or not method.isalpha():
+            raise ValueError("method must be a conventional HTTP method token")
+        return method
 
 
 class OwnedObjectAcquisition(StrictModel):
@@ -94,6 +119,9 @@ class OwnedObjectAcquisition(StrictModel):
     identifier_field: str = Field(min_length=1, max_length=200)
     identifier_parameter_reference: str | None = Field(
         default=None, min_length=1, max_length=255
+    )
+    identifier_parameter_correspondence: OwnedObjectReferenceCorrespondence | None = (
+        None
     )
     tenant_field: str | None = Field(default=None, min_length=1, max_length=200)
     items_field: str | None = Field(default=None, min_length=1, max_length=200)
@@ -131,8 +159,14 @@ class OwnedObjectAcquisition(StrictModel):
 def owned_object_acquisition_reference(config: OwnedObjectAcquisition) -> str:
     """Return a stable, secret-free reference to one configured acquisition."""
 
+    payload = config.model_dump(mode="json")
+    # Preserve the reference produced for configurations persisted before the
+    # explicit correspondence field existed. A supplied correspondence remains
+    # covered by the acquisition fingerprint.
+    if payload["identifier_parameter_correspondence"] is None:
+        del payload["identifier_parameter_correspondence"]
     encoded = json.dumps(
-        config.model_dump(mode="json"),
+        payload,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -618,7 +652,9 @@ class OwnedObjectAcquirer:
             raise OwnedObjectAcquisitionError(
                 "The configured owned-object collection request failed."
             )
-        item = self._select_item(response.get("body"), config)
+        item, identifier_response_pointer = self._select_item_with_pointer(
+            response.get("body"), config
+        )
         identifier = self._scalar(item.get(config.identifier_field))
         if identifier is None:
             raise OwnedObjectAcquisitionError(
@@ -640,10 +676,23 @@ class OwnedObjectAcquirer:
             ),
             ownership_basis="owner_scoped_authenticated_collection",
             source_reference=owned_object_acquisition_reference(config),
+            identifier_response_pointer=identifier_response_pointer,
         )
 
     @classmethod
     def _select_item(cls, body: Any, config: OwnedObjectAcquisition) -> dict[str, Any]:
+        item, _ = cls._select_item_with_pointer(body, config)
+        return item
+
+    @classmethod
+    def _select_item_with_pointer(
+        cls, body: Any, config: OwnedObjectAcquisition
+    ) -> tuple[dict[str, Any], str]:
+        def pointer_token(value: str) -> str:
+            return value.replace("~", "~0").replace("/", "~1")
+
+        collection_pointer = ""
+        direct_object = False
         if isinstance(body, list):
             collection: Any = body
         elif isinstance(body, dict):
@@ -653,17 +702,22 @@ class OwnedObjectAcquirer:
                         "The configured collection field was absent from the response."
                     )
                 collection = body[config.items_field]
+                collection_pointer = "/" + pointer_token(config.items_field)
             else:
                 list_fields = [
-                    value for value in body.values() if isinstance(value, list)
+                    (key, value)
+                    for key, value in body.items()
+                    if isinstance(value, list)
                 ]
                 has_direct_identifier = (
                     cls._scalar(body.get(config.identifier_field)) is not None
                 )
                 if has_direct_identifier and not list_fields:
                     collection = [body]
+                    direct_object = True
                 elif not has_direct_identifier and len(list_fields) == 1:
-                    collection = list_fields[0]
+                    collection_pointer = "/" + pointer_token(list_fields[0][0])
+                    collection = list_fields[0][1]
                 else:
                     raise OwnedObjectAcquisitionError(
                         "The owned-object collection response structure was ambiguous."
@@ -673,7 +727,8 @@ class OwnedObjectAcquirer:
                 "The owned-object collection response structure was ambiguous."
             )
 
-        if isinstance(collection, dict):
+        collection_was_object = isinstance(collection, dict)
+        if collection_was_object:
             collection = [collection]
         if not isinstance(collection, list):
             raise OwnedObjectAcquisitionError(
@@ -684,12 +739,21 @@ class OwnedObjectAcquirer:
                 "The configured owned-object collection was empty."
             )
         bounded = collection[: config.max_items]
-        for item in bounded:
+        for index, item in enumerate(bounded):
             if (
                 isinstance(item, dict)
                 and cls._scalar(item.get(config.identifier_field)) is not None
             ):
-                return item
+                if direct_object:
+                    item_pointer = ""
+                elif collection_was_object:
+                    item_pointer = collection_pointer
+                else:
+                    item_pointer = f"{collection_pointer}/{index}"
+                identifier_pointer = (
+                    f"{item_pointer}/{pointer_token(config.identifier_field)}"
+                )
+                return item, identifier_pointer
         raise OwnedObjectAcquisitionError(
             "The configured identifier field was absent from the collection response."
         )

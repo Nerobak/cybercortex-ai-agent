@@ -413,7 +413,7 @@ def _sanitize_quoted_pair(match: re.Match[str]) -> str:
         private = _secret_key(key, value, ())
     if not private:
         return match.group(0)
-    return f'{match.group("prefix")}[REDACTED]{match.group("suffix")}'
+    return f"{match.group('prefix')}[REDACTED]{match.group('suffix')}"
 
 
 def sanitize_url(url: str) -> str:
@@ -1018,6 +1018,9 @@ def normalize_url_evidence(target: str, results: dict[str, Any]) -> dict[str, An
         if isinstance(item, dict)
     ]
     schemas = [item for item in openapi.get("schemas", []) if isinstance(item, dict)]
+    workflows = [
+        item for item in openapi.get("workflows", []) if isinstance(item, dict)
+    ]
     api_target = _tool_output(results, "api_target_analyzer")
     metadata = _tool_output(results, "api_metadata_discovery")
     attack_surface = {
@@ -1026,6 +1029,7 @@ def normalize_url_evidence(target: str, results: dict[str, Any]) -> dict[str, An
         "objects": objects,
         "authentication_boundaries": authentication_boundaries,
         "schemas": schemas,
+        "workflows": workflows,
         "sources": {
             "captured_requests": len(captured_requests),
             "crawler": len(crawl_urls),
@@ -1064,6 +1068,7 @@ def normalize_url_evidence(target: str, results: dict[str, Any]) -> dict[str, An
         "objects": objects,
         "authentication_boundaries": authentication_boundaries,
         "schemas": schemas,
+        "workflows": workflows,
         "sources": attack_surface["sources"],
         "api_target": api_target,
         "adaptive_decision": api_target.get("decision", {}),
@@ -1190,7 +1195,9 @@ def normalize_findings(results: dict[str, Any]) -> list[dict[str, Any]]:
                 category=(
                     "credential_candidate"
                     if candidate
-                    else "public_contact" if public_contact else "scanner_observation"
+                    else "public_contact"
+                    if public_contact
+                    else "scanner_observation"
                 ),
             )
         )
@@ -1422,6 +1429,7 @@ def build_evidence_package(
                     "authentication_boundaries", []
                 ),
                 "schemas": surface.get("schemas", []),
+                "workflows": surface.get("workflows", []),
                 "sources": surface.get("sources", {}),
             },
             "graphql": {

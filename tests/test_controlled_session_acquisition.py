@@ -1567,6 +1567,7 @@ def test_owned_object_acquirer_builds_in_memory_test_owned_object():
             test_owned=True,
             ownership_basis="owner_scoped_authenticated_collection",
             source_reference=owned_object_acquisition_reference(config),
+            identifier_response_pointer="/0/external_order_key",
         )
         assert budget.snapshot()["discovery_requests"] == 1
     finally:
