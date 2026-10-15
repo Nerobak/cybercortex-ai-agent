@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum
+import math
+from threading import RLock
 from time import monotonic
 
 from pydantic import Field, StrictFloat, StrictInt, model_validator
@@ -42,6 +45,15 @@ class ResearchBudgetStopReason(str, Enum):
     reproduction_model_budget_exhausted = "reproduction_model_budget_exhausted"
     reproduction_wall_time_exhausted = "reproduction_wall_time_exhausted"
     reproduction_state_change_forbidden = "reproduction_state_change_forbidden"
+
+
+class ModelSelectionAdmissionReason(str, Enum):
+    """Wall-time reasons that can prevent an optional model-selection call."""
+
+    wall_time_exhausted = "wall_time_exhausted"
+    insufficient_wall_time_for_model_selection = (
+        "insufficient_wall_time_for_model_selection"
+    )
 
 
 class ResearchBudgetPolicy(ResearchContract):
@@ -98,6 +110,42 @@ class ReproductionBudgetDecision(ResearchContract):
     def validate_reason(self) -> "ReproductionBudgetDecision":
         if self.allowed == (self.reason is not None):
             raise ValueError("denied reproduction budgets require exactly one reason")
+        return self
+
+
+class ModelSelectionWallTimeReserve(ResearchContract):
+    """Required post-selection work that an optional model call must preserve."""
+
+    experiment_execution_seconds: StrictFloat = Field(ge=0.0)
+    reproduction_seconds: StrictFloat = Field(ge=0.0)
+    cleanup_seconds: StrictFloat = Field(ge=0.0)
+
+    @property
+    def total_seconds(self) -> float:
+        return float(
+            self.experiment_execution_seconds
+            + self.reproduction_seconds
+            + self.cleanup_seconds
+        )
+
+
+class ModelSelectionAdmissionDecision(ResearchContract):
+    """Pre-dispatch decision for an optional model-selection call."""
+
+    allowed: bool
+    reason: ModelSelectionAdmissionReason | None = None
+    remaining_wall_time_seconds: StrictFloat = Field(ge=0.0)
+    provider_timeout_seconds: StrictFloat = Field(ge=0.0)
+    reserve: ModelSelectionWallTimeReserve
+    required_wall_time_seconds: StrictFloat = Field(ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> "ModelSelectionAdmissionDecision":
+        if self.allowed == (self.reason is not None):
+            raise ValueError("denied model-selection admission requires one reason")
+        expected = self.provider_timeout_seconds + self.reserve.total_seconds
+        if not math.isclose(self.required_wall_time_seconds, expected):
+            raise ValueError("model-selection wall-time requirement is inconsistent")
         return self
 
 
@@ -366,6 +414,7 @@ class ResearchBudgetManager:
         budget_reference: str = "research-budget-v1",
         request_ledger_reference: str = "request-budget-v1",
         model_ledger_reference: str = "model-call-ledger-v1",
+        clock: Callable[[], float] = monotonic,
     ) -> None:
         if not 1 <= model_call_ceiling <= 1_000_000:
             raise ValueError("model call ceiling is outside the supported bound")
@@ -376,7 +425,13 @@ class ResearchBudgetManager:
         self.budget_reference: OpaqueIdentifier = budget_reference
         self.request_ledger_reference: OpaqueIdentifier = request_ledger_reference
         self.model_ledger_reference: OpaqueIdentifier = model_ledger_reference
-        self._started = monotonic()
+        if not callable(clock):
+            raise TypeError("research budget clock must be callable")
+        self._clock = clock
+        self._started = self._clock_value()
+        self._wall_time_origins: dict[str, float] = {}
+        self._wall_time_consumed: dict[str, float] = {}
+        self._wall_time_lock = RLock()
 
     def state(self, research: ResearchState) -> BudgetState:
         matches = [
@@ -476,6 +531,57 @@ class ResearchBudgetManager:
             reason = ResearchBudgetStopReason.repeated_service_instability
         return ResearchBudgetDecision(allowed=reason is None, reason=reason, **values)
 
+    def remaining_wall_time_seconds(self, research: ResearchState) -> float:
+        """Return clamped capacity after synchronizing elapsed time exactly once."""
+
+        budget = self.state(research)
+        return max(
+            0.0,
+            float(
+                self.policy.wall_time_ceiling_seconds
+                - budget.wall_time_consumed_seconds
+            ),
+        )
+
+    def check_model_selection_admission(
+        self,
+        research: ResearchState,
+        *,
+        provider_timeout_seconds: float,
+        reserve: ModelSelectionWallTimeReserve,
+    ) -> ModelSelectionAdmissionDecision:
+        """Reserve required work before an optional provider attempt is started."""
+
+        timeout = float(provider_timeout_seconds)
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError("model provider timeout cannot be negative or non-finite")
+        if not isinstance(reserve, ModelSelectionWallTimeReserve):
+            raise TypeError("model-selection reserve must be a strict reserve model")
+        budget = self.state(research)
+        remaining = max(
+            0.0,
+            float(
+                self.policy.wall_time_ceiling_seconds
+                - budget.wall_time_consumed_seconds
+            ),
+        )
+        required = timeout + reserve.total_seconds
+        reason = None
+        if budget.wall_time_consumed_seconds >= (self.policy.wall_time_ceiling_seconds):
+            reason = ModelSelectionAdmissionReason.wall_time_exhausted
+        elif required > remaining:
+            reason = (
+                ModelSelectionAdmissionReason.insufficient_wall_time_for_model_selection
+            )
+        return ModelSelectionAdmissionDecision(
+            allowed=reason is None,
+            reason=reason,
+            remaining_wall_time_seconds=remaining,
+            provider_timeout_seconds=timeout,
+            reserve=reserve,
+            required_wall_time_seconds=required,
+        )
+
     def consume_experiment(
         self,
         research: ResearchState,
@@ -537,7 +643,6 @@ class ResearchBudgetManager:
                 else 0
             ),
         )
-        self._started = monotonic()
         return self._synchronize(
             BudgetState.model_validate(payload), research.research_id
         )
@@ -686,17 +791,35 @@ class ResearchBudgetManager:
         )
 
     def _synchronize(self, value: BudgetState, research_id: str) -> BudgetState:
+        if value.wall_time_ceiling_seconds != self.policy.wall_time_ceiling_seconds:
+            raise ValueError("persisted wall-time ceiling does not match configuration")
+        now = self._clock_value()
+        with self._wall_time_lock:
+            prior_origin = self._wall_time_origins.get(research_id, self._started)
+            elapsed = max(0.0, now - prior_origin)
+            persisted = max(0.0, float(value.wall_time_consumed_seconds))
+            process_floor = self._wall_time_consumed.get(research_id, persisted)
+            consumed = min(
+                float(self.policy.wall_time_ceiling_seconds),
+                max(persisted, process_floor) + elapsed,
+            )
+            self._wall_time_consumed[research_id] = consumed
+            # A monotonic source cannot move backwards in production. Keeping the
+            # greatest observed origin also makes synthetic/replaced clocks safe.
+            self._wall_time_origins[research_id] = max(prior_origin, now)
         payload = value.model_dump(mode="python")
         payload.update(
             request_budget=self._request_snapshot(value.request_budget),
             model_budget=self._model_snapshot(research_id, value.model_budget),
-            wall_time_consumed_seconds=min(
-                self.policy.wall_time_ceiling_seconds,
-                value.wall_time_consumed_seconds
-                + max(0.0, monotonic() - self._started),
-            ),
+            wall_time_consumed_seconds=consumed,
         )
         return BudgetState.model_validate(payload)
+
+    def _clock_value(self) -> float:
+        value = float(self._clock())
+        if not math.isfinite(value):
+            raise ValueError("research budget clock returned a non-finite value")
+        return value
 
     def _request_snapshot(
         self, previous: RequestBudgetSnapshot | None = None
@@ -763,6 +886,9 @@ __all__ = [
     "ChainBudgetDecision",
     "ChainBudgetManager",
     "ChainBudgetStopReason",
+    "ModelSelectionAdmissionDecision",
+    "ModelSelectionAdmissionReason",
+    "ModelSelectionWallTimeReserve",
     "ReproductionBudgetDecision",
     "ResearchBudgetDecision",
     "ResearchBudgetManager",

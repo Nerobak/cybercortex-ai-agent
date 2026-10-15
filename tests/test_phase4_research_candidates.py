@@ -392,13 +392,17 @@ def candidate_orchestrator(
         ExperimentResultClassification.inconclusive,
     ),
     model_call_ceiling: int = 10,
+    clock=None,
+    enable_finding_confirmation: bool = False,
 ):
     requests = request_budget or RequestBudget(100)
+    budget_kwargs = {"clock": clock} if clock is not None else {}
     budgets = ResearchBudgetManager(
         budget_policy,
         request_budget=requests,
         model_ledger=router.ledger,
         model_call_ceiling=model_call_ceiling,
+        **budget_kwargs,
     )
     state, budgets, compiler, context, builder = candidate_system(
         initial_state, budgets=budgets
@@ -432,6 +436,7 @@ def candidate_orchestrator(
         selection_fallback_policy=DeterministicSelectionFallbackPolicy(
             enabled=fallback_enabled
         ),
+        enable_finding_confirmation=enable_finding_confirmation,
     )
     return (
         state,
@@ -882,6 +887,169 @@ def test_after_start_timeout_uses_explicit_fallback_once_and_preserves_accountin
     assert len(store.load_research(state.research_id).candidate_selections) == 1
 
 
+@pytest.mark.parametrize("fallback_enabled", (True, False))
+def test_model_admission_rejection_skips_attempt_and_obeys_fallback_policy(
+    tmp_path, fallback_enabled
+):
+    class FakeClock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    clock = FakeClock()
+    router = FakeSelectionRouter()
+    fixture = candidate_orchestrator(
+        tmp_path,
+        router,
+        fallback_enabled=fallback_enabled,
+        budget_policy=ResearchBudgetPolicy(wall_time_ceiling_seconds=180.0),
+        clock=clock,
+    )
+    state, candidates = fixture[:2]
+    budgets = fixture[3]
+    store, gate, runtime, runner = fixture[7:]
+    before = tuple(item.model_dump(mode="json") for item in candidates)
+    largest_reserve = max(
+        runner._candidate_wall_time_reserve(item, state).total_seconds
+        for item in candidates
+    )
+    clock.value = 180.0 - largest_reserve - 59.0
+
+    result = runner.run(state.research_id, max_iterations=1)
+    persisted = store.load_research(state.research_id)
+
+    assert router.requests == []
+    assert budgets.state(persisted).model_budget.usage.attempted_calls == 0
+    assert tuple(item.model_dump(mode="json") for item in candidates) == before
+    assert "insufficient_wall_time_for_model_selection" in (persisted.diagnostic_codes)
+    assert len(persisted.candidate_selections) == 1
+    record = persisted.candidate_selections[0]
+    assert record.model_failure_category == (
+        "insufficient_wall_time_for_model_selection"
+    )
+    if fallback_enabled:
+        assert len(gate.authorized) == len(runtime.calls) == 1
+        assert record.method is CandidateSelectionMethod.deterministic_fallback
+        assert record.selected_candidate_id in {
+            item.candidate_id for item in candidates
+        }
+    else:
+        assert not gate.authorized
+        assert not runtime.calls
+        assert result.stop_reason.value == (
+            "insufficient_wall_time_for_model_selection"
+        )
+        assert record.method is CandidateSelectionMethod.model_selection_unavailable
+    assert store.verify_integrity(state.research_id).valid
+
+
+def test_benchmark_10_shape_uses_one_timeout_then_admission_fallback(tmp_path):
+    class FakeClock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    clock = FakeClock()
+
+    class TimeoutClient:
+        calls = 0
+
+        def post(self, url, **kwargs):
+            del url, kwargs
+            self.calls += 1
+            clock.value += 60.0
+            raise httpx.ReadTimeout("synthetic offline timeout")
+
+    client = TimeoutClient()
+    configuration = ModelConfiguration(
+        default_provider="ollama",
+        ollama=ProviderConfiguration(
+            model_name="fake-local-model",
+            base_url="http://127.0.0.1:11434",
+            timeout_seconds=60.0,
+            max_output_tokens=4096,
+        ),
+    )
+
+    class RecordingRegistry(ProviderRegistry):
+        def __init__(self):
+            super().__init__(configuration)
+            self.created = []
+
+        def create(self, provider=None, *, model_name=None, client_override=None):
+            del client_override
+            self.created.append(provider)
+            return super().create(provider, model_name=model_name, client=client)
+
+    registry = RecordingRegistry()
+    router = ModelRouter(registry)
+    fixture = candidate_orchestrator(
+        tmp_path,
+        router,
+        fallback_enabled=True,
+        budget_policy=ResearchBudgetPolicy(wall_time_ceiling_seconds=180.0),
+        initial_state=synthetic_state(endpoint_count=6),
+        runtime_classifications=(
+            ExperimentResultClassification.inconclusive,
+            ExperimentResultClassification.inconclusive,
+        ),
+        clock=clock,
+        enable_finding_confirmation=True,
+    )
+    state, initial_candidates = fixture[:2]
+    builder = fixture[6]
+    store, gate, runtime, runner = fixture[7:]
+    before = tuple(item.model_dump(mode="json") for item in initial_candidates)
+
+    class SixThenFourCandidates:
+        def __init__(self, delegate):
+            self.delegate = delegate
+            self.calls = 0
+            self.counts = []
+
+        def build(self, *args, **kwargs):
+            available = self.delegate.build(*args, **kwargs)
+            limit = (6, 4)[self.calls]
+            assert len(available) >= limit
+            selected = available[:limit]
+            self.calls += 1
+            self.counts.append(len(selected))
+            return selected
+
+    shaped_builder = SixThenFourCandidates(builder)
+    runner.candidate_builder = shaped_builder
+
+    result = runner.run(state.research_id, max_iterations=2)
+    persisted = store.load_research(state.research_id)
+    usage = router.ledger.usage_for_run(state.research_id)
+
+    assert result.iterations == 2
+    assert shaped_builder.counts == [6, 4]
+    assert client.calls == 1
+    assert registry.created == ["ollama"]
+    assert usage.attempted_calls == usage.failed_calls == usage.unknown_usage_calls == 1
+    assert usage.budget_input_tokens > 0
+    assert usage.budget_output_tokens == 4096
+    assert len(gate.authorized) == len(runtime.calls) == 2
+    selections = sorted(
+        persisted.candidate_selections,
+        key=lambda item: item.source_state_revision,
+    )
+    assert [item.method for item in selections] == [
+        CandidateSelectionMethod.deterministic_fallback,
+        CandidateSelectionMethod.deterministic_fallback,
+    ]
+    assert [item.model_failure_category for item in selections] == [
+        "timeout",
+        "insufficient_wall_time_for_model_selection",
+    ]
+    assert persisted.budgets[0].wall_time_consumed_seconds == 60.0
+    assert tuple(item.model_dump(mode="json") for item in initial_candidates) == before
+    assert store.verify_integrity(state.research_id).valid
+
+
 @pytest.mark.parametrize("failure_kind", ("invalid_json", "unknown_id", "mismatch"))
 def test_invalid_selection_responses_use_explicit_fallback(tmp_path, failure_kind):
     class InvalidSelectionRouter(FakeSelectionRouter):
@@ -1039,22 +1207,29 @@ def test_fallback_rechecks_execution_budgets_before_authorization(
                 self.hook()
             return super().route(request, policy)
 
+    class FakeClock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    clock = FakeClock()
     router = HookRouter("{")
     request_budget = RequestBudget(4)
     fixture = candidate_orchestrator(
         tmp_path,
         router,
         fallback_enabled=True,
-        budget_policy=ResearchBudgetPolicy(wall_time_ceiling_seconds=1.0),
+        budget_policy=ResearchBudgetPolicy(wall_time_ceiling_seconds=1_000.0),
         request_budget=request_budget,
+        clock=clock,
     )
     state = fixture[0]
-    budgets = fixture[3]
     store, gate, runtime, runner = fixture[7:]
     if exhausted_resource == "request":
         router.hook = lambda: request_budget.consume("verification", 4)
     else:
-        router.hook = lambda: setattr(budgets, "_started", budgets._started - 2.0)
+        router.hook = lambda: setattr(clock, "value", 1_001.0)
 
     result = runner.run(state.research_id)
     persisted = store.load_research(state.research_id)

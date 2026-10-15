@@ -73,6 +73,9 @@ class ResearchModelFailure(str, Enum):
     rate_limited = "rate_limited"
     model_budget_exhausted = "model_budget_exhausted"
     schema_rejected = "schema_rejected"
+    insufficient_wall_time_for_model_selection = (
+        "insufficient_wall_time_for_model_selection"
+    )
 
 
 class ResearchReasoningError(RuntimeError):
@@ -726,6 +729,25 @@ class ResearchReasoningEngine:
             raise ValueError("research reasoning output limit is invalid")
         self.router = router
         self.max_output_tokens = max_output_tokens
+
+    def selection_provider_timeout_seconds(
+        self, routing_policy: ModelRoutingPolicy
+    ) -> float:
+        """Return the greatest configured timeout among permitted routes."""
+
+        registry = getattr(self.router, "registry", None)
+        configuration = getattr(registry, "configuration", None)
+        if configuration is None:
+            # Test doubles and older integrations may expose only ``route`` and a
+            # ledger. The provider configuration default remains 60 seconds.
+            return 60.0
+        timeouts = tuple(
+            float(configuration.provider_configuration(route.provider).timeout_seconds)
+            for route in routing_policy.ordered_routes()
+        )
+        if not timeouts:
+            raise ValueError("model routing policy has no selectable route")
+        return max(timeouts)
 
     def select(
         self,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -16,7 +16,11 @@ from agent_core.research.authorization import (
     ResearchExecutionGate,
     policy_fingerprint as authorization_policy_fingerprint,
 )
-from agent_core.research.budgets import ResearchBudgetManager
+from agent_core.research.budgets import (
+    ModelSelectionAdmissionReason,
+    ModelSelectionWallTimeReserve,
+    ResearchBudgetManager,
+)
 from agent_core.research.candidates import (
     ExperimentCandidate,
     ExperimentCandidateBuilder,
@@ -108,6 +112,9 @@ class OrchestratorStopReason(str, Enum):
     no_eligible_hypotheses = "no_eligible_hypotheses"
     no_eligible_experiments = "no_eligible_experiments"
     model_selection_unavailable = "model_selection_unavailable"
+    insufficient_wall_time_for_model_selection = (
+        "insufficient_wall_time_for_model_selection"
+    )
     global_experiment_budget_exhausted = "global_experiment_budget_exhausted"
     request_budget_exhausted = "request_budget_exhausted"
     model_budget_exhausted = "model_budget_exhausted"
@@ -143,6 +150,7 @@ class DeterministicSelectionFallbackPolicy(ResearchContract):
         ResearchModelFailure.invalid_output,
         ResearchModelFailure.rate_limited,
         ResearchModelFailure.schema_rejected,
+        ResearchModelFailure.insufficient_wall_time_for_model_selection,
     )
 
     @model_validator(mode="after")
@@ -439,6 +447,9 @@ class SecurityResearchOrchestrator:
             model_failure_category: str | None = None
             selection_method: CandidateSelectionMethod | None = None
             candidate_by_proposal_id: dict[str, ExperimentCandidate] = {}
+            candidate_reserves: dict[str, ModelSelectionWallTimeReserve] = {}
+            admission_rejected = False
+            fallback_capacity_unavailable = False
             lightweight_selection = bool(
                 self.candidate_builder is not None
                 and self.candidate_packet_builder is not None
@@ -457,97 +468,223 @@ class SecurityResearchOrchestrator:
                             policy_reference=self.compiler_context.policy_reference,
                             policy_fingerprint=self._policy_fingerprint(),
                         )
+                        if (
+                            not experiment_candidates
+                            and self.budget_manager.remaining_wall_time_seconds(state)
+                            <= 0.0
+                        ):
+                            state = self._stop(
+                                state, OrchestratorStopReason.wall_time_exhausted
+                            )
+                            return ResearchLoopResult(
+                                research_id=research_id,
+                                state=state,
+                                iterations=iterations,
+                                evaluations=tuple(evaluations),
+                                stop_reason=OrchestratorStopReason.wall_time_exhausted,
+                                completed=True,
+                            )
+                        candidate_reserves = {
+                            candidate.candidate_id: self._candidate_wall_time_reserve(
+                                candidate, state
+                            )
+                            for candidate in experiment_candidates
+                        }
                         if len(experiment_candidates) == 1:
                             # Candidate builders return only deterministically screened,
                             # compile-valid candidates.  Choosing the sole member adds no
                             # strategic information, so keep the ordinary freshness,
                             # compiler, selector, policy, and authorization path while
                             # avoiding an unnecessary model call.
-                            proposal = materialize_candidate(
-                                experiment_candidates[0], state
+                            available = self._candidates_with_wall_time_capacity(
+                                state, experiment_candidates, candidate_reserves
                             )
-                            model_proposals = (proposal,)
-                            candidate_by_proposal_id[proposal.proposal_id] = (
-                                experiment_candidates[0]
-                            )
-                            selection_method = (
-                                CandidateSelectionMethod.singleton_deterministic
-                            )
-                            state = self._with_diagnostic_codes(
-                                state, "singleton_deterministic_selection"
-                            )
+                            if available:
+                                proposal = materialize_candidate(available[0], state)
+                                model_proposals = (proposal,)
+                                candidate_by_proposal_id[proposal.proposal_id] = (
+                                    available[0]
+                                )
+                                selection_method = (
+                                    CandidateSelectionMethod.singleton_deterministic
+                                )
+                                state = self._with_diagnostic_codes(
+                                    state, "singleton_deterministic_selection"
+                                )
+                            else:
+                                fallback_capacity_unavailable = True
+                                state = self._with_diagnostic_codes(
+                                    state, "insufficient_wall_time_for_experiment"
+                                )
                         elif (
                             len(experiment_candidates) > 1
                             and self.reasoning_engine is not None
                         ):
-                            packet = self.candidate_packet_builder.build(  # type: ignore[union-attr]
-                                state,
-                                experiment_candidates,
-                                policy_limitations=self.policy_limitations,
+                            reserve = max(
+                                candidate_reserves.values(),
+                                key=lambda item: item.total_seconds,
                             )
-                            decision = self.reasoning_engine.select(
-                                packet,
-                                self.routing_policy,  # type: ignore[arg-type]
+                            provider_timeout = self.reasoning_engine.selection_provider_timeout_seconds(
+                                self.routing_policy  # type: ignore[arg-type]
                             )
-                            if decision.action in {
-                                ResearchSelectionAction.stop,
-                                ResearchSelectionAction.defer,
-                            }:
-                                state = self._stop(
+                            admission = (
+                                self.budget_manager.check_model_selection_admission(
                                     state,
-                                    OrchestratorStopReason.model_requested_stop,
+                                    provider_timeout_seconds=provider_timeout,
+                                    reserve=reserve,
+                                )
+                            )
+                            if admission.reason is (
+                                ModelSelectionAdmissionReason.wall_time_exhausted
+                            ):
+                                state = self._stop(
+                                    state, OrchestratorStopReason.wall_time_exhausted
                                 )
                                 return ResearchLoopResult(
                                     research_id=research_id,
                                     state=state,
                                     iterations=iterations,
                                     evaluations=tuple(evaluations),
-                                    stop_reason=(
-                                        OrchestratorStopReason.model_requested_stop
-                                    ),
+                                    stop_reason=OrchestratorStopReason.wall_time_exhausted,
                                     completed=True,
                                 )
-                            selected_candidate = next(
-                                item
-                                for item in experiment_candidates
-                                if item.candidate_id == decision.selected_candidate_id
-                            )
-                            proposal = materialize_candidate(
-                                selected_candidate,
-                                state,
-                                model_decision_id=decision.decision_id,
-                            )
-                            model_proposals = (proposal,)
-                            candidate_by_proposal_id[proposal.proposal_id] = (
-                                selected_candidate
-                            )
-                            selection_method = CandidateSelectionMethod.model_selected
-                            next_is_pivot = next_is_pivot or (
-                                decision.action is ResearchSelectionAction.pivot
-                            )
+                            if not admission.allowed:
+                                failure = ResearchModelFailure.insufficient_wall_time_for_model_selection
+                                admission_rejected = True
+                                model_failure_category = failure.value
+                                model_failure_code = failure.value
+                                state = self._with_diagnostic_codes(
+                                    state, model_failure_code
+                                )
+                                if self.selection_fallback_policy.permits(failure):
+                                    available = (
+                                        self._candidates_with_wall_time_capacity(
+                                            state,
+                                            experiment_candidates,
+                                            candidate_reserves,
+                                        )
+                                    )
+                                    if available:
+                                        model_proposals = tuple(
+                                            materialize_candidate(item, state)
+                                            for item in available
+                                        )
+                                        candidate_by_proposal_id.update(
+                                            {
+                                                proposal.proposal_id: candidate
+                                                for proposal, candidate in zip(
+                                                    model_proposals,
+                                                    available,
+                                                    strict=True,
+                                                )
+                                            }
+                                        )
+                                        selection_method = CandidateSelectionMethod.deterministic_fallback
+                                        state = self._with_diagnostic_codes(
+                                            state,
+                                            "deterministic_selection_fallback",
+                                        )
+                                    else:
+                                        fallback_capacity_unavailable = True
+                                        state = self._with_diagnostic_codes(
+                                            state,
+                                            "insufficient_wall_time_for_experiment",
+                                        )
+                            else:
+                                packet = self.candidate_packet_builder.build(  # type: ignore[union-attr]
+                                    state,
+                                    experiment_candidates,
+                                    policy_limitations=self.policy_limitations,
+                                )
+                                decision = self.reasoning_engine.select(
+                                    packet,
+                                    self.routing_policy,  # type: ignore[arg-type]
+                                )
+                                if decision.action in {
+                                    ResearchSelectionAction.stop,
+                                    ResearchSelectionAction.defer,
+                                }:
+                                    state = self._stop(
+                                        state,
+                                        OrchestratorStopReason.model_requested_stop,
+                                    )
+                                    return ResearchLoopResult(
+                                        research_id=research_id,
+                                        state=state,
+                                        iterations=iterations,
+                                        evaluations=tuple(evaluations),
+                                        stop_reason=(
+                                            OrchestratorStopReason.model_requested_stop
+                                        ),
+                                        completed=True,
+                                    )
+                                selected_candidate = next(
+                                    item
+                                    for item in experiment_candidates
+                                    if item.candidate_id
+                                    == decision.selected_candidate_id
+                                )
+                                available = self._candidates_with_wall_time_capacity(
+                                    state,
+                                    (selected_candidate,),
+                                    candidate_reserves,
+                                )
+                                if available:
+                                    proposal = materialize_candidate(
+                                        selected_candidate,
+                                        state,
+                                        model_decision_id=decision.decision_id,
+                                    )
+                                    model_proposals = (proposal,)
+                                    candidate_by_proposal_id[proposal.proposal_id] = (
+                                        selected_candidate
+                                    )
+                                    selection_method = (
+                                        CandidateSelectionMethod.model_selected
+                                    )
+                                    next_is_pivot = next_is_pivot or (
+                                        decision.action is ResearchSelectionAction.pivot
+                                    )
+                                else:
+                                    fallback_capacity_unavailable = True
+                                    model_failure_category = (
+                                        "insufficient_wall_time_for_experiment"
+                                    )
+                                    model_failure_code = model_failure_category
+                                    state = self._with_diagnostic_codes(
+                                        state, model_failure_code
+                                    )
                         elif len(experiment_candidates) > 1:
                             failure = ResearchModelFailure.provider_unavailable
                             model_failure_category = failure.value
                             model_failure_code = "model_provider_unavailable"
                             invalid_model_outputs += 1
                             if self.selection_fallback_policy.permits(failure):
+                                available = self._candidates_with_wall_time_capacity(
+                                    state,
+                                    experiment_candidates,
+                                    candidate_reserves,
+                                )
                                 model_proposals = tuple(
                                     materialize_candidate(item, state)
-                                    for item in experiment_candidates
+                                    for item in available
                                 )
                                 candidate_by_proposal_id.update(
                                     {
                                         proposal.proposal_id: candidate
                                         for proposal, candidate in zip(
                                             model_proposals,
-                                            experiment_candidates,
+                                            available,
                                             strict=True,
                                         )
                                     }
                                 )
-                                selection_method = (
-                                    CandidateSelectionMethod.deterministic_fallback
-                                )
+                                if available:
+                                    selection_method = (
+                                        CandidateSelectionMethod.deterministic_fallback
+                                    )
+                                else:
+                                    fallback_capacity_unavailable = True
                                 state = self._with_diagnostic_codes(
                                     state,
                                     model_failure_code,
@@ -588,6 +725,9 @@ class SecurityResearchOrchestrator:
                         "rate_limited": "model_rate_limited",
                         "model_budget_exhausted": "model_budget_rejection",
                         "schema_rejected": "model_schema_rejection",
+                        "insufficient_wall_time_for_model_selection": (
+                            "insufficient_wall_time_for_model_selection"
+                        ),
                     }[exc.reason.value]
                     invalid_model_outputs += 1
                     if (
@@ -615,23 +755,30 @@ class SecurityResearchOrchestrator:
                         and self.selection_fallback_policy.permits(exc.reason)
                     )
                     if fallback_applied:
+                        available = self._candidates_with_wall_time_capacity(
+                            state,
+                            experiment_candidates,
+                            candidate_reserves,
+                        )
                         model_proposals = tuple(
-                            materialize_candidate(item, state)
-                            for item in experiment_candidates
+                            materialize_candidate(item, state) for item in available
                         )
                         candidate_by_proposal_id.update(
                             {
                                 proposal.proposal_id: candidate
                                 for proposal, candidate in zip(
                                     model_proposals,
-                                    experiment_candidates,
+                                    available,
                                     strict=True,
                                 )
                             }
                         )
-                        selection_method = (
-                            CandidateSelectionMethod.deterministic_fallback
-                        )
+                        if available:
+                            selection_method = (
+                                CandidateSelectionMethod.deterministic_fallback
+                            )
+                        else:
+                            fallback_capacity_unavailable = True
                         state = self._with_diagnostic_codes(
                             state,
                             model_failure_code,
@@ -699,11 +846,14 @@ class SecurityResearchOrchestrator:
                 if model_failure_code is not None:
                     diagnostic_codes.append(model_failure_code)
                 if not candidates:
-                    diagnostic_codes.append(
-                        "model_selection_unavailable"
-                        if experiment_candidates and model_failure_category is not None
-                        else "no_proposal"
-                    )
+                    if admission_rejected:
+                        diagnostic_codes.append(
+                            "insufficient_wall_time_for_model_selection"
+                        )
+                    elif experiment_candidates and model_failure_category is not None:
+                        diagnostic_codes.append("model_selection_unavailable")
+                    else:
+                        diagnostic_codes.append("no_proposal")
                 elif any(
                     reason.value == "invalid_proposal"
                     for assessment in selection.assessments
@@ -733,7 +883,20 @@ class SecurityResearchOrchestrator:
                 reason = self._selection_stop_reason(selection)
                 selection_record = None
                 if experiment_candidates and model_failure_category is not None:
-                    if reason is OrchestratorStopReason.no_eligible_experiments:
+                    remaining_wall_time = (
+                        self.budget_manager.remaining_wall_time_seconds(state)
+                    )
+                    if remaining_wall_time <= 0.0:
+                        reason = OrchestratorStopReason.wall_time_exhausted
+                    elif (
+                        admission_rejected
+                        and not fallback_capacity_unavailable
+                        and not candidates
+                    ):
+                        reason = OrchestratorStopReason.insufficient_wall_time_for_model_selection
+                    elif fallback_capacity_unavailable:
+                        reason = OrchestratorStopReason.no_eligible_experiments
+                    elif reason is OrchestratorStopReason.no_eligible_experiments:
                         reason = OrchestratorStopReason.model_selection_unavailable
                     selection_record = self._candidate_selection_record(
                         state,
@@ -1118,6 +1281,16 @@ class SecurityResearchOrchestrator:
     def _confirmation_policy(
         finding: FindingRecord, experiment: SecurityExperiment
     ) -> FindingConfirmationPolicy | None:
+        return SecurityResearchOrchestrator._confirmation_policy_for_experiment(
+            experiment,
+            finding.confirmation_policy_reference,
+        )
+
+    @staticmethod
+    def _confirmation_policy_for_experiment(
+        experiment: SecurityExperiment,
+        policy_reference: str,
+    ) -> FindingConfirmationPolicy | None:
         inputs = tuple(item.input for item in experiment.primitive_steps)
         if any(
             isinstance(item, (GraphQLOperationInput, GraphQLVariableMutationInput))
@@ -1125,22 +1298,16 @@ class SecurityResearchOrchestrator:
         ):
             if experiment.state_changing:
                 return FindingConfirmationPolicy.graphql_state_changing(
-                    finding.confirmation_policy_reference
+                    policy_reference
                 )
-            return FindingConfirmationPolicy.graphql_read_only(
-                finding.confirmation_policy_reference
-            )
+            return FindingConfirmationPolicy.graphql_read_only(policy_reference)
         if any(isinstance(item, ObjectSubstitutionInput) for item in inputs):
-            return SecurityResearchOrchestrator._confirmation_policy_for_kind(
-                finding, ReproductionKind.object_substitution
-            )
+            return FindingConfirmationPolicy.authorization_read_only(policy_reference)
         if any(isinstance(item, AuthenticationDifferentialInput) for item in inputs):
-            return SecurityResearchOrchestrator._confirmation_policy_for_kind(
-                finding, ReproductionKind.authentication_differential
-            )
+            return FindingConfirmationPolicy.authentication_read_only(policy_reference)
         if any(isinstance(item, ParameterMutationInput) for item in inputs):
-            return SecurityResearchOrchestrator._confirmation_policy_for_kind(
-                finding, ReproductionKind.parameter_mutation
+            return FindingConfirmationPolicy.parameter_mutation_read_only(
+                policy_reference
             )
         return None
 
@@ -1214,6 +1381,86 @@ class SecurityResearchOrchestrator:
             state.research_id,
             expected_revision=state.revision,
             state=next_state,
+        )
+
+    def _candidate_wall_time_reserve(
+        self,
+        candidate: ExperimentCandidate,
+        state: ResearchState,
+    ) -> ModelSelectionWallTimeReserve:
+        """Derive required work from immutable compiler and runtime bounds."""
+
+        proposal = materialize_candidate(candidate, state)
+        experiment = self.compiler.compile(proposal, state, self.compiler_context)
+        timeout = self._candidate_request_timeout_seconds(candidate)
+        cleanup_requests = experiment.request_estimate.cleanup
+        execution_requests = max(
+            0,
+            experiment.request_estimate.total_reservation - cleanup_requests,
+        )
+        reproduction_attempts = 0
+        if self.enable_finding_confirmation:
+            policy = self._confirmation_policy_for_experiment(
+                experiment,
+                "wall-time-reserve-policy",
+            )
+            if policy is not None:
+                reproduction_attempts = policy.minimum_independent_reproductions
+        return ModelSelectionWallTimeReserve(
+            experiment_execution_seconds=float(execution_requests * timeout),
+            reproduction_seconds=float(
+                reproduction_attempts * execution_requests * timeout
+            ),
+            cleanup_seconds=float(
+                (1 + reproduction_attempts) * cleanup_requests * timeout
+            ),
+        )
+
+    def _candidate_request_timeout_seconds(
+        self, candidate: ExperimentCandidate
+    ) -> float:
+        """Resolve only operator-configured runtime bounds, never model data."""
+
+        templates = getattr(self.gate, "request_templates", {})
+        values = tuple(templates.values()) if isinstance(templates, Mapping) else ()
+        matching = tuple(
+            item
+            for item in values
+            if (
+                candidate.request_template_id is not None
+                and getattr(item, "template_id", None) == candidate.request_template_id
+            )
+            or (
+                candidate.request_template_id is None
+                and getattr(item, "endpoint_id", None) == candidate.endpoint_id
+            )
+        )
+        runtime_timeout = max(
+            (float(getattr(item, "timeout_seconds")) for item in matching),
+            default=10.0,
+        )
+        if candidate.primitive_kind in {
+            "graphql_operation",
+            "graphql_variable_mutation",
+        }:
+            graphql_limits = getattr(self.gate, "graphql_limits", None)
+            graphql_timeout = float(
+                getattr(graphql_limits, "timeout_seconds", runtime_timeout)
+            )
+            return min(runtime_timeout, graphql_timeout)
+        return runtime_timeout
+
+    def _candidates_with_wall_time_capacity(
+        self,
+        state: ResearchState,
+        candidates: Sequence[ExperimentCandidate],
+        reserves: Mapping[str, ModelSelectionWallTimeReserve],
+    ) -> tuple[ExperimentCandidate, ...]:
+        remaining = self.budget_manager.remaining_wall_time_seconds(state)
+        return tuple(
+            candidate
+            for candidate in candidates
+            if reserves[candidate.candidate_id].total_seconds <= remaining
         )
 
     def _prepare(self, state: ResearchState) -> ResearchState:
