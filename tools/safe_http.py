@@ -12,6 +12,11 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from agent_core.request_budget import RequestBudget, RequestBudgetExceeded
+from agent_core.url_authorization import (
+    URLCanonicalizationError,
+    canonicalize_transport_url,
+    validate_transport_timeout,
+)
 from tools.scope_guard import enforce_scope
 
 try:
@@ -39,6 +44,9 @@ class PolicyViolationError(requests.RequestException):
 
 class ResponseTooLargeError(requests.RequestException):
     pass
+
+
+ABSOLUTE_MAX_REDIRECTS = 10
 
 
 def _credential_header(name: Any) -> bool:
@@ -89,6 +97,9 @@ class ScopedHTTPClient:
         self.session.trust_env = False
         self.requester = requester or self.session.request
         self.requester_takes_method = requester_takes_method
+        # This compatibility flag applies only to the initial destination of
+        # each request() call.  Redirects are never prevalidated by a boolean;
+        # every hop must pass policy or active-scope authorization separately.
         self.scope_prevalidated = scope_prevalidated
         self.max_response_bytes = max_response_bytes
         self.budget = budget or (
@@ -157,6 +168,10 @@ class ScopedHTTPClient:
         DNS is transport preparation, not an HTTP request, so this does not
         consume the HTTP ledger.
         """
+        try:
+            target_url = canonicalize_transport_url(target_url).url
+        except URLCanonicalizationError as exc:
+            raise PolicyViolationError(str(exc)) from exc
         parsed = urlparse(target_url)
         host = (parsed.hostname or "").lower().rstrip(".")
         if expected_host and host != expected_host.lower().rstrip("."):
@@ -538,6 +553,7 @@ class ScopedHTTPClient:
         request_context: TransportRequestContext | None = None,
         techniques: tuple[str, ...] = (),
         oast_callback_url: str | None = None,
+        prevalidated_initial_target: bool = False,
     ) -> None:
         if request_context is not None and purpose != request_context.purpose:
             raise PolicyViolationError("Request purpose metadata is inconsistent.")
@@ -599,7 +615,7 @@ class ScopedHTTPClient:
                 raise PolicyViolationError(
                     "OAST-capable requests require the explicit OAST purpose."
                 )
-        elif not self.scope_prevalidated and not enforce_scope(url).get("allowed"):
+        elif not prevalidated_initial_target and not enforce_scope(url).get("allowed"):
             raise PolicyViolationError("Requested URL is outside authorized scope.")
         if purpose in {"discovery", "owned_object_acquisition", "verification"}:
             if method not in {"GET", "HEAD", "OPTIONS"}:
@@ -677,8 +693,14 @@ class ScopedHTTPClient:
         request_context: TransportRequestContext | None = None,
         techniques: tuple[str, ...] = (),
         oast_callback_url: str | None = None,
+        prevalidated_initial_target: bool = False,
         **kwargs: Any,
     ) -> requests.Response:
+        try:
+            url = canonicalize_transport_url(url).url
+            kwargs["timeout"] = validate_transport_timeout(kwargs.get("timeout"))
+        except (URLCanonicalizationError, ValueError) as exc:
+            raise PolicyViolationError(str(exc)) from exc
         self._authorize(
             url,
             method,
@@ -686,6 +708,7 @@ class ScopedHTTPClient:
             request_context=request_context,
             techniques=techniques,
             oast_callback_url=oast_callback_url,
+            prevalidated_initial_target=prevalidated_initial_target,
         )
         self._validate_transport_binding(url, kwargs)
         acquired = self._concurrency_slots is None or self._concurrency_slots.acquire(
@@ -766,7 +789,7 @@ class ScopedHTTPClient:
         method: str,
         url: str,
         *,
-        timeout: float = 10,
+        timeout: float | tuple[float, float] = 10,
         max_redirects: int | None = None,
         follow_redirects: bool = False,
         headers: dict[str, str] | None = None,
@@ -779,6 +802,14 @@ class ScopedHTTPClient:
         response_byte_limit: int | None = None,
         **kwargs: Any,
     ) -> tuple[requests.Response, list[dict[str, Any]]]:
+        """Authorize and send a bounded sequence through the supported transport.
+
+        The finite timeout is applied to every connect/read attempt. Redirects
+        are explicit, individually canonicalized, reauthorized, and charged to
+        the shared request budget. A custom requester is required to honor the
+        timeout; Python cannot forcibly terminate arbitrary blocking callbacks.
+        """
+
         method = method.strip().upper()
         if purpose is None and self.policy is not None:
             purpose = (
@@ -802,6 +833,12 @@ class ScopedHTTPClient:
         }:
             raise PolicyViolationError("Unsupported request purpose.")
         semantic_context = self._coerce_request_context(request_context)
+        try:
+            timeout = validate_transport_timeout(timeout)
+            params = kwargs.pop("params", None)
+            current = canonicalize_transport_url(url, params=params).url
+        except (URLCanonicalizationError, ValueError) as exc:
+            raise PolicyViolationError(str(exc)) from exc
         if not allow_session_credentials:
             headers = {
                 name: value
@@ -820,11 +857,25 @@ class ScopedHTTPClient:
             if self.policy
             else 5
         )
-        current = url
+        maximum_redirects = min(
+            ABSOLUTE_MAX_REDIRECTS,
+            self.policy.max_redirects
+            if self.policy is not None
+            else ABSOLUTE_MAX_REDIRECTS,
+        )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 0
+            or limit > maximum_redirects
+        ):
+            raise PolicyViolationError(
+                f"Redirect limit must be between 0 and {maximum_redirects}."
+            )
         current_method = method
         chain: list[dict[str, Any]] = []
         seen = {current}
-        for _ in range(limit + 1):
+        for hop_index in range(limit + 1):
             try:
                 response = self._send(
                     current_method,
@@ -836,6 +887,9 @@ class ScopedHTTPClient:
                     request_context=semantic_context,
                     techniques=tuple(techniques or ()),
                     oast_callback_url=oast_callback_url,
+                    prevalidated_initial_target=(
+                        self.scope_prevalidated and hop_index == 0
+                    ),
                     **kwargs,
                 )
             finally:
@@ -853,8 +907,9 @@ class ScopedHTTPClient:
             if not location or not follow_redirects:
                 response.url = current
                 return response, chain
-            destination = urljoin(current, location)
+            raw_destination = urljoin(current, location)
             try:
+                destination = canonicalize_transport_url(raw_destination).url
                 self._authorize(
                     destination,
                     current_method,
@@ -864,7 +919,8 @@ class ScopedHTTPClient:
                     oast_callback_url=oast_callback_url,
                 )
                 allowed = True
-            except PolicyViolationError:
+            except (PolicyViolationError, URLCanonicalizationError):
+                destination = raw_destination
                 allowed = False
             hop = {
                 "from": current,

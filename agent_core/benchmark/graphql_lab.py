@@ -21,6 +21,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_core.benchmark.integrity import artifact_fingerprint
+from agent_core.benchmark.discovery_scope import (
+    manifest_authorized_discovery_scope,
+    validate_manifest_authorized_discovery_scope,
+)
 from agent_core.benchmark.isolation import BenchmarkGroundTruthStore
 from agent_core.benchmark.manifest import build_research_input
 from agent_core.benchmark.runner import BenchmarkExecutionBindings
@@ -984,6 +988,10 @@ def graphql_benchmark_execution_factory(
         max_concurrency=1,
         max_response_bytes=262_144,
     )
+    validate_manifest_authorized_discovery_scope(
+        manifest=manifest,
+        policy=assessment_policy,
+    )
     transport = ScopedHTTPClient(
         policy=assessment_policy,
         budget=request_budget,
@@ -1153,6 +1161,10 @@ def graphql_benchmark_execution_factory(
         bootstrapper=bootstrapper,
         orchestrator=None,
         orchestrator_factory=orchestrator_factory,
+        discovery_scope_context_factory=lambda: manifest_authorized_discovery_scope(
+            manifest=manifest,
+            policy=assessment_policy,
+        ),
     )
     reset_plan = BenchmarkResetPlan(
         strategy=ResetStrategy.stateless_target,

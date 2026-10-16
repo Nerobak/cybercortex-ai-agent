@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 
+from agent_core.policy import AssessmentPolicy
+from agent_core.url_authorization import (
+    URLCanonicalizationError,
+    canonicalize_transport_url,
+)
 from config import (
     API_METADATA_DISCOVERY_ENABLED,
     API_METADATA_MAX_REQUESTS,
@@ -24,7 +30,16 @@ from tools.safe_http import (
     ScopedHTTPClient,
     UnsafeRedirectError,
 )
-from tools.scope_guard import enforce_scope
+from tools.scope_guard import (
+    ASSESSMENT_POLICY_UNSET,
+    AssessmentScopeAuthorizationError,
+    AssessmentScopeTransfer,
+    RequestPermitDenied,
+    capture_assessment_policy_scope,
+    enforce_scope,
+    request_dispatch_permit,
+    resolve_assessment_policy_authority,
+)
 
 METADATA_PATHS = (
     "/openapi.json",
@@ -37,6 +52,80 @@ METADATA_PATHS = (
     "/redoc",
 )
 ABSOLUTE_MAX_REQUESTS = len(METADATA_PATHS)
+ABSOLUTE_MAX_REDIRECTS = 3
+
+
+@dataclass(frozen=True)
+class _MetadataAuthorizationContext:
+    """One immutable authority for the complete metadata request sequence."""
+
+    policy: Any
+    scope_transfer: AssessmentScopeTransfer | None
+    canonical_target: str
+
+    def permit(self, target: str, *, timeout: Any):
+        if self.policy is ASSESSMENT_POLICY_UNSET:
+            return request_dispatch_permit(target, timeout=timeout)
+        return request_dispatch_permit(
+            target,
+            assessment_policy=self.policy,
+            timeout=timeout,
+        )
+
+
+@dataclass
+class _MetadataAttemptBudget:
+    limit: int
+    used: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used)
+
+
+def _metadata_authorization_context(
+    *,
+    target: str,
+    assessment_policy: AssessmentPolicy | None | object,
+) -> _MetadataAuthorizationContext:
+    policy = resolve_assessment_policy_authority(assessment_policy)
+    transfer = (
+        None
+        if policy is ASSESSMENT_POLICY_UNSET
+        else capture_assessment_policy_scope(policy)
+    )
+    return _MetadataAuthorizationContext(
+        policy=policy,
+        scope_transfer=transfer,
+        canonical_target=target,
+    )
+
+
+def _metadata_client_authority_error(
+    client: Any,
+    authorization: _MetadataAuthorizationContext,
+) -> str | None:
+    """Reject clients that could substitute authority for lease-backed scope."""
+
+    if authorization.policy is ASSESSMENT_POLICY_UNSET:
+        return None
+    if bool(getattr(client, "scope_prevalidated", False)):
+        return (
+            "A prevalidated HTTP client cannot be used for explicit metadata "
+            "authorization."
+        )
+    if getattr(client, "policy", ASSESSMENT_POLICY_UNSET) is not authorization.policy:
+        return "The supplied HTTP client uses a different assessment policy."
+    return None
+
+
+def _authorize_discovery_target(
+    target: str,
+    assessment_policy: AssessmentPolicy | None | object,
+) -> dict[str, Any]:
+    if assessment_policy is ASSESSMENT_POLICY_UNSET:
+        return enforce_scope(target)
+    return enforce_scope(target, assessment_policy=assessment_policy)
 
 
 def _safe_url(value: Any) -> str:
@@ -59,6 +148,115 @@ def _origin(url: str) -> str:
     return urlunsplit((parsed.scheme, f"{host}{port}", "/", "", ""))
 
 
+def _request_metadata_candidate(
+    *,
+    client: Any,
+    candidate: str,
+    authorization: _MetadataAuthorizationContext,
+    timeout: Any,
+    attempt_budget: _MetadataAttemptBudget,
+    max_redirects: int,
+    headers: dict[str, str],
+) -> tuple[requests.Response, list[dict[str, Any]]]:
+    """Dispatch one candidate with a fresh original-authority permit per hop."""
+
+    current = canonicalize_transport_url(candidate).url
+    seen = {current}
+    chain: list[dict[str, Any]] = []
+    pending_hop: dict[str, Any] | None = None
+    redirects = 0
+
+    while attempt_budget.remaining:
+        try:
+            permit = authorization.permit(current, timeout=timeout)
+            with permit as admission:
+                current = str(admission["target"])
+                if pending_hop is not None:
+                    pending_hop["to"] = current
+                    pending_hop["allowed"] = True
+                    chain.append(pending_hop)
+                    pending_hop = None
+                attempt_budget.used += 1
+                response, client_chain = client.request(
+                    "GET",
+                    current,
+                    purpose="discovery",
+                    timeout=admission["dispatch_timeout"],
+                    max_redirects=0,
+                    follow_redirects=False,
+                    headers=headers,
+                )
+        except RequestPermitDenied as exc:
+            if pending_hop is None:
+                raise
+            pending_hop["to"] = current
+            pending_hop["allowed"] = False
+            chain.append(pending_hop)
+            raise UnsafeRedirectError(
+                f"Redirect destination is outside authorized scope: {current}",
+                chain,
+            ) from exc
+
+        if client_chain:
+            raise UnsafeRedirectError(
+                "The supplied HTTP client followed redirects despite redirects being disabled.",
+                [*chain, *client_chain],
+            )
+        try:
+            response.url = current
+        except AttributeError:
+            pass
+        if not getattr(response, "is_redirect", False) and not getattr(
+            response, "is_permanent_redirect", False
+        ):
+            return response, chain
+
+        location = response.headers.get("Location")
+        if not location:
+            return response, chain
+
+        raw_destination = urljoin(current, location)
+        try:
+            destination = canonicalize_transport_url(raw_destination).url
+        except URLCanonicalizationError as exc:
+            chain.append(
+                {
+                    "from": current,
+                    "to": raw_destination,
+                    "status_code": response.status_code,
+                    "allowed": False,
+                }
+            )
+            raise UnsafeRedirectError(
+                "Redirect destination is ambiguous or malformed.", chain
+            ) from exc
+
+        hop = {
+            "from": current,
+            "to": destination,
+            "status_code": response.status_code,
+            "allowed": False,
+        }
+        if destination in seen:
+            hop["allowed"] = True
+            chain.append(hop)
+            raise UnsafeRedirectError("Redirect loop detected.", chain)
+        if redirects >= max_redirects or not attempt_budget.remaining:
+            chain.append(hop)
+            raise UnsafeRedirectError(
+                f"Redirect limit exceeded ({max_redirects}).", chain
+            )
+
+        redirects += 1
+        seen.add(destination)
+        pending_hop = hop
+        current = destination
+
+    raise UnsafeRedirectError(
+        f"Metadata request-attempt limit exceeded ({attempt_budget.limit}).", chain
+    )
+
+
 def api_metadata_discovery(
     target: str,
     *,
@@ -67,6 +265,7 @@ def api_metadata_discovery(
     timeout_seconds: int = API_METADATA_TIMEOUT_SECONDS,
     max_response_bytes: int = API_METADATA_MAX_RESPONSE_BYTES,
     http_client: ScopedHTTPClient | None = None,
+    assessment_policy: AssessmentPolicy | None | object = ASSESSMENT_POLICY_UNSET,
 ) -> dict[str, Any]:
     """GET a fixed set of metadata paths; never enumerate arbitrary paths."""
     if not enabled:
@@ -89,39 +288,49 @@ def api_metadata_discovery(
     parsed_target = urlsplit(target)
     if parsed_target.scheme not in {"http", "https"} or not parsed_target.hostname:
         return {"success": False, "error": "A valid HTTP(S) target is required."}
-    target_scope = enforce_scope(target)
+    target_scope = _authorize_discovery_target(target, assessment_policy)
     if not target_scope.get("allowed"):
         return {
             "success": False,
             "error": target_scope.get("error", "Target is outside scope."),
         }
+    target = str(target_scope.get("target") or target)
 
-    client = http_client or ScopedHTTPClient(max_response_bytes=max_response_bytes)
-    starting_requests = int(getattr(client, "requests_used", 0))
+    try:
+        authorization = _metadata_authorization_context(
+            target=target,
+            assessment_policy=assessment_policy,
+        )
+    except AssessmentScopeAuthorizationError as exc:
+        return {"success": False, "error": str(exc)}
+
+    if http_client is None:
+        if isinstance(authorization.policy, AssessmentPolicy):
+            client = ScopedHTTPClient(
+                policy=authorization.policy,
+                max_response_bytes=max_response_bytes,
+            )
+        else:
+            client = ScopedHTTPClient(
+                max_response_bytes=max_response_bytes,
+                scope_prevalidated=(
+                    authorization.policy is not ASSESSMENT_POLICY_UNSET
+                ),
+            )
+    else:
+        client = http_client
+        authority_error = _metadata_client_authority_error(client, authorization)
+        if authority_error is not None:
+            return {"success": False, "error": authority_error}
+
     origin = _origin(target)
     documents: list[dict[str, Any]] = []
     requests_made: list[dict[str, Any]] = []
+    attempt_budget = _MetadataAttemptBudget(limit=max_requests)
     for path in METADATA_PATHS[:max_requests]:
-        requests_used = (
-            int(
-                getattr(client, "requests_used", starting_requests + len(requests_made))
-            )
-            - starting_requests
-        )
-        if isinstance(requests_used, int) and requests_used >= max_requests:
+        if not attempt_budget.remaining:
             break
         candidate = urljoin(origin, path.lstrip("/"))
-        scope = enforce_scope(candidate)
-        if not scope.get("allowed"):
-            requests_made.append(
-                {
-                    "url": _safe_url(candidate),
-                    "method": "GET",
-                    "status": "blocked_out_of_scope",
-                    "openapi_detected": False,
-                }
-            )
-            continue
         request_record: dict[str, Any] = {
             "url": _safe_url(candidate),
             "method": "GET",
@@ -129,13 +338,16 @@ def api_metadata_discovery(
             "openapi_detected": False,
         }
         try:
-            response, redirect_chain = client.request(
-                "GET",
-                candidate,
-                purpose="discovery",
+            response, redirect_chain = _request_metadata_candidate(
+                client=client,
+                candidate=candidate,
+                authorization=authorization,
                 timeout=timeout_seconds,
-                max_redirects=max(0, min(3, max_requests - requests_used - 1)),
-                follow_redirects=True,
+                attempt_budget=attempt_budget,
+                max_redirects=min(
+                    ABSOLUTE_MAX_REDIRECTS,
+                    max(0, attempt_budget.remaining - 1),
+                ),
                 headers={
                     "Accept": "application/json, application/yaml, text/yaml, */*",
                     "User-Agent": "CyberCortexAI/2.1 Authorized-Metadata-Discovery",
@@ -192,6 +404,13 @@ def api_metadata_discovery(
                         "document": sanitize_openapi_document(structured),
                     }
                 )
+        except RequestPermitDenied as exc:
+            request_record.update(
+                {
+                    "status": "blocked_out_of_scope",
+                    "error": str(exc),
+                }
+            )
         except UnsafeRedirectError as exc:
             request_record.update(
                 {
@@ -230,9 +449,7 @@ def api_metadata_discovery(
         "metadata_requests": requests_made,
         "document_count": len(documents),
         "request_count": len(requests_made),
-        "network_request_count": int(
-            getattr(client, "requests_used", starting_requests) - starting_requests
-        ),
+        "network_request_count": attempt_budget.used,
         "network_tested": any(
             item.get("status") != "blocked_out_of_scope" for item in requests_made
         ),

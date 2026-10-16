@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +99,9 @@ class BenchmarkExecutionBindings:
     orchestrator_factory: (
         Callable[[ResearchState], SecurityResearchOrchestrator] | None
     ) = None
+    discovery_scope_context_factory: (
+        Callable[[], AbstractContextManager[str]] | None
+    ) = None
     synthetic_fixture: bool = False
 
     def validate(self) -> None:
@@ -128,6 +132,12 @@ class BenchmarkExecutionBindings:
         if getattr(self.bootstrapper, "store", None) is not self.research_store:
             raise BenchmarkPreflightError(
                 "bootstrapper uses a different research store"
+            )
+        if self.discovery_scope_context_factory is not None and not callable(
+            self.discovery_scope_context_factory
+        ):
+            raise BenchmarkPreflightError(
+                "benchmark discovery scope context factory is invalid"
             )
         if (self.orchestrator is None) == (self.orchestrator_factory is None):
             raise BenchmarkPreflightError(
@@ -614,7 +624,12 @@ class AutonomousResearchBenchmarkRunner:
             payload={"research_id": research_id},
         )
         started = time.monotonic()
+        execution_scope = ExitStack()
         try:
+            if bindings.discovery_scope_context_factory is not None:
+                execution_scope.enter_context(
+                    bindings.discovery_scope_context_factory()
+                )
             # Invoke the production bootstrap explicitly. The orchestrator may
             # safely call it again; its persisted lifecycle is restart-safe.
             state = bindings.research_store.load_research(research_id)
@@ -702,6 +717,8 @@ class AutonomousResearchBenchmarkRunner:
                 payload={"failure_class": type(exc).__name__},
             )
             raise BenchmarkRunnerError("benchmark research execution failed") from exc
+        finally:
+            execution_scope.close()
 
     def score_run(
         self,

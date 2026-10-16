@@ -11,7 +11,19 @@ from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 import requests
 
-from tools.scope_guard import enforce_scope
+from agent_core.policy import AssessmentPolicy
+from agent_core.url_authorization import (
+    URLCanonicalizationError,
+    canonicalize_transport_url,
+    validate_transport_timeout,
+)
+
+from tools.scope_guard import (
+    ASSESSMENT_POLICY_UNSET,
+    RequestPermitDenied,
+    enforce_scope,
+    request_dispatch_permit,
+)
 from tools.safe_http import ScopedHTTPClient
 
 DEFAULT_MAX_DEPTH = 2
@@ -553,10 +565,16 @@ def _extract_links(
     discovered: set[str] = set()
 
     for raw_link in HTML_LINK_PATTERN.findall(text):
-        discovered.add(_normalize_url(urljoin(base_url, raw_link)))
+        try:
+            discovered.add(canonicalize_transport_url(urljoin(base_url, raw_link)).url)
+        except URLCanonicalizationError:
+            continue
 
     for raw_link in URL_PATTERN.findall(text):
-        discovered.add(_normalize_url(urljoin(base_url, raw_link)))
+        try:
+            discovered.add(canonicalize_transport_url(urljoin(base_url, raw_link)).url)
+        except URLCanonicalizationError:
+            continue
 
     return sorted(discovered)
 
@@ -688,6 +706,7 @@ def crawl_and_discover_ids(
     normalized_url_evidence: dict[str, Any] | None = None,
     allow_network_crawl: bool = True,
     http_client: ScopedHTTPClient | None = None,
+    assessment_policy: AssessmentPolicy | None | object = ASSESSMENT_POLICY_UNSET,
 ) -> dict[str, Any]:
     """
     Crawl an explicitly authorized target and extract identifiers observed
@@ -708,6 +727,16 @@ def crawl_and_discover_ids(
             "error": "max_pages must be at least 1.",
         }
 
+    if delay_seconds < 0:
+        return {
+            "success": False,
+            "error": "delay_seconds cannot be negative.",
+        }
+    try:
+        timeout_seconds = validate_transport_timeout(timeout_seconds)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
     parsed_start = urlparse(start_url)
 
     if parsed_start.scheme not in {"http", "https"} or not parsed_start.hostname:
@@ -716,7 +745,12 @@ def crawl_and_discover_ids(
             "error": ("A valid HTTP or HTTPS start URL is required."),
         }
 
-    scope_result = enforce_scope(start_url)
+    def authorize(url: str) -> dict[str, Any]:
+        if assessment_policy is ASSESSMENT_POLICY_UNSET:
+            return enforce_scope(url)
+        return enforce_scope(url, assessment_policy=assessment_policy)
+
+    scope_result = authorize(start_url)
 
     if not scope_result.get("allowed"):
         return {
@@ -727,6 +761,9 @@ def crawl_and_discover_ids(
             ),
             "scope": scope_result,
         }
+    start_url = str(
+        scope_result.get("target") or canonicalize_transport_url(start_url).url
+    )
 
     prepared_headers = {
         str(name).strip(): str(value).strip() for name, value in (headers or {}).items()
@@ -739,7 +776,7 @@ def crawl_and_discover_ids(
 
     prepared_headers.setdefault(
         "Accept",
-        ("application/json, text/html, " "application/javascript, text/plain, */*"),
+        ("application/json, text/html, application/javascript, text/plain, */*"),
     )
 
     normalized_url_evidence = (
@@ -753,11 +790,15 @@ def crawl_and_discover_ids(
     katana_urls = (
         list(raw_katana_urls) if isinstance(raw_katana_urls, (list, tuple, set)) else []
     )
-    allowed_katana_urls = [
-        _normalize_url(url)
-        for url in katana_urls
-        if isinstance(url, str) and enforce_scope(url).get("allowed")
-    ]
+    allowed_katana_urls: list[str] = []
+    for url in katana_urls:
+        if not isinstance(url, str):
+            continue
+        decision = authorize(url)
+        if decision.get("allowed"):
+            allowed_katana_urls.append(
+                str(decision.get("target") or canonicalize_transport_url(url).url)
+            )
     offline_identifiers: list[dict[str, Any]] = []
     for candidate in surface_objects:
         if not isinstance(candidate, dict):
@@ -837,35 +878,41 @@ def crawl_and_discover_ids(
         ):
             continue
 
-        current_scope = enforce_scope(current_url)
-
-        if not current_scope.get("allowed"):
-            errors.append(
-                {
-                    "url": current_url,
-                    "error": "Discovered URL was outside scope.",
-                }
-            )
-            continue
-
         try:
             started = time.perf_counter()
-
-            response, _ = scoped_client.request(
-                "GET",
-                current_url,
-                purpose="discovery",
-                headers=prepared_headers,
-                timeout=timeout_seconds,
-                follow_redirects=False,
-                verify=verify_tls,
+            permit = (
+                request_dispatch_permit(current_url, timeout=timeout_seconds)
+                if assessment_policy is ASSESSMENT_POLICY_UNSET
+                else request_dispatch_permit(
+                    current_url,
+                    assessment_policy=assessment_policy,
+                    timeout=timeout_seconds,
+                )
             )
+            with permit as admission:
+                response, _ = scoped_client.request(
+                    "GET",
+                    str(admission["target"]),
+                    purpose="discovery",
+                    headers=prepared_headers,
+                    timeout=admission["dispatch_timeout"],
+                    follow_redirects=False,
+                    verify=verify_tls,
+                )
 
             elapsed_ms = round(
                 (time.perf_counter() - started) * 1000,
                 2,
             )
 
+        except RequestPermitDenied as error:
+            errors.append(
+                {
+                    "url": current_url,
+                    "error": str(error),
+                }
+            )
+            continue
         except requests.RequestException as error:
             errors.append(
                 {

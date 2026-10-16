@@ -25,6 +25,12 @@ from agent_core.agent_models import (
     VerificationPlan,
     VerificationStep,
 )
+from agent_core.url_authorization import (
+    URLCanonicalizationError,
+    canonicalize_transport_url,
+    normalize_transport_hostname,
+    path_is_within_prefix,
+)
 
 NON_OVERRIDABLE_TECHNIQUES = {
     "denial_of_service",
@@ -67,32 +73,7 @@ def normalize_profile_name(value: str) -> str:
 
 def normalize_hostname(value: str) -> str:
     """Normalize an exact hostname without accepting URL or wildcard syntax."""
-    raw = str(value).strip().lower().rstrip(".")
-    if not raw or any(character.isspace() for character in raw):
-        raise ValueError("hostname cannot be empty or contain whitespace")
-    if raw.startswith("[") and raw.endswith("]"):
-        raw = raw[1:-1]
-    try:
-        return str(ipaddress.ip_address(raw))
-    except ValueError:
-        pass
-    if any(token in raw for token in ("://", "/", "@", "?", "#", "*", ":")):
-        raise ValueError("hostname must be an exact host without scheme, port, or path")
-    try:
-        ascii_host = raw.encode("idna").decode("ascii")
-    except UnicodeError as exc:
-        raise ValueError("hostname is not valid IDNA") from exc
-    labels = ascii_host.split(".")
-    if any(
-        not label
-        or len(label) > 63
-        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
-        for label in labels
-    ):
-        raise ValueError("hostname contains an invalid DNS label")
-    if len(ascii_host) > 253:
-        raise ValueError("hostname is too long")
-    return ascii_host
+    return normalize_transport_hostname(value)
 
 
 class ScopeAsset(StrictModel):
@@ -133,24 +114,20 @@ class ScopeAsset(StrictModel):
             else:
                 raise ValueError("wildcard scope cannot use an IP address")
         elif self.kind == "url_prefix":
-            parsed = urlparse(self.value)
-            if (
-                parsed.scheme not in {"http", "https"}
-                or not parsed.hostname
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.query
-                or parsed.fragment
-            ):
+            try:
+                canonical = canonicalize_transport_url(self.value)
+            except URLCanonicalizationError as exc:
                 raise ValueError(
-                    "url_prefix must be an absolute HTTP(S) URL without credentials, query, or fragment"
-                )
-            normalize_hostname(parsed.hostname)
-            if parsed.scheme not in self.schemes:
+                    "url_prefix must be one canonical absolute HTTP(S) URL"
+                ) from exc
+            if canonical.query:
+                raise ValueError("url_prefix cannot contain a query")
+            object.__setattr__(self, "value", canonical.url)
+            if canonical.scheme not in self.schemes:
                 raise ValueError(
                     "url_prefix scheme must be present in the asset schemes"
                 )
-            if self.ports and _origin_port(parsed) not in self.ports:
+            if self.ports and canonical.port not in self.ports:
                 raise ValueError("url_prefix port must be present in the asset ports")
         elif self.kind == "cidr":
             try:
@@ -407,7 +384,13 @@ class AssessmentPolicy(StrictModel):
         semantic checks before a request can be sent.
         """
         reasons: list[str] = []
-        parsed = urlparse(url)
+        canonical = None
+        try:
+            canonical = canonicalize_transport_url(url)
+        except URLCanonicalizationError:
+            reasons.append("The target URL representation is ambiguous or malformed.")
+        canonical_url = canonical.url if canonical is not None else url
+        parsed = urlparse(canonical_url)
         if not self.authorization_confirmed:
             reasons.append("Explicit authorization was not confirmed by the policy.")
         if not self.authorization_reference:
@@ -425,10 +408,21 @@ class AssessmentPolicy(StrictModel):
         normalized_method = method.strip().upper()
         if normalized_method not in self.allowed_methods:
             reasons.append(f"HTTP method {normalized_method} is not allowed.")
-        if any(_asset_matches(asset, url) for asset in self.excluded_assets):
+        if canonical is not None and any(
+            _asset_matches(asset, canonical_url) for asset in self.excluded_assets
+        ):
             reasons.append("The target matches an explicit scope exclusion.")
-        matched = next(
-            (asset for asset in self.allowed_assets if _asset_matches(asset, url)), None
+        matched = (
+            next(
+                (
+                    asset
+                    for asset in self.allowed_assets
+                    if _asset_matches(asset, canonical_url)
+                ),
+                None,
+            )
+            if canonical is not None
+            else None
         )
         if matched is None:
             reasons.append("The target does not match an authorized asset rule.")
@@ -557,13 +551,7 @@ def _asset_matches(asset: ScopeAsset, target: str) -> bool:
             (allowed.hostname or "").lower().rstrip("."),
             _origin_port(allowed),
         )
-        allowed_path = (allowed.path or "/").rstrip("/") or "/"
-        target_path = (parsed.path or "/").rstrip("/") or "/"
-        return same_origin and (
-            allowed_path == "/"
-            or target_path == allowed_path
-            or target_path.startswith(f"{allowed_path}/")
-        )
+        return same_origin and path_is_within_prefix(parsed.path, allowed.path)
     if asset.kind == "cidr":
         try:
             return ipaddress.ip_address(host) in ipaddress.ip_network(

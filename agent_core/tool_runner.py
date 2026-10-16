@@ -20,6 +20,12 @@ from agent_core.policy import AssessmentPolicy, policy_from_runtime
 from agent_core.request_budget import RequestBudget
 from tool_registry import TOOLS, resolve_tool, tools_for_profile
 from tools.safe_http import ScopedHTTPClient
+from tools.scope_guard import (
+    AssessmentScopeAuthorizationError,
+    AssessmentScopeTransfer,
+    capture_assessment_policy_scope,
+    propagated_assessment_policy_scope,
+)
 from config import (
     ADAPTIVE_MAX_REQUESTS,
     AGENT_REQUEST_BUDGET,
@@ -109,6 +115,13 @@ class ToolRunner:
         )
 
     @staticmethod
+    def _declares_keyword(function: Callable[..., Any], name: str) -> bool:
+        try:
+            return name in inspect.signature(function).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _is_registered_implementation(
         function: Callable[..., Any], metadata: dict[str, Any]
     ) -> bool:
@@ -182,6 +195,7 @@ class ToolRunner:
 
         metadata = TOOLS[name]
         call_kwargs = dict(kwargs)
+        authorization_transfer: AssessmentScopeTransfer | None = None
         if metadata["sends_network_traffic"]:
             if self.http_client is None:
                 envelope = self._envelope(
@@ -212,6 +226,21 @@ class ToolRunner:
                 self._notify(name, envelope)
                 return envelope
             if adapter in {"shared_http", "shared_dns"}:
+                try:
+                    authorization_transfer = capture_assessment_policy_scope(
+                        self.policy
+                    )
+                except AssessmentScopeAuthorizationError as exc:
+                    envelope = self._envelope(
+                        name,
+                        "failed",
+                        started=started,
+                        started_clock=clock,
+                        error=str(exc),
+                        input_summary=input_summary,
+                    )
+                    self._notify(name, envelope)
+                    return envelope
                 if self._accepts_keyword(function, "http_client"):
                     call_kwargs["http_client"] = self.http_client
                 elif self._is_registered_implementation(function, metadata):
@@ -225,6 +254,8 @@ class ToolRunner:
                     )
                     self._notify(name, envelope)
                     return envelope
+                if self._declares_keyword(function, "assessment_policy"):
+                    call_kwargs["assessment_policy"] = self.policy
             elif adapter == "offline_fallback" and self._accepts_keyword(
                 function, "allow_network_analysis"
             ):
@@ -233,7 +264,8 @@ class ToolRunner:
         def invoke() -> Any:
             if TOOLS[name]["sends_network_traffic"]:
                 with self.network_slots:
-                    return function(*args, **call_kwargs)
+                    with propagated_assessment_policy_scope(authorization_transfer):
+                        return function(*args, **call_kwargs)
             return function(*args, **call_kwargs)
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
