@@ -8,8 +8,8 @@ import requests
 
 import agent_core.result_normalizer as normalizer_module
 import agent_core.tool_runner as runner_module
-import tools.api_metadata_discovery as metadata_module
 import tools.api_object_discovery as object_module
+import tools.scope_guard as scope_guard
 from agent_core.result_normalizer import build_evidence_package
 from agent_core.tool_runner import ToolRunner
 from agent_core.tool_explainer import explain
@@ -57,6 +57,15 @@ class FakeClient:
         if value is None:
             value = _response(url, b'{"detail":"Not Found"}', status=404)
         return value, []
+
+
+def _allow_metadata_test_origin(monkeypatch) -> None:
+    monkeypatch.setattr(scope_guard, "PENTEST_ALLOWLIST", "")
+    monkeypatch.setattr(
+        scope_guard,
+        "PENTEST_ALLOWED_URL_PREFIXES",
+        "https://example.test",
+    )
 
 
 def _openapi_three() -> dict[str, Any]:
@@ -205,7 +214,7 @@ def test_api_tools_are_explainable_and_doctor_checks_bounds():
 
 
 def test_metadata_discovery_enforces_request_bound(monkeypatch):
-    monkeypatch.setattr(metadata_module, "enforce_scope", lambda url: {"allowed": True})
+    _allow_metadata_test_origin(monkeypatch)
     client = FakeClient({})
     result = api_metadata_discovery(
         "https://example.test", max_requests=3, http_client=client
@@ -216,7 +225,7 @@ def test_metadata_discovery_enforces_request_bound(monkeypatch):
 
 
 def test_metadata_discovery_blocks_out_of_scope_redirect(monkeypatch):
-    monkeypatch.setattr(metadata_module, "enforce_scope", lambda url: {"allowed": True})
+    _allow_metadata_test_origin(monkeypatch)
     first = "https://example.test/openapi.json"
     client = FakeClient(
         {
@@ -242,7 +251,7 @@ def test_metadata_discovery_blocks_out_of_scope_redirect(monkeypatch):
 
 
 def test_metadata_response_size_is_enforced(monkeypatch):
-    monkeypatch.setattr(metadata_module, "enforce_scope", lambda url: {"allowed": True})
+    _allow_metadata_test_origin(monkeypatch)
     url = "https://example.test/openapi.json"
     client = FakeClient({url: _response(url, b"x" * 101)})
     result = api_metadata_discovery(
@@ -256,25 +265,21 @@ def test_metadata_response_size_is_enforced(monkeypatch):
 
 
 def test_metadata_rejects_invalid_and_html_but_accepts_openapi_versions(monkeypatch):
-    monkeypatch.setattr(metadata_module, "enforce_scope", lambda url: {"allowed": True})
+    _allow_metadata_test_origin(monkeypatch)
     origin = "https://example.test"
     responses = {
-        origin
-        + METADATA_PATHS[0]: _response(
+        origin + METADATA_PATHS[0]: _response(
             origin + METADATA_PATHS[0], b'{"message":"not a specification"}'
         ),
-        origin
-        + METADATA_PATHS[1]: _response(
+        origin + METADATA_PATHS[1]: _response(
             origin + METADATA_PATHS[1],
             b"<html>OpenAPI docs</html>",
             content_type="text/html",
         ),
-        origin
-        + METADATA_PATHS[2]: _response(
+        origin + METADATA_PATHS[2]: _response(
             origin + METADATA_PATHS[2], json.dumps(_openapi_three()).encode()
         ),
-        origin
-        + METADATA_PATHS[3]: _response(
+        origin + METADATA_PATHS[3]: _response(
             origin + METADATA_PATHS[3], json.dumps(_swagger_two()).encode()
         ),
     }

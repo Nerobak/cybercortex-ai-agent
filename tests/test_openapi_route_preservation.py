@@ -7,8 +7,8 @@ import pytest
 import requests
 
 import agent_core.result_normalizer as normalizer_module
-import tools.api_metadata_discovery as metadata_module
 import tools.openapi_surface_analyzer as openapi_module
+import tools.scope_guard as scope_guard
 from agent_core.attack_surface import build_canonical_attack_surface
 from agent_core.result_normalizer import build_evidence_package, normalize_url_evidence
 from agent_core.tool_runner import ToolRunner
@@ -159,7 +159,12 @@ class _MetadataClient:
 def recovery_pipeline(monkeypatch):
     target = "https://routes.example"
     document = _route_preservation_document()
-    monkeypatch.setattr(metadata_module, "enforce_scope", lambda url: {"allowed": True})
+    monkeypatch.setattr(scope_guard, "PENTEST_ALLOWLIST", "")
+    monkeypatch.setattr(
+        scope_guard,
+        "PENTEST_ALLOWED_URL_PREFIXES",
+        target,
+    )
     monkeypatch.setattr(
         normalizer_module, "enforce_scope", lambda url: {"allowed": True}
     )
